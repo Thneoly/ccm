@@ -56,7 +56,7 @@ The runtime target is kept in memory and does not rewrite `config.toml`.
 
 ## Route layer
 
-A route is a first-class object that preserves routing intent instead of collapsing immediately to one model:
+A route is a first-class object that preserves routing intent:
 
 ```toml
 [routes.coding-route]
@@ -82,9 +82,7 @@ Then switch to it:
 ccm switch coding
 ```
 
-At this stage the proxy forwards to `primary`. The fallback list is already retained in runtime route resolution so retry/failover can be added without changing the route model.
-
-The architecture is now:
+The architecture is:
 
 ```text
 Provider
@@ -95,7 +93,61 @@ Route (primary + fallback[])
    ↓
 Runtime Target
    ↓
+Routing Policy Executor
+   ↓
 CCM Proxy
+```
+
+## Fallback policy
+
+For each request, CCM tries the route candidates in this order:
+
+```text
+primary → fallback[0] → fallback[1] → ...
+```
+
+Fallback is intentionally narrow. CCM continues to the next candidate on:
+
+```text
+connection / request error
+response-header timeout (30s)
+HTTP 429
+HTTP 502
+HTTP 503
+HTTP 504
+```
+
+CCM does not automatically fallback on client/config/authentication failures such as:
+
+```text
+HTTP 400
+HTTP 401
+HTTP 403
+HTTP 500
+```
+
+Once an upstream response is accepted, CCM streams that response directly back to Claude Code. It does not buffer the full SSE response in order to retry. If a streaming response fails after it has already started, CCM does not switch providers mid-stream.
+
+Example route:
+
+```toml
+[routes.coding]
+primary = "claude"
+fallback = ["glm", "kimi"]
+```
+
+A request may produce proxy traces such as:
+
+```text
+ccm route=coding attempt=1 model=claude result=HTTP 429 action=fallback
+ccm route=coding attempt=2 model=glm result=HTTP 200
+```
+
+Or:
+
+```text
+ccm route=coding attempt=1 model=claude result=timeout after 30s action=fallback
+ccm route=coding attempt=2 model=glm result=HTTP 200
 ```
 
 ## Control API
@@ -210,7 +262,9 @@ Secrets are stored with the Rust `keyring` crate and are not written to `config.
 - in-memory runtime target
 - first-class route objects
 - local control API
-- primary routing only; automatic fallback is next
+- ordered route fallback execution
+- attempt tracing
+- no mid-stream failover
 - no OpenAI protocol translation yet
 
 ## Development
@@ -226,7 +280,7 @@ GitHub Actions CI is currently disabled; run these checks locally before release
 
 ## Next
 
-The next routing step is policy execution: retry the route's fallback models on selected failures such as connection errors, timeouts, and 429/5xx responses, with clear attempt tracing.
+The next routing step is policy configuration: make timeout/retry/fallback conditions route-specific, add backoff, and expose recent attempt traces through the control API.
 
 ## License
 
