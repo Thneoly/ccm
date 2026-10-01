@@ -15,6 +15,13 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Add or update providers and models.
+    Add {
+        #[command(subcommand)]
+        command: AddCommand,
+    },
+    /// Run local diagnostics for Claude Code and the selected model.
+    Doctor,
     /// List configured models.
     List,
     /// Show the selected model alias.
@@ -30,6 +37,26 @@ pub enum Command {
     },
     /// Check whether a model's provider endpoint is reachable.
     Health { target: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AddCommand {
+    /// Add or update a provider. Missing values are prompted interactively.
+    Provider {
+        name: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Add or update a model. Missing values are prompted interactively.
+    Model {
+        name: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
