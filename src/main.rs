@@ -3,6 +3,7 @@ mod config;
 mod credential;
 mod doctor;
 mod health;
+mod integrate;
 mod launcher;
 mod manage;
 mod model;
@@ -26,6 +27,9 @@ async fn main() -> Result<()> {
         Command::Add { command } => {
             let mut config = load_config()?;
             manage::handle(&mut config, command)?;
+        }
+        Command::Integrate { command } => {
+            integrate::handle(command)?;
         }
         Command::Doctor => {
             let config = load_config()?;
