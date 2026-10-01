@@ -28,18 +28,14 @@ Check the setup:
 
 ## Direct mode
 
-Launch Claude Code directly against the selected provider:
+Persist a default backend and launch Claude Code directly against it:
 
 ```bash
 ccm use glm
 ccm run
 ```
 
-Or select a model for one launch:
-
-```bash
-ccm run claude
-```
+`ccm use` changes the persisted default in `~/.ccm/config.toml`.
 
 ## Proxy mode
 
@@ -61,26 +57,40 @@ Launch Claude Code through the proxy in terminal 2:
 ccm run --proxy
 ```
 
-Now switch backends without restarting the proxy or changing the Claude Code endpoint:
+Now switch the running proxy route without modifying the persisted default:
 
 ```bash
-ccm use glm
-ccm use claude
-ccm use fast
+ccm switch glm
+ccm switch claude
+ccm switch fast
 ```
 
-The proxy reloads `~/.ccm/config.toml` on every request. It rewrites the request `model` field to the currently selected CCM model, injects the selected provider credential, forwards the request to the configured Anthropic-compatible `/v1/messages` endpoint, and streams the upstream response back to Claude Code.
+The proxy keeps the active route in memory. Provider/model definitions are still read from `~/.ccm/config.toml`, while runtime switching is handled by the local control API.
 
-You can also switch and launch in one command:
+### Control API
+
+```text
+GET  /health
+GET  /_ccm/status
+GET  /_ccm/models
+POST /_ccm/switch/{model-or-profile}
+```
+
+Example:
 
 ```bash
-ccm run glm --proxy
+curl http://127.0.0.1:13521/_ccm/status
+curl http://127.0.0.1:13521/_ccm/models
+curl -X POST http://127.0.0.1:13521/_ccm/switch/glm
 ```
+
+The `/v1/messages` path rewrites the incoming request model to the active runtime model, injects the selected provider credential, forwards the request to the configured Anthropic-compatible upstream, and streams the response back to Claude Code.
 
 Use another local port if needed:
 
 ```bash
 ccm proxy --bind 127.0.0.1:14521
+ccm switch glm --proxy-url http://127.0.0.1:14521
 ccm run --proxy --proxy-url http://127.0.0.1:14521
 ```
 
@@ -105,7 +115,7 @@ ccm proxy
 ccm run --proxy
 ```
 
-Inside the running Claude Code session, switch backends with:
+Inside the running Claude Code session:
 
 ```text
 /switch glm
@@ -113,7 +123,7 @@ Inside the running Claude Code session, switch backends with:
 /switch fast
 ```
 
-The slash command runs `ccm use <model-or-profile>`. Because the proxy reloads CCM configuration on each request, subsequent Claude Code requests are routed to the newly selected backend without restarting the session.
+The slash command runs `ccm switch <model-or-profile>`, so it changes the proxy's in-memory route immediately and does not rewrite `config.toml`.
 
 Remove the integration with:
 
@@ -135,6 +145,7 @@ ccm proxy [--bind HOST:PORT]
 ccm list
 ccm current
 ccm use <model-or-profile>
+ccm switch <model-or-profile> [--proxy-url URL]
 ccm run [model-or-profile] [--proxy] [--proxy-url URL]
 ccm auth set <provider>
 ccm auth delete <provider>
@@ -210,7 +221,8 @@ The current proxy intentionally stays small:
 - request model rewriting
 - provider credential injection
 - streaming upstream responses
-- dynamic routing via the current CCM model
+- in-memory runtime route state
+- local control API
 - no OpenAI protocol translation yet
 
 OpenAI-compatible adapters, fallback chains, retries, and routing policies are deferred to later versions.
@@ -224,7 +236,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-GitHub Actions runs these checks on Linux, Windows, and macOS.
+GitHub Actions CI is currently disabled; run these checks locally before release commits.
 
 ## Roadmap
 
@@ -236,6 +248,7 @@ GitHub Actions runs these checks on Linux, Windows, and macOS.
 - Streaming Anthropic-compatible forwarding
 - Proxy-aware Claude Code launcher
 - Global `/switch` integration for Claude Code
+- Runtime route state and local control API
 
 ### v0.3
 
