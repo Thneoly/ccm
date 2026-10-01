@@ -2,14 +2,14 @@
 
 A fast local model manager for AI coding CLIs, starting with Claude Code.
 
-CCM keeps provider/model switching local and lightweight. The v0.1 scope focuses on configuration, credential management, model aliases, health checks, and launching Claude Code with the selected backend. A local proxy for in-session switching is planned for v0.2.
+CCM keeps provider/model switching local and lightweight. The v0.1 scope focuses on configuration, credential management, model aliases, diagnostics, health checks, and launching Claude Code with the selected backend. A local proxy for in-session switching is planned for v0.2.
 
 ## Goals
 
 - Switch Claude Code backends with short aliases such as `ccm use glm`.
 - Keep API keys out of plaintext config files.
 - Support multiple Anthropic-compatible providers.
-- Stay local-first, fast, and easy to inspect.
+- Make setup and diagnostics simple enough for daily use.
 - Provide a clean path toward a local routing proxy without turning v0.1 into a gateway platform.
 
 ## Quick start
@@ -33,6 +33,12 @@ Store credentials in the operating-system keyring:
 ./target/release/ccm auth set zai
 ```
 
+Run diagnostics:
+
+```bash
+./target/release/ccm doctor
+```
+
 Then switch and launch Claude Code:
 
 ```bash
@@ -51,6 +57,9 @@ You can also select a model for one launch without changing the current selectio
 
 ```text
 ccm init [--force]
+ccm add provider <name> [--base-url URL] [--kind KIND]
+ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
+ccm doctor
 ccm list
 ccm current
 ccm use <model-or-profile>
@@ -58,6 +67,47 @@ ccm run [model-or-profile]
 ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>
+```
+
+Missing values for `ccm add provider` and `ccm add model` are prompted interactively.
+
+Examples:
+
+```bash
+ccm add provider moonshot \
+  --kind anthropic-compatible \
+  --base-url https://api.moonshot.ai/anthropic
+
+ccm add model kimi \
+  --provider moonshot \
+  --model-id kimi-k2.5
+```
+
+Or just:
+
+```bash
+ccm add provider moonshot
+ccm add model kimi
+```
+
+## Doctor
+
+`ccm doctor` checks the selected local setup without exposing secrets:
+
+```text
+✓ Claude Code: installed
+✓ current model: glm
+✓ model id: glm-5
+✓ provider: zai
+✓ base URL: https://api.z.ai/api/anthropic
+✓ credential: present
+✓ endpoint: reachable (...)
+```
+
+For a full authenticated model request, use:
+
+```bash
+ccm health glm
 ```
 
 ## Configuration
@@ -139,6 +189,8 @@ GitHub Actions runs these checks on Linux, Windows, and macOS.
 
 - CLI with clap
 - First-run `ccm init`
+- Interactive provider/model setup
+- `ccm doctor`
 - TOML config
 - OS keyring credentials
 - Provider/model/profile aliases
