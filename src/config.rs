@@ -173,6 +173,14 @@ impl AppConfig {
         if route.policy.header_timeout_ms == 0 {
             bail!("route policy header_timeout_ms must be greater than 0");
         }
+        if route.policy.circuit_breaker.enabled {
+            if route.policy.circuit_breaker.failure_threshold == 0 {
+                bail!("circuit breaker failure_threshold must be greater than 0");
+            }
+            if route.policy.circuit_breaker.open_ms == 0 {
+                bail!("circuit breaker open_ms must be greater than 0");
+            }
+        }
         Ok(())
     }
 
@@ -240,6 +248,7 @@ mod tests {
         assert_eq!(route.primary, "claude");
         assert_eq!(route.fallback, vec!["glm"]);
         assert_eq!(route.policy.header_timeout_ms, 30_000);
+        assert!(route.policy.circuit_breaker.enabled);
     }
 
     #[test]
