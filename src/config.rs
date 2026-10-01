@@ -118,6 +118,18 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn add_provider(&mut self, name: String, provider: Provider) {
+        self.providers.insert(name, provider);
+    }
+
+    pub fn add_model(&mut self, name: String, model: Model) -> Result<()> {
+        if !self.providers.contains_key(&model.provider) {
+            bail!("unknown provider `{}`", model.provider);
+        }
+        self.models.insert(name, model);
+        Ok(())
+    }
+
     pub fn resolve_target(&self, target: &str) -> Result<String> {
         if self.models.contains_key(target) {
             return Ok(target.to_string());
@@ -158,5 +170,18 @@ mod tests {
     fn rejects_unknown_target() {
         let config = AppConfig::starter();
         assert!(config.resolve_target("missing").is_err());
+    }
+
+    #[test]
+    fn rejects_model_with_unknown_provider() {
+        let mut config = AppConfig::starter();
+        let result = config.add_model(
+            "broken".to_string(),
+            Model {
+                provider: "missing".to_string(),
+                model_id: "x".to_string(),
+            },
+        );
+        assert!(result.is_err());
     }
 }
