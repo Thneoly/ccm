@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{Model, Profile},
     provider::{Provider, ProviderKind},
-    route::{ResolvedRoute, Route},
+    route::{ResolvedRoute, Route, RoutePolicy},
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -82,6 +82,7 @@ impl AppConfig {
             Route {
                 primary: "claude".to_string(),
                 fallback: vec!["glm".to_string()],
+                policy: RoutePolicy::default(),
             },
         );
         routes.insert(
@@ -89,6 +90,7 @@ impl AppConfig {
             Route {
                 primary: "glm".to_string(),
                 fallback: Vec::new(),
+                policy: RoutePolicy::default(),
             },
         );
 
@@ -165,6 +167,12 @@ impl AppConfig {
                 bail!("unknown fallback model `{fallback}`");
             }
         }
+        if route.policy.max_attempts == 0 {
+            bail!("route policy max_attempts must be greater than 0");
+        }
+        if route.policy.header_timeout_ms == 0 {
+            bail!("route policy header_timeout_ms must be greater than 0");
+        }
         Ok(())
     }
 
@@ -194,6 +202,7 @@ impl AppConfig {
                 target: target.to_string(),
                 primary: route.primary.clone(),
                 fallback: route.fallback.clone(),
+                policy: route.policy.clone(),
             });
         }
 
@@ -202,6 +211,7 @@ impl AppConfig {
             target: target.to_string(),
             primary: model,
             fallback: Vec::new(),
+            policy: RoutePolicy::default(),
         })
     }
 }
@@ -229,6 +239,7 @@ mod tests {
         assert_eq!(route.target, "coding-route");
         assert_eq!(route.primary, "claude");
         assert_eq!(route.fallback, vec!["glm"]);
+        assert_eq!(route.policy.header_timeout_ms, 30_000);
     }
 
     #[test]
@@ -258,6 +269,7 @@ mod tests {
             Route {
                 primary: "claude".to_string(),
                 fallback: vec!["missing".to_string()],
+                policy: RoutePolicy::default(),
             },
         );
         assert!(result.is_err());
