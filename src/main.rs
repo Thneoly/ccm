@@ -7,6 +7,7 @@ mod launcher;
 mod manage;
 mod model;
 mod provider;
+mod proxy;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -29,6 +30,10 @@ async fn main() -> Result<()> {
         Command::Doctor => {
             let config = load_config()?;
             doctor::run(&config).await?;
+        }
+        Command::Proxy { bind } => {
+            load_config()?;
+            proxy::serve(&bind).await?;
         }
         Command::Auth { command } => {
             credential::handle(command)?;
