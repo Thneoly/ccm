@@ -32,6 +32,11 @@ fallback_on = [429, 502, 503, 504]
 max_attempts = 3
 backoff_ms = 200
 
+[routes.coding-route.policy.circuit_breaker]
+enabled = true
+failure_threshold = 3
+open_ms = 30000
+
 [routes.fast-route]
 primary = "glm"
 fallback = []
@@ -41,3 +46,8 @@ header_timeout_ms = 15000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 1
 backoff_ms = 0
+
+[routes.fast-route.policy.circuit_breaker]
+enabled = true
+failure_threshold = 3
+open_ms = 30000
