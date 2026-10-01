@@ -9,6 +9,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create ~/.ccm/config.toml with a starter configuration.
+    Init {
+        /// Overwrite an existing configuration file.
+        #[arg(long)]
+        force: bool,
+    },
     /// List configured models.
     List,
     /// Show the selected model alias.
