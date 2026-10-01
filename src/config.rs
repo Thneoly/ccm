@@ -96,7 +96,10 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
-            bail!("config not found at {}. Run `ccm init` first", path.display());
+            bail!(
+                "config not found at {}. Run `ccm init` first",
+                path.display()
+            );
         }
 
         let raw =
