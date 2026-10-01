@@ -12,18 +12,7 @@ CCM keeps provider/model switching local and lightweight. The v0.1 scope focuses
 - Stay local-first, fast, and easy to inspect.
 - Provide a clean path toward a local routing proxy without turning v0.1 into a gateway platform.
 
-## v0.1 commands
-
-```bash
-ccm list
-ccm current
-ccm use glm
-ccm run glm
-ccm auth set zai
-ccm health glm
-```
-
-## Install
+## Quick start
 
 ```bash
 git clone https://github.com/Thneoly/ccm.git
@@ -31,19 +20,53 @@ cd ccm
 cargo build --release
 ```
 
-The binary will be available at:
+Initialize a starter configuration:
+
+```bash
+./target/release/ccm init
+```
+
+Store credentials in the operating-system keyring:
+
+```bash
+./target/release/ccm auth set anthropic
+./target/release/ccm auth set zai
+```
+
+Then switch and launch Claude Code:
+
+```bash
+./target/release/ccm list
+./target/release/ccm use glm
+./target/release/ccm run
+```
+
+You can also select a model for one launch without changing the current selection:
+
+```bash
+./target/release/ccm run claude
+```
+
+## v0.1 commands
 
 ```text
-target/release/ccm
+ccm init [--force]
+ccm list
+ccm current
+ccm use <model-or-profile>
+ccm run [model-or-profile]
+ccm auth set <provider>
+ccm auth delete <provider>
+ccm health <model-or-profile>
 ```
 
 ## Configuration
 
-CCM reads `~/.ccm/config.toml` by default.
-
-Example:
+CCM reads `~/.ccm/config.toml` by default. `ccm init` creates a starter configuration containing Anthropic and Z.AI examples.
 
 ```toml
+current = "claude"
+
 [providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -67,17 +90,17 @@ model = "claude"
 model = "glm"
 ```
 
-You can also start from `examples/config.toml`.
+The same starter configuration is available at `examples/config.toml`.
 
 ## Credentials
 
-CCM uses the operating system keyring via the Rust `keyring` crate.
+CCM uses the operating-system keyring through the Rust `keyring` crate. Secrets are not written to `config.toml`.
 
 ```bash
 ccm auth set zai
 ```
 
-The secret is stored under service `ccm` and the provider name as the account key.
+Credentials use service name `ccm` and the provider name as the account key.
 
 ## Running Claude Code
 
@@ -85,7 +108,7 @@ The secret is stored under service `ccm` and the provider name as the account ke
 ccm run glm
 ```
 
-CCM resolves the model alias, loads the provider credential, and launches `claude` with:
+CCM resolves the model alias, retrieves the provider credential, and launches `claude` with:
 
 ```text
 ANTHROPIC_BASE_URL
@@ -93,16 +116,35 @@ ANTHROPIC_AUTH_TOKEN
 ANTHROPIC_MODEL
 ```
 
+Profiles are aliases to model aliases, so this also works:
+
+```bash
+ccm run fast
+```
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+GitHub Actions runs these checks on Linux, Windows, and macOS.
+
 ## Roadmap
 
 ### v0.1
 
 - CLI with clap
+- First-run `ccm init`
 - TOML config
 - OS keyring credentials
 - Provider/model/profile aliases
 - Claude Code launcher
 - Health checks
+- Cross-platform CI
 
 ### v0.2
 
@@ -122,7 +164,7 @@ ANTHROPIC_MODEL
 
 1. CLI first; TUI later.
 2. Aliases over raw provider model IDs.
-3. Secrets never stored in config.toml.
+3. Secrets never stored in `config.toml`.
 4. Prefer transparent Anthropic-compatible forwarding before protocol translation.
 5. Keep v0.1 small enough to understand in one sitting.
 
