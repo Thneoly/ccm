@@ -15,9 +15,9 @@ pub fn handle(command: AuthCommand) -> Result<()> {
 pub fn get(provider: &str) -> Result<String> {
     let entry = Entry::new(SERVICE, provider)
         .with_context(|| format!("cannot open keyring entry for provider `{provider}`"))?;
-    entry
-        .get_password()
-        .with_context(|| format!("no credential found for provider `{provider}`; run `ccm auth set {provider}`"))
+    entry.get_password().with_context(|| {
+        format!("no credential found for provider `{provider}`; run `ccm auth set {provider}`")
+    })
 }
 
 fn set(provider: &str) -> Result<()> {
