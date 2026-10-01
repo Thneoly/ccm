@@ -1,13 +1,13 @@
 use std::io::{self, Write};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
     cli::AddCommand,
     config::AppConfig,
     model::Model,
     provider::{Provider, ProviderKind},
-    route::Route,
+    route::{Route, RoutePolicy},
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
@@ -39,16 +39,28 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             name,
             primary,
             fallback,
+            header_timeout_ms,
+            fallback_on,
+            max_attempts,
+            backoff_ms,
         } => {
             let primary = required(primary, "Primary model")?;
-            let fallback = fallback
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            config.add_route(name.clone(), Route { primary, fallback })?;
+            let fallback = parse_csv_strings(fallback.unwrap_or_default());
+            let fallback_on = parse_status_codes(&fallback_on)?;
+            let policy = RoutePolicy {
+                header_timeout_ms,
+                fallback_on,
+                max_attempts,
+                backoff_ms,
+            };
+            config.add_route(
+                name.clone(),
+                Route {
+                    primary,
+                    fallback,
+                    policy,
+                },
+            )?;
             config.save()?;
             println!("Saved route {name}");
         }
@@ -72,6 +84,28 @@ fn required(value: Option<String>, label: &str) -> Result<String> {
         bail!("{label} cannot be empty");
     }
     Ok(value)
+}
+
+fn parse_csv_strings(value: String) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_status_codes(value: &str) -> Result<Vec<u16>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .with_context(|| format!("invalid HTTP status code `{value}`"))
+        })
+        .collect()
 }
 
 fn parse_kind(value: &str) -> Result<ProviderKind> {
