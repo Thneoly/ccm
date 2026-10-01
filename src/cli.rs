@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "ccm", version, about = "Claude Code Model Manager")]
@@ -93,7 +93,7 @@ pub enum AddCommand {
         max_attempts: usize,
         #[arg(long, default_value_t = 200)]
         backoff_ms: u64,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
         circuit_enabled: bool,
         #[arg(long, default_value_t = 3)]
         failure_threshold: usize,
