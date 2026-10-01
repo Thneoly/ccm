@@ -5,18 +5,18 @@ use anyhow::{Context, Result};
 use crate::cli::IntegrateCommand;
 
 const CLAUDE_SWITCH_COMMAND: &str = r#"---
-description: Switch the CCM backend model/profile used by the running Claude Code proxy session
+description: Switch the active CCM proxy route for the running Claude Code session
 argument-hint: <model-or-profile>
-allowed-tools: Bash(ccm use:*), Bash(ccm current:*)
+allowed-tools: Bash(ccm switch:*), Bash(ccm current:*)
 ---
 
-Switch the CCM backend to `$ARGUMENTS`.
+Switch the running CCM proxy route to `$ARGUMENTS` without changing the persisted default configuration.
 
 Run:
 
-!`ccm use $ARGUMENTS`
+!`ccm switch $ARGUMENTS`
 
-Then report the newly selected CCM model/profile concisely. This changes CCM's routing target for subsequent requests when Claude Code is running through `ccm run --proxy`.
+Then report the active runtime route concisely. This requires a CCM proxy running on the default local endpoint and Claude Code started with `ccm run --proxy`.
 "#;
 
 pub fn handle(command: IntegrateCommand) -> Result<()> {
@@ -47,7 +47,7 @@ fn install_claude_command() -> Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))?;
     println!("Installed Claude Code command: /switch <model-or-profile>");
     println!("Path: {}", path.display());
-    println!("Use it with a Claude Code session started by `ccm run --proxy`.");
+    println!("The command now switches CCM's in-memory runtime route.");
     Ok(())
 }
 
@@ -68,8 +68,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_contains_switch_invocation() {
-        assert!(CLAUDE_SWITCH_COMMAND.contains("ccm use $ARGUMENTS"));
+    fn command_contains_runtime_switch_invocation() {
+        assert!(CLAUDE_SWITCH_COMMAND.contains("ccm switch $ARGUMENTS"));
         assert!(CLAUDE_SWITCH_COMMAND.contains("/switch"));
     }
 }
