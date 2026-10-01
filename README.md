@@ -2,7 +2,7 @@
 
 A fast local model manager for AI coding CLIs, starting with Claude Code.
 
-CCM manages provider/model aliases locally and can now run as a local Anthropic-compatible proxy, so Claude Code can stay connected to one localhost endpoint while `ccm use ...` switches the backend underneath it.
+CCM manages provider/model aliases locally and can run as a local Anthropic-compatible proxy, so Claude Code can stay connected to one localhost endpoint while CCM switches the backend underneath it.
 
 ## Quick start
 
@@ -41,7 +41,7 @@ Or select a model for one launch:
 ccm run claude
 ```
 
-## Proxy mode (v0.2)
+## Proxy mode
 
 Start the local router in terminal 1:
 
@@ -84,12 +84,52 @@ ccm proxy --bind 127.0.0.1:14521
 ccm run --proxy --proxy-url http://127.0.0.1:14521
 ```
 
+## In-session switching from Claude Code
+
+Install CCM's global Claude Code command:
+
+```bash
+ccm integrate claude
+```
+
+This creates:
+
+```text
+~/.claude/commands/switch.md
+```
+
+Then start Claude Code through CCM's proxy:
+
+```bash
+ccm proxy
+ccm run --proxy
+```
+
+Inside the running Claude Code session, switch backends with:
+
+```text
+/switch glm
+/switch claude
+/switch fast
+```
+
+The slash command runs `ccm use <model-or-profile>`. Because the proxy reloads CCM configuration on each request, subsequent Claude Code requests are routed to the newly selected backend without restarting the session.
+
+Remove the integration with:
+
+```bash
+ccm integrate claude --remove
+```
+
+The integration expects the `ccm` executable to be available on `PATH`.
+
 ## Commands
 
 ```text
 ccm init [--force]
 ccm add provider <name> [--base-url URL] [--kind KIND]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
+ccm integrate claude [--remove]
 ccm doctor
 ccm proxy [--bind HOST:PORT]
 ccm list
@@ -164,7 +204,7 @@ Secrets are stored with the Rust `keyring` crate and are not written to `config.
 
 ## Proxy scope
 
-The v0.2 proxy intentionally stays small:
+The current proxy intentionally stays small:
 
 - Anthropic-compatible `/v1/messages` only
 - request model rewriting
@@ -195,6 +235,7 @@ GitHub Actions runs these checks on Linux, Windows, and macOS.
 - In-session backend switching
 - Streaming Anthropic-compatible forwarding
 - Proxy-aware Claude Code launcher
+- Global `/switch` integration for Claude Code
 
 ### v0.3
 
