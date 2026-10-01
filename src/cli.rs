@@ -11,11 +11,10 @@ pub struct Cli {
 pub enum Command {
     /// Create ~/.ccm/config.toml with a starter configuration.
     Init {
-        /// Overwrite an existing configuration file.
         #[arg(long)]
         force: bool,
     },
-    /// Add or update providers and models.
+    /// Add or update providers, models, and routes.
     Add {
         #[command(subcommand)]
         command: AddCommand,
@@ -29,7 +28,6 @@ pub enum Command {
     Doctor,
     /// Start the local Anthropic-compatible routing proxy.
     Proxy {
-        /// Address to bind, for example 127.0.0.1:13521.
         #[arg(long, default_value = "127.0.0.1:13521")]
         bind: String,
     },
@@ -39,20 +37,17 @@ pub enum Command {
     Current,
     /// Persist a model or profile alias as the default selection.
     Use { target: String },
-    /// Switch the active route of a running CCM proxy without changing config.toml.
+    /// Switch the active model/profile/route of a running CCM proxy.
     Switch {
         target: String,
-        /// Local CCM proxy base URL.
         #[arg(long, default_value = "http://127.0.0.1:13521")]
         proxy_url: String,
     },
-    /// Launch Claude Code using a model/profile alias, or through the local CCM proxy.
+    /// Launch Claude Code directly or through the local CCM proxy.
     Run {
         target: Option<String>,
-        /// Connect Claude Code to the local CCM proxy instead of directly to the provider.
         #[arg(long)]
         proxy: bool,
-        /// Local proxy base URL used with --proxy.
         #[arg(long, default_value = "http://127.0.0.1:13521")]
         proxy_url: String,
     },
@@ -83,13 +78,20 @@ pub enum AddCommand {
         #[arg(long)]
         model_id: Option<String>,
     },
+    /// Add or update a route. Fallback accepts a comma-separated model list.
+    Route {
+        name: String,
+        #[arg(long)]
+        primary: Option<String>,
+        #[arg(long)]
+        fallback: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum IntegrateCommand {
     /// Install the global /switch command for Claude Code.
     Claude {
-        /// Remove the installed command instead of installing it.
         #[arg(long)]
         remove: bool,
     },
