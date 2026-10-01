@@ -30,13 +30,7 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
         } => {
             let provider = required(provider, "Provider")?;
             let model_id = required(model_id, "Model ID")?;
-            config.add_model(
-                name.clone(),
-                Model {
-                    provider,
-                    model_id,
-                },
-            )?;
+            config.add_model(name.clone(), Model { provider, model_id })?;
             config.save()?;
             println!("Saved model {name}");
         }
