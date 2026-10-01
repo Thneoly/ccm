@@ -7,7 +7,7 @@ use crate::{
     config::AppConfig,
     model::Model,
     provider::{Provider, ProviderKind},
-    route::{Route, RoutePolicy},
+    route::{CircuitBreakerPolicy, Route, RoutePolicy},
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
@@ -43,6 +43,9 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             fallback_on,
             max_attempts,
             backoff_ms,
+            circuit_enabled,
+            failure_threshold,
+            circuit_open_ms,
         } => {
             let primary = required(primary, "Primary model")?;
             let fallback = parse_csv_strings(fallback.unwrap_or_default());
@@ -52,6 +55,11 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
                 fallback_on,
                 max_attempts,
                 backoff_ms,
+                circuit_breaker: CircuitBreakerPolicy {
+                    enabled: circuit_enabled,
+                    failure_threshold,
+                    open_ms: circuit_open_ms,
+                },
             };
             config.add_route(
                 name.clone(),
