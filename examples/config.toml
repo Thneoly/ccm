@@ -1,0 +1,23 @@
+current = "claude"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[providers.zai]
+kind = "anthropic-compatible"
+base_url = "https://api.z.ai/api/anthropic"
+
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-4-5"
+
+[models.glm]
+provider = "zai"
+model_id = "glm-5"
+
+[profiles.coding]
+model = "claude"
+
+[profiles.fast]
+model = "glm"
