@@ -150,6 +150,8 @@ ccm route=coding attempt=1 model=claude result=timeout after 30s action=fallback
 ccm route=coding attempt=2 model=glm result=HTTP 200
 ```
 
+The proxy keeps the most recent 100 attempt traces in memory.
+
 ## Control API
 
 ```text
@@ -157,6 +159,7 @@ GET  /health
 GET  /_ccm/status
 GET  /_ccm/models
 GET  /_ccm/routes
+GET  /_ccm/traces
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
@@ -166,6 +169,7 @@ Examples:
 curl http://127.0.0.1:13521/_ccm/status
 curl http://127.0.0.1:13521/_ccm/models
 curl http://127.0.0.1:13521/_ccm/routes
+curl http://127.0.0.1:13521/_ccm/traces
 curl -X POST http://127.0.0.1:13521/_ccm/switch/coding-route
 ```
 
@@ -178,6 +182,19 @@ A route-aware status response looks like:
   "model_id": "claude-sonnet-4-5",
   "provider": "anthropic",
   "fallback": ["glm"]
+}
+```
+
+A trace entry looks like:
+
+```json
+{
+  "timestamp_ms": 1790820000000,
+  "target": "coding",
+  "attempt": 1,
+  "model": "claude",
+  "result": "HTTP 429 Too Many Requests",
+  "fallback": true
 }
 ```
 
@@ -263,7 +280,7 @@ Secrets are stored with the Rust `keyring` crate and are not written to `config.
 - first-class route objects
 - local control API
 - ordered route fallback execution
-- attempt tracing
+- in-memory attempt tracing
 - no mid-stream failover
 - no OpenAI protocol translation yet
 
@@ -280,7 +297,7 @@ GitHub Actions CI is currently disabled; run these checks locally before release
 
 ## Next
 
-The next routing step is policy configuration: make timeout/retry/fallback conditions route-specific, add backoff, and expose recent attempt traces through the control API.
+The next routing step is policy configuration: make timeout/retry/fallback conditions route-specific, add backoff and simple circuit-breaking, then expose those policies through the control API.
 
 ## License
 
