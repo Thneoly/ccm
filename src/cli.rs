@@ -20,6 +20,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AddCommand,
     },
+    /// Install or remove integrations for supported coding CLIs.
+    Integrate {
+        #[command(subcommand)]
+        command: IntegrateCommand,
+    },
     /// Run local diagnostics for Claude Code and the selected model.
     Doctor,
     /// Start the local Anthropic-compatible routing proxy.
@@ -70,6 +75,16 @@ pub enum AddCommand {
         provider: Option<String>,
         #[arg(long)]
         model_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IntegrateCommand {
+    /// Install the global /switch command for Claude Code.
+    Claude {
+        /// Remove the installed command instead of installing it.
+        #[arg(long)]
+        remove: bool,
     },
 }
 
