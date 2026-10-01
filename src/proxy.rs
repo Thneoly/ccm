@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,9 +17,16 @@ use axum::{
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{sync::RwLock, time::{sleep, timeout}};
+use tokio::{
+    sync::RwLock,
+    time::{sleep, timeout},
+};
 
-use crate::{config::AppConfig, credential, route::RoutePolicy};
+use crate::{
+    config::AppConfig,
+    credential,
+    route::{CircuitBreakerPolicy, RoutePolicy},
+};
 
 const TRACE_CAPACITY: usize = 100;
 
@@ -28,6 +35,22 @@ struct ProxyState {
     client: Client,
     target: Arc<RwLock<String>>,
     traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
+    circuits: Arc<RwLock<HashMap<String, CircuitState>>>,
+}
+
+#[derive(Clone, Default)]
+struct CircuitState {
+    consecutive_failures: usize,
+    open_until_ms: Option<u64>,
+    half_open_probe_in_flight: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CircuitDecision {
+    Closed,
+    HalfOpen,
+    SkipOpen(u64),
+    SkipHalfOpen,
 }
 
 #[derive(Clone, Serialize)]
@@ -41,11 +64,29 @@ struct AttemptTrace {
 }
 
 #[derive(Clone, Serialize)]
+struct CircuitPolicyView {
+    enabled: bool,
+    failure_threshold: usize,
+    open_ms: u64,
+}
+
+impl From<&CircuitBreakerPolicy> for CircuitPolicyView {
+    fn from(policy: &CircuitBreakerPolicy) -> Self {
+        Self {
+            enabled: policy.enabled,
+            failure_threshold: policy.failure_threshold,
+            open_ms: policy.open_ms,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
 struct PolicyView {
     header_timeout_ms: u64,
     fallback_on: Vec<u16>,
     max_attempts: usize,
     backoff_ms: u64,
+    circuit_breaker: CircuitPolicyView,
 }
 
 impl From<&RoutePolicy> for PolicyView {
@@ -55,6 +96,7 @@ impl From<&RoutePolicy> for PolicyView {
             fallback_on: policy.fallback_on.clone(),
             max_attempts: policy.max_attempts,
             backoff_ms: policy.backoff_ms,
+            circuit_breaker: CircuitPolicyView::from(&policy.circuit_breaker),
         }
     }
 }
@@ -94,6 +136,14 @@ struct SwitchView {
     policy: PolicyView,
 }
 
+#[derive(Serialize)]
+struct CircuitView {
+    model: String,
+    state: String,
+    consecutive_failures: usize,
+    open_until_ms: Option<u64>,
+}
+
 pub async fn serve(bind: &str) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
@@ -110,6 +160,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
         traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
+        circuits: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -118,6 +169,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         .route("/_ccm/models", get(control_models))
         .route("/_ccm/routes", get(control_routes))
         .route("/_ccm/traces", get(control_traces))
+        .route("/_ccm/circuits", get(control_circuits))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -189,6 +241,30 @@ async fn control_traces(State(state): State<ProxyState>) -> Json<Vec<AttemptTrac
     Json(traces)
 }
 
+async fn control_circuits(State(state): State<ProxyState>) -> Json<Vec<CircuitView>> {
+    let now = now_ms();
+    let circuits = state.circuits.read().await;
+    let mut views = circuits
+        .iter()
+        .map(|(model, circuit)| {
+            let state_name = match circuit.open_until_ms {
+                Some(until) if until > now => "OPEN",
+                Some(_) if circuit.half_open_probe_in_flight => "HALF_OPEN",
+                Some(_) => "HALF_OPEN_READY",
+                None => "CLOSED",
+            };
+            CircuitView {
+                model: model.clone(),
+                state: state_name.to_string(),
+                consecutive_failures: circuit.consecutive_failures,
+                open_until_ms: circuit.open_until_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| left.model.cmp(&right.model));
+    Json(views)
+}
+
 async fn control_switch(
     State(state): State<ProxyState>,
     Path(target): Path<String>,
@@ -251,11 +327,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
-    let candidates = route
-        .candidates()
-        .take(route.policy.max_attempts)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -263,10 +335,51 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         .context("failed to read request body")?;
 
     let mut failures = Vec::new();
+    let mut actual_attempts = 0usize;
 
     for (index, candidate) in candidates.iter().enumerate() {
-        let attempt = index + 1;
-        let has_next = attempt < candidates.len();
+        if actual_attempts >= route.policy.max_attempts {
+            break;
+        }
+
+        match circuit_admit(&state, candidate, &route.policy.circuit_breaker).await {
+            CircuitDecision::SkipOpen(until) => {
+                let result = format!("skipped: circuit OPEN until {until}");
+                trace_attempt(
+                    &state,
+                    &target,
+                    actual_attempts + 1,
+                    candidate,
+                    &result,
+                    index + 1 < candidates.len(),
+                )
+                .await;
+                failures.push(format!("{candidate}: {result}"));
+                continue;
+            }
+            CircuitDecision::SkipHalfOpen => {
+                let result = "skipped: HALF_OPEN probe already in flight".to_string();
+                trace_attempt(
+                    &state,
+                    &target,
+                    actual_attempts + 1,
+                    candidate,
+                    &result,
+                    index + 1 < candidates.len(),
+                )
+                .await;
+                failures.push(format!("{candidate}: {result}"));
+                continue;
+            }
+            CircuitDecision::Closed | CircuitDecision::HalfOpen => {}
+        }
+
+        actual_attempts += 1;
+        let attempt = actual_attempts;
+        let has_next_candidate = index + 1 < candidates.len();
+        let has_attempt_budget = actual_attempts < route.policy.max_attempts;
+        let can_fallback = has_next_candidate && has_attempt_budget;
+
         let model = config
             .models
             .get(candidate)
@@ -290,9 +403,10 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         let upstream_response = match send {
             Err(_) => {
                 let result = format!("timeout after {}ms", route.policy.header_timeout_ms);
-                trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
+                circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
+                trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
                 failures.push(format!("{candidate}: {result}"));
-                if has_next {
+                if can_fallback {
                     apply_backoff(route.policy.backoff_ms).await;
                     continue;
                 }
@@ -300,9 +414,10 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             }
             Ok(Err(err)) => {
                 let result = format!("request error: {err}");
-                trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
+                circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
+                trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
                 failures.push(format!("{candidate}: {result}"));
-                if has_next {
+                if can_fallback {
                     apply_backoff(route.policy.backoff_ms).await;
                     continue;
                 }
@@ -312,14 +427,19 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         };
 
         let status = upstream_response.status();
-        if should_fallback_status(status, &route.policy) && has_next {
+        if should_fallback_status(status, &route.policy) {
+            circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
             let result = format!("HTTP {status}");
-            trace_attempt(&state, &target, attempt, candidate, &result, true).await;
+            trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
             failures.push(format!("{candidate}: {result}"));
-            apply_backoff(route.policy.backoff_ms).await;
-            continue;
+            if can_fallback {
+                apply_backoff(route.policy.backoff_ms).await;
+                continue;
+            }
+            return proxy_response(upstream_response);
         }
 
+        circuit_success(&state, candidate, &route.policy.circuit_breaker).await;
         trace_attempt(
             &state,
             &target,
@@ -333,9 +453,70 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     }
 
     bail!(
-        "all allowed route attempts failed for `{target}`: {}",
+        "all available route candidates failed for `{target}`: {}",
         failures.join("; ")
     )
+}
+
+async fn circuit_admit(
+    state: &ProxyState,
+    model: &str,
+    policy: &CircuitBreakerPolicy,
+) -> CircuitDecision {
+    if !policy.enabled {
+        return CircuitDecision::Closed;
+    }
+
+    let now = now_ms();
+    let mut circuits = state.circuits.write().await;
+    let circuit = circuits.entry(model.to_string()).or_default();
+
+    match circuit.open_until_ms {
+        Some(until) if until > now => CircuitDecision::SkipOpen(until),
+        Some(_) if circuit.half_open_probe_in_flight => CircuitDecision::SkipHalfOpen,
+        Some(_) => {
+            circuit.half_open_probe_in_flight = true;
+            CircuitDecision::HalfOpen
+        }
+        None => CircuitDecision::Closed,
+    }
+}
+
+async fn circuit_failure(
+    state: &ProxyState,
+    model: &str,
+    policy: &CircuitBreakerPolicy,
+) {
+    if !policy.enabled {
+        return;
+    }
+
+    let mut circuits = state.circuits.write().await;
+    let circuit = circuits.entry(model.to_string()).or_default();
+    circuit.consecutive_failures += 1;
+
+    if circuit.half_open_probe_in_flight
+        || circuit.consecutive_failures >= policy.failure_threshold
+    {
+        circuit.open_until_ms = Some(now_ms().saturating_add(policy.open_ms));
+        circuit.half_open_probe_in_flight = false;
+    }
+}
+
+async fn circuit_success(
+    state: &ProxyState,
+    model: &str,
+    policy: &CircuitBreakerPolicy,
+) {
+    if !policy.enabled {
+        return;
+    }
+
+    let mut circuits = state.circuits.write().await;
+    let circuit = circuits.entry(model.to_string()).or_default();
+    circuit.consecutive_failures = 0;
+    circuit.open_until_ms = None;
+    circuit.half_open_probe_in_flight = false;
 }
 
 async fn apply_backoff(backoff_ms: u64) {
@@ -467,6 +648,7 @@ mod tests {
         assert_eq!(status.primary, "claude");
         assert_eq!(status.fallback, vec!["glm"]);
         assert_eq!(status.policy.header_timeout_ms, 30_000);
+        assert!(status.policy.circuit_breaker.enabled);
     }
 
     #[test]
@@ -475,9 +657,17 @@ mod tests {
             fallback_on: vec![429, 503],
             ..RoutePolicy::default()
         };
-        assert!(should_fallback_status(reqwest::StatusCode::TOO_MANY_REQUESTS, &policy));
-        assert!(should_fallback_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, &policy));
-        assert!(!should_fallback_status(reqwest::StatusCode::BAD_GATEWAY, &policy));
-        assert!(!should_fallback_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &policy));
+        assert!(should_fallback_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &policy
+        ));
+        assert!(should_fallback_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &policy
+        ));
+        assert!(!should_fallback_status(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &policy
+        ));
     }
 }
