@@ -1,6 +1,6 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
@@ -12,9 +12,11 @@ use axum::{
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, time::timeout};
 
 use crate::{config::AppConfig, credential};
+
+const ATTEMPT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ProxyState {
@@ -201,30 +203,97 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
-    let model = config
-        .models
-        .get(&route.primary)
-        .with_context(|| format!("primary model `{}` is not configured", route.primary))?;
-    let provider = config
-        .providers
-        .get(&model.provider)
-        .with_context(|| format!("provider `{}` is not configured", model.provider))?;
-    let token = credential::get(&model.provider)?;
+    let candidates = std::iter::once(route.primary.clone())
+        .chain(route.fallback.iter().cloned())
+        .collect::<Vec<_>>();
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
         .await
         .context("failed to read request body")?;
-    let body = rewrite_model(bytes, &model.model_id)?;
 
-    let upstream = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
-    let mut builder = state.client.post(upstream).body(body);
-    builder = copy_request_headers(builder, &parts.headers);
-    builder = builder
-        .header("x-api-key", &token)
-        .header("authorization", format!("Bearer {token}"));
+    let mut failures = Vec::new();
 
-    let upstream_response = builder.send().await.context("upstream request failed")?;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let attempt = index + 1;
+        let has_next = attempt < candidates.len();
+        let model = config
+            .models
+            .get(candidate)
+            .with_context(|| format!("route candidate model `{candidate}` is not configured"))?;
+        let provider = config
+            .providers
+            .get(&model.provider)
+            .with_context(|| format!("provider `{}` is not configured", model.provider))?;
+        let token = credential::get(&model.provider)?;
+        let body = rewrite_model(bytes.clone(), &model.model_id)?;
+        let upstream = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
+
+        let mut builder = state.client.post(upstream).body(body);
+        builder = copy_request_headers(builder, &parts.headers);
+        builder = builder
+            .header("x-api-key", &token)
+            .header("authorization", format!("Bearer {token}"));
+
+        let send = timeout(ATTEMPT_HEADER_TIMEOUT, builder.send()).await;
+        let upstream_response = match send {
+            Err(_) => {
+                let result = format!("timeout after {}s", ATTEMPT_HEADER_TIMEOUT.as_secs());
+                trace_attempt(&target, attempt, candidate, &result, has_next);
+                failures.push(format!("{candidate}: {result}"));
+                if has_next {
+                    continue;
+                }
+                break;
+            }
+            Ok(Err(err)) => {
+                let result = format!("request error: {err}");
+                trace_attempt(&target, attempt, candidate, &result, has_next);
+                failures.push(format!("{candidate}: {result}"));
+                if has_next {
+                    continue;
+                }
+                break;
+            }
+            Ok(Ok(response)) => response,
+        };
+
+        let status = upstream_response.status();
+        if is_fallback_status(status) && has_next {
+            let result = format!("HTTP {status}");
+            trace_attempt(&target, attempt, candidate, &result, true);
+            failures.push(format!("{candidate}: {result}"));
+            continue;
+        }
+
+        trace_attempt(&target, attempt, candidate, &format!("HTTP {status}"), false);
+        return proxy_response(upstream_response);
+    }
+
+    bail!(
+        "all route candidates failed for `{target}`: {}",
+        failures.join("; ")
+    )
+}
+
+fn trace_attempt(target: &str, attempt: usize, model: &str, result: &str, fallback: bool) {
+    if fallback {
+        eprintln!(
+            "ccm route={target} attempt={attempt} model={model} result={result} action=fallback"
+        );
+    } else {
+        eprintln!("ccm route={target} attempt={attempt} model={model} result={result}");
+    }
+}
+
+fn is_fallback_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::BAD_GATEWAY
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+}
+
+fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
     let stream = upstream_response.bytes_stream();
@@ -302,5 +371,17 @@ mod tests {
         assert_eq!(status.target, "coding-route");
         assert_eq!(status.primary, "claude");
         assert_eq!(status.fallback, vec!["glm"]);
+    }
+
+    #[test]
+    fn fallback_status_policy_is_narrow() {
+        assert!(is_fallback_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_fallback_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(is_fallback_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_fallback_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_fallback_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_fallback_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_fallback_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_fallback_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
     }
 }
