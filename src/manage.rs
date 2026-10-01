@@ -7,7 +7,7 @@ use crate::{
     config::AppConfig,
     model::Model,
     provider::{Provider, ProviderKind},
-    route::{CircuitBreakerPolicy, Route, RoutePolicy},
+    route::{CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy},
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
@@ -39,6 +39,7 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             name,
             primary,
             fallback,
+            selection,
             header_timeout_ms,
             fallback_on,
             max_attempts,
@@ -50,7 +51,9 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             let primary = required(primary, "Primary model")?;
             let fallback = parse_csv_strings(fallback.unwrap_or_default());
             let fallback_on = parse_status_codes(&fallback_on)?;
+            let selection = parse_selection(&selection)?;
             let policy = RoutePolicy {
+                selection,
                 header_timeout_ms,
                 fallback_on,
                 max_attempts,
@@ -114,6 +117,17 @@ fn parse_status_codes(value: &str) -> Result<Vec<u16>> {
                 .with_context(|| format!("invalid HTTP status code `{value}`"))
         })
         .collect()
+}
+
+fn parse_selection(value: &str) -> Result<SelectionStrategy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ordered" => Ok(SelectionStrategy::Ordered),
+        "healthiest" => Ok(SelectionStrategy::Healthiest),
+        "lowest-latency" | "lowest_latency" | "latency" => Ok(SelectionStrategy::LowestLatency),
+        other => bail!(
+            "unsupported selection strategy `{other}`; expected ordered, healthiest, or lowest-latency"
+        ),
+    }
 }
 
 fn parse_kind(value: &str) -> Result<ProviderKind> {
