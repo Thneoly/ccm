@@ -7,6 +7,7 @@ use crate::{
     config::AppConfig,
     model::Model,
     provider::{Provider, ProviderKind},
+    route::Route,
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
@@ -33,6 +34,23 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             config.add_model(name.clone(), Model { provider, model_id })?;
             config.save()?;
             println!("Saved model {name}");
+        }
+        AddCommand::Route {
+            name,
+            primary,
+            fallback,
+        } => {
+            let primary = required(primary, "Primary model")?;
+            let fallback = fallback
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            config.add_route(name.clone(), Route { primary, fallback })?;
+            config.save()?;
+            println!("Saved route {name}");
         }
     }
     Ok(())
