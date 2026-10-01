@@ -17,11 +17,10 @@ use axum::{
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{sync::RwLock, time::timeout};
+use tokio::{sync::RwLock, time::{sleep, timeout}};
 
-use crate::{config::AppConfig, credential};
+use crate::{config::AppConfig, credential, route::RoutePolicy};
 
-const ATTEMPT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const TRACE_CAPACITY: usize = 100;
 
 #[derive(Clone)]
@@ -41,6 +40,25 @@ struct AttemptTrace {
     fallback: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct PolicyView {
+    header_timeout_ms: u64,
+    fallback_on: Vec<u16>,
+    max_attempts: usize,
+    backoff_ms: u64,
+}
+
+impl From<&RoutePolicy> for PolicyView {
+    fn from(policy: &RoutePolicy) -> Self {
+        Self {
+            header_timeout_ms: policy.header_timeout_ms,
+            fallback_on: policy.fallback_on.clone(),
+            max_attempts: policy.max_attempts,
+            backoff_ms: policy.backoff_ms,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct StatusView {
     target: String,
@@ -48,6 +66,7 @@ struct StatusView {
     model_id: String,
     provider: String,
     fallback: Vec<String>,
+    policy: PolicyView,
 }
 
 #[derive(Serialize)]
@@ -62,6 +81,7 @@ struct RouteView {
     name: String,
     primary: String,
     fallback: Vec<String>,
+    policy: PolicyView,
     active: bool,
 }
 
@@ -71,6 +91,7 @@ struct SwitchView {
     target: String,
     primary: String,
     fallback: Vec<String>,
+    policy: PolicyView,
 }
 
 pub async fn serve(bind: &str) -> Result<()> {
@@ -153,6 +174,7 @@ async fn control_routes(State(state): State<ProxyState>) -> impl IntoResponse {
                     name: name.clone(),
                     primary: route.primary.clone(),
                     fallback: route.fallback.clone(),
+                    policy: PolicyView::from(&route.policy),
                     active: name == &active,
                 })
                 .collect::<Vec<_>>();
@@ -179,6 +201,7 @@ async fn control_switch(
                 target: route.target,
                 primary: route.primary,
                 fallback: route.fallback,
+                policy: PolicyView::from(&route.policy),
             })
             .into_response()
         }
@@ -202,6 +225,7 @@ fn status_view(config: &AppConfig, target: &str) -> Result<StatusView> {
         model_id: model.model_id.clone(),
         provider: model.provider.clone(),
         fallback: route.fallback,
+        policy: PolicyView::from(&route.policy),
     })
 }
 
@@ -227,7 +251,11 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
-    let candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
+    let candidates = route
+        .candidates()
+        .take(route.policy.max_attempts)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -257,13 +285,15 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             .header("x-api-key", &token)
             .header("authorization", format!("Bearer {token}"));
 
-        let send = timeout(ATTEMPT_HEADER_TIMEOUT, builder.send()).await;
+        let header_timeout = Duration::from_millis(route.policy.header_timeout_ms);
+        let send = timeout(header_timeout, builder.send()).await;
         let upstream_response = match send {
             Err(_) => {
-                let result = format!("timeout after {}s", ATTEMPT_HEADER_TIMEOUT.as_secs());
+                let result = format!("timeout after {}ms", route.policy.header_timeout_ms);
                 trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
                 failures.push(format!("{candidate}: {result}"));
                 if has_next {
+                    apply_backoff(route.policy.backoff_ms).await;
                     continue;
                 }
                 break;
@@ -273,6 +303,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
                 failures.push(format!("{candidate}: {result}"));
                 if has_next {
+                    apply_backoff(route.policy.backoff_ms).await;
                     continue;
                 }
                 break;
@@ -281,10 +312,11 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         };
 
         let status = upstream_response.status();
-        if is_fallback_status(status) && has_next {
+        if should_fallback_status(status, &route.policy) && has_next {
             let result = format!("HTTP {status}");
             trace_attempt(&state, &target, attempt, candidate, &result, true).await;
             failures.push(format!("{candidate}: {result}"));
+            apply_backoff(route.policy.backoff_ms).await;
             continue;
         }
 
@@ -301,9 +333,15 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     }
 
     bail!(
-        "all route candidates failed for `{target}`: {}",
+        "all allowed route attempts failed for `{target}`: {}",
         failures.join("; ")
     )
+}
+
+async fn apply_backoff(backoff_ms: u64) {
+    if backoff_ms > 0 {
+        sleep(Duration::from_millis(backoff_ms)).await;
+    }
 }
 
 async fn trace_attempt(
@@ -346,11 +384,8 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn is_fallback_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::BAD_GATEWAY
-        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+fn should_fallback_status(status: reqwest::StatusCode, policy: &RoutePolicy) -> bool {
+    policy.fallback_on.contains(&status.as_u16())
 }
 
 fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>> {
@@ -431,17 +466,18 @@ mod tests {
         assert_eq!(status.target, "coding-route");
         assert_eq!(status.primary, "claude");
         assert_eq!(status.fallback, vec!["glm"]);
+        assert_eq!(status.policy.header_timeout_ms, 30_000);
     }
 
     #[test]
-    fn fallback_status_policy_is_narrow() {
-        assert!(is_fallback_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_fallback_status(reqwest::StatusCode::BAD_GATEWAY));
-        assert!(is_fallback_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
-        assert!(is_fallback_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
-        assert!(!is_fallback_status(reqwest::StatusCode::BAD_REQUEST));
-        assert!(!is_fallback_status(reqwest::StatusCode::UNAUTHORIZED));
-        assert!(!is_fallback_status(reqwest::StatusCode::FORBIDDEN));
-        assert!(!is_fallback_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    fn fallback_status_comes_from_policy() {
+        let policy = RoutePolicy {
+            fallback_on: vec![429, 503],
+            ..RoutePolicy::default()
+        };
+        assert!(should_fallback_status(reqwest::StatusCode::TOO_MANY_REQUESTS, &policy));
+        assert!(should_fallback_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, &policy));
+        assert!(!should_fallback_status(reqwest::StatusCode::BAD_GATEWAY, &policy));
+        assert!(!should_fallback_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &policy));
     }
 }
