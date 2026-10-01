@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -17,11 +22,23 @@ use tokio::{sync::RwLock, time::timeout};
 use crate::{config::AppConfig, credential};
 
 const ATTEMPT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const TRACE_CAPACITY: usize = 100;
 
 #[derive(Clone)]
 struct ProxyState {
     client: Client,
     target: Arc<RwLock<String>>,
+    traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
+}
+
+#[derive(Clone, Serialize)]
+struct AttemptTrace {
+    timestamp_ms: u64,
+    target: String,
+    attempt: usize,
+    model: String,
+    result: String,
+    fallback: bool,
 }
 
 #[derive(Serialize)]
@@ -71,6 +88,7 @@ pub async fn serve(bind: &str) -> Result<()> {
     let state = ProxyState {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
+        traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
     };
 
     let app = Router::new()
@@ -78,6 +96,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         .route("/_ccm/status", get(control_status))
         .route("/_ccm/models", get(control_models))
         .route("/_ccm/routes", get(control_routes))
+        .route("/_ccm/traces", get(control_traces))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -143,6 +162,11 @@ async fn control_routes(State(state): State<ProxyState>) -> impl IntoResponse {
     }
 }
 
+async fn control_traces(State(state): State<ProxyState>) -> Json<Vec<AttemptTrace>> {
+    let traces = state.traces.read().await.iter().cloned().collect();
+    Json(traces)
+}
+
 async fn control_switch(
     State(state): State<ProxyState>,
     Path(target): Path<String>,
@@ -203,9 +227,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
-    let candidates = std::iter::once(route.primary.clone())
-        .chain(route.fallback.iter().cloned())
-        .collect::<Vec<_>>();
+    let candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -239,7 +261,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         let upstream_response = match send {
             Err(_) => {
                 let result = format!("timeout after {}s", ATTEMPT_HEADER_TIMEOUT.as_secs());
-                trace_attempt(&target, attempt, candidate, &result, has_next);
+                trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
                 failures.push(format!("{candidate}: {result}"));
                 if has_next {
                     continue;
@@ -248,7 +270,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             }
             Ok(Err(err)) => {
                 let result = format!("request error: {err}");
-                trace_attempt(&target, attempt, candidate, &result, has_next);
+                trace_attempt(&state, &target, attempt, candidate, &result, has_next).await;
                 failures.push(format!("{candidate}: {result}"));
                 if has_next {
                     continue;
@@ -261,12 +283,20 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         let status = upstream_response.status();
         if is_fallback_status(status) && has_next {
             let result = format!("HTTP {status}");
-            trace_attempt(&target, attempt, candidate, &result, true);
+            trace_attempt(&state, &target, attempt, candidate, &result, true).await;
             failures.push(format!("{candidate}: {result}"));
             continue;
         }
 
-        trace_attempt(&target, attempt, candidate, &format!("HTTP {status}"), false);
+        trace_attempt(
+            &state,
+            &target,
+            attempt,
+            candidate,
+            &format!("HTTP {status}"),
+            false,
+        )
+        .await;
         return proxy_response(upstream_response);
     }
 
@@ -276,7 +306,23 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     )
 }
 
-fn trace_attempt(target: &str, attempt: usize, model: &str, result: &str, fallback: bool) {
+async fn trace_attempt(
+    state: &ProxyState,
+    target: &str,
+    attempt: usize,
+    model: &str,
+    result: &str,
+    fallback: bool,
+) {
+    let trace = AttemptTrace {
+        timestamp_ms: now_ms(),
+        target: target.to_string(),
+        attempt,
+        model: model.to_string(),
+        result: result.to_string(),
+        fallback,
+    };
+
     if fallback {
         eprintln!(
             "ccm route={target} attempt={attempt} model={model} result={result} action=fallback"
@@ -284,6 +330,20 @@ fn trace_attempt(target: &str, attempt: usize, model: &str, result: &str, fallba
     } else {
         eprintln!("ccm route={target} attempt={attempt} model={model} result={result}");
     }
+
+    let mut traces = state.traces.write().await;
+    if traces.len() == TRACE_CAPACITY {
+        traces.pop_front();
+    }
+    traces.push_back(trace);
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn is_fallback_status(status: reqwest::StatusCode) -> bool {
