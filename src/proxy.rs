@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +29,7 @@ use crate::{
 };
 
 const TRACE_CAPACITY: usize = 100;
+const LATENCY_EWMA_ALPHA: f64 = 0.2;
 
 #[derive(Clone)]
 struct ProxyState {
@@ -36,6 +37,7 @@ struct ProxyState {
     target: Arc<RwLock<String>>,
     traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
     circuits: Arc<RwLock<HashMap<String, CircuitState>>>,
+    metrics: Arc<RwLock<HashMap<String, ModelMetrics>>>,
 }
 
 #[derive(Clone, Default)]
@@ -51,6 +53,36 @@ enum CircuitDecision {
     HalfOpen,
     SkipOpen(u64),
     SkipHalfOpen,
+}
+
+#[derive(Clone, Default)]
+struct ModelMetrics {
+    attempts: u64,
+    successes: u64,
+    http_errors: u64,
+    fallback_failures: u64,
+    timeouts: u64,
+    request_errors: u64,
+    rate_limited: u64,
+    latency_ewma_ms: Option<f64>,
+    last_success_ms: Option<u64>,
+    last_failure_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct ModelMetricsView {
+    model: String,
+    attempts: u64,
+    successes: u64,
+    success_rate: f64,
+    http_errors: u64,
+    fallback_failures: u64,
+    timeouts: u64,
+    request_errors: u64,
+    rate_limited: u64,
+    latency_ewma_ms: Option<f64>,
+    last_success_ms: Option<u64>,
+    last_failure_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -161,6 +193,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         target: Arc::new(RwLock::new(target)),
         traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
         circuits: Arc::new(RwLock::new(HashMap::new())),
+        metrics: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -170,6 +203,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         .route("/_ccm/routes", get(control_routes))
         .route("/_ccm/traces", get(control_traces))
         .route("/_ccm/circuits", get(control_circuits))
+        .route("/_ccm/metrics", get(control_metrics))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -259,6 +293,29 @@ async fn control_circuits(State(state): State<ProxyState>) -> Json<Vec<CircuitVi
                 consecutive_failures: circuit.consecutive_failures,
                 open_until_ms: circuit.open_until_ms,
             }
+        })
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| left.model.cmp(&right.model));
+    Json(views)
+}
+
+async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetricsView>> {
+    let metrics = state.metrics.read().await;
+    let mut views = metrics
+        .iter()
+        .map(|(model, metrics)| ModelMetricsView {
+            model: model.clone(),
+            attempts: metrics.attempts,
+            successes: metrics.successes,
+            success_rate: success_rate(metrics),
+            http_errors: metrics.http_errors,
+            fallback_failures: metrics.fallback_failures,
+            timeouts: metrics.timeouts,
+            request_errors: metrics.request_errors,
+            rate_limited: metrics.rate_limited,
+            latency_ewma_ms: metrics.latency_ewma_ms,
+            last_success_ms: metrics.last_success_ms,
+            last_failure_ms: metrics.last_failure_ms,
         })
         .collect::<Vec<_>>();
     views.sort_by(|left, right| left.model.cmp(&right.model));
@@ -398,11 +455,15 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             .header("x-api-key", &token)
             .header("authorization", format!("Bearer {token}"));
 
+        let started = Instant::now();
+        record_attempt_started(&state, candidate).await;
         let header_timeout = Duration::from_millis(route.policy.header_timeout_ms);
         let send = timeout(header_timeout, builder.send()).await;
         let upstream_response = match send {
             Err(_) => {
+                let elapsed_ms = elapsed_ms(started);
                 let result = format!("timeout after {}ms", route.policy.header_timeout_ms);
+                record_timeout(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
                 trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
                 failures.push(format!("{candidate}: {result}"));
@@ -413,7 +474,9 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 break;
             }
             Ok(Err(err)) => {
+                let elapsed_ms = elapsed_ms(started);
                 let result = format!("request error: {err}");
+                record_request_error(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
                 trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
                 failures.push(format!("{candidate}: {result}"));
@@ -423,7 +486,18 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 }
                 break;
             }
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => {
+                let elapsed_ms = elapsed_ms(started);
+                record_http_response(
+                    &state,
+                    candidate,
+                    response.status(),
+                    elapsed_ms,
+                    should_fallback_status(response.status(), &route.policy),
+                )
+                .await;
+                response
+            }
         };
 
         let status = upstream_response.status();
@@ -517,6 +591,75 @@ async fn circuit_success(
     circuit.consecutive_failures = 0;
     circuit.open_until_ms = None;
     circuit.half_open_probe_in_flight = false;
+}
+
+async fn record_attempt_started(state: &ProxyState, model: &str) {
+    let mut metrics = state.metrics.write().await;
+    metrics.entry(model.to_string()).or_default().attempts += 1;
+}
+
+async fn record_timeout(state: &ProxyState, model: &str, latency_ms: f64) {
+    let mut metrics = state.metrics.write().await;
+    let metric = metrics.entry(model.to_string()).or_default();
+    metric.timeouts += 1;
+    metric.last_failure_ms = Some(now_ms());
+    update_latency_ewma(metric, latency_ms);
+}
+
+async fn record_request_error(state: &ProxyState, model: &str, latency_ms: f64) {
+    let mut metrics = state.metrics.write().await;
+    let metric = metrics.entry(model.to_string()).or_default();
+    metric.request_errors += 1;
+    metric.last_failure_ms = Some(now_ms());
+    update_latency_ewma(metric, latency_ms);
+}
+
+async fn record_http_response(
+    state: &ProxyState,
+    model: &str,
+    status: reqwest::StatusCode,
+    latency_ms: f64,
+    fallback_failure: bool,
+) {
+    let mut metrics = state.metrics.write().await;
+    let metric = metrics.entry(model.to_string()).or_default();
+    update_latency_ewma(metric, latency_ms);
+
+    if status.is_success() {
+        metric.successes += 1;
+        metric.last_success_ms = Some(now_ms());
+    } else {
+        metric.http_errors += 1;
+        metric.last_failure_ms = Some(now_ms());
+    }
+
+    if fallback_failure {
+        metric.fallback_failures += 1;
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        metric.rate_limited += 1;
+    }
+}
+
+fn update_latency_ewma(metrics: &mut ModelMetrics, latency_ms: f64) {
+    metrics.latency_ewma_ms = Some(match metrics.latency_ewma_ms {
+        Some(previous) => {
+            LATENCY_EWMA_ALPHA * latency_ms + (1.0 - LATENCY_EWMA_ALPHA) * previous
+        }
+        None => latency_ms,
+    });
+}
+
+fn success_rate(metrics: &ModelMetrics) -> f64 {
+    if metrics.attempts == 0 {
+        0.0
+    } else {
+        metrics.successes as f64 / metrics.attempts as f64
+    }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 async fn apply_backoff(backoff_ms: u64) {
@@ -669,5 +812,23 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY,
             &policy
         ));
+    }
+
+    #[test]
+    fn latency_ewma_tracks_recent_samples() {
+        let mut metrics = ModelMetrics::default();
+        update_latency_ewma(&mut metrics, 100.0);
+        update_latency_ewma(&mut metrics, 200.0);
+        assert_eq!(metrics.latency_ewma_ms, Some(120.0));
+    }
+
+    #[test]
+    fn success_rate_uses_real_attempts() {
+        let metrics = ModelMetrics {
+            attempts: 4,
+            successes: 3,
+            ..ModelMetrics::default()
+        };
+        assert_eq!(success_rate(&metrics), 0.75);
     }
 }
