@@ -19,14 +19,16 @@ use crate::{config::AppConfig, credential};
 #[derive(Clone)]
 struct ProxyState {
     client: Client,
-    current: Arc<RwLock<String>>,
+    target: Arc<RwLock<String>>,
 }
 
 #[derive(Serialize)]
 struct StatusView {
-    current: String,
+    target: String,
+    primary: String,
     model_id: String,
     provider: String,
+    fallback: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -34,13 +36,22 @@ struct ModelView {
     name: String,
     model_id: String,
     provider: String,
+}
+
+#[derive(Serialize)]
+struct RouteView {
+    name: String,
+    primary: String,
+    fallback: Vec<String>,
     active: bool,
 }
 
 #[derive(Serialize)]
 struct SwitchView {
     requested: String,
-    current: String,
+    target: String,
+    primary: String,
+    fallback: Vec<String>,
 }
 
 pub async fn serve(bind: &str) -> Result<()> {
@@ -49,21 +60,22 @@ pub async fn serve(bind: &str) -> Result<()> {
         .with_context(|| format!("invalid bind address `{bind}`"))?;
 
     let config = AppConfig::load().context("failed to load CCM config")?;
-    let current = config
+    let target = config
         .current
         .clone()
-        .context("no current model selected; run `ccm use <name>` first")?;
-    let current = config.resolve_target(&current)?;
+        .context("no current target selected; run `ccm use <name>` first")?;
+    config.resolve_route(&target)?;
 
     let state = ProxyState {
         client: Client::new(),
-        current: Arc::new(RwLock::new(current)),
+        target: Arc::new(RwLock::new(target)),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/_ccm/status", get(control_status))
         .route("/_ccm/models", get(control_models))
+        .route("/_ccm/routes", get(control_routes))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -74,7 +86,7 @@ pub async fn serve(bind: &str) -> Result<()> {
 
     println!("CCM proxy listening on http://{addr}");
     println!("Claude Code base URL: http://{addr}");
-    println!("Runtime switch: `ccm switch <model-or-profile>`.");
+    println!("Runtime switch: `ccm switch <model-or-profile-or-route>`.");
 
     axum::serve(listener, app).await.context("proxy server failed")
 }
@@ -84,15 +96,14 @@ async fn health() -> &'static str {
 }
 
 async fn control_status(State(state): State<ProxyState>) -> impl IntoResponse {
-    let current = state.current.read().await.clone();
-    match AppConfig::load().and_then(|config| status_view(&config, &current)) {
+    let target = state.target.read().await.clone();
+    match AppConfig::load().and_then(|config| status_view(&config, &target)) {
         Ok(view) => Json(view).into_response(),
         Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
 
-async fn control_models(State(state): State<ProxyState>) -> impl IntoResponse {
-    let current = state.current.read().await.clone();
+async fn control_models() -> impl IntoResponse {
     match AppConfig::load() {
         Ok(config) => {
             let models = config
@@ -102,10 +113,29 @@ async fn control_models(State(state): State<ProxyState>) -> impl IntoResponse {
                     name: name.clone(),
                     model_id: model.model_id.clone(),
                     provider: model.provider.clone(),
-                    active: name == &current,
                 })
                 .collect::<Vec<_>>();
             Json(models).into_response()
+        }
+        Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn control_routes(State(state): State<ProxyState>) -> impl IntoResponse {
+    let active = state.target.read().await.clone();
+    match AppConfig::load() {
+        Ok(config) => {
+            let routes = config
+                .routes
+                .iter()
+                .map(|(name, route)| RouteView {
+                    name: name.clone(),
+                    primary: route.primary.clone(),
+                    fallback: route.fallback.clone(),
+                    active: name == &active,
+                })
+                .collect::<Vec<_>>();
+            Json(routes).into_response()
         }
         Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
@@ -115,13 +145,14 @@ async fn control_switch(
     State(state): State<ProxyState>,
     Path(target): Path<String>,
 ) -> impl IntoResponse {
-    let result = AppConfig::load().and_then(|config| config.resolve_target(&target));
-    match result {
-        Ok(resolved) => {
-            *state.current.write().await = resolved.clone();
+    match AppConfig::load().and_then(|config| config.resolve_route(&target)) {
+        Ok(route) => {
+            *state.target.write().await = route.target.clone();
             Json(SwitchView {
                 requested: target,
-                current: resolved,
+                target: route.target,
+                primary: route.primary,
+                fallback: route.fallback,
             })
             .into_response()
         }
@@ -133,15 +164,18 @@ fn control_error(status: StatusCode, err: anyhow::Error) -> Response<Body> {
     (status, format!("CCM control error: {err:#}")).into_response()
 }
 
-fn status_view(config: &AppConfig, current: &str) -> Result<StatusView> {
+fn status_view(config: &AppConfig, target: &str) -> Result<StatusView> {
+    let route = config.resolve_route(target)?;
     let model = config
         .models
-        .get(current)
-        .with_context(|| format!("runtime model `{current}` is not configured"))?;
+        .get(&route.primary)
+        .with_context(|| format!("primary model `{}` is not configured", route.primary))?;
     Ok(StatusView {
-        current: current.to_string(),
+        target: route.target,
+        primary: route.primary,
         model_id: model.model_id.clone(),
         provider: model.provider.clone(),
+        fallback: route.fallback,
     })
 }
 
@@ -164,12 +198,13 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         return Ok((StatusCode::METHOD_NOT_ALLOWED, "POST required").into_response());
     }
 
-    let current = state.current.read().await.clone();
+    let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
+    let route = config.resolve_route(&target)?;
     let model = config
         .models
-        .get(&current)
-        .with_context(|| format!("runtime model `{current}` is not configured"))?;
+        .get(&route.primary)
+        .with_context(|| format!("primary model `{}` is not configured", route.primary))?;
     let provider = config
         .providers
         .get(&model.provider)
@@ -261,10 +296,11 @@ mod tests {
     }
 
     #[test]
-    fn builds_status_view() {
+    fn builds_route_status_view() {
         let config = AppConfig::starter();
-        let status = status_view(&config, "glm").unwrap();
-        assert_eq!(status.current, "glm");
-        assert_eq!(status.provider, "zai");
+        let status = status_view(&config, "coding-route").unwrap();
+        assert_eq!(status.target, "coding-route");
+        assert_eq!(status.primary, "claude");
+        assert_eq!(status.fallback, vec!["glm"]);
     }
 }
