@@ -78,13 +78,21 @@ pub enum AddCommand {
         #[arg(long)]
         model_id: Option<String>,
     },
-    /// Add or update a route. Fallback accepts a comma-separated model list.
+    /// Add or update a route and its fallback policy.
     Route {
         name: String,
         #[arg(long)]
         primary: Option<String>,
         #[arg(long)]
         fallback: Option<String>,
+        #[arg(long, default_value_t = 30_000)]
+        header_timeout_ms: u64,
+        #[arg(long, default_value = "429,502,503,504")]
+        fallback_on: String,
+        #[arg(long, default_value_t = 3)]
+        max_attempts: usize,
+        #[arg(long, default_value_t = 200)]
+        backoff_ms: u64,
     },
 }
 
