@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{Model, Profile},
     provider::{Provider, ProviderKind},
+    route::{ResolvedRoute, Route},
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub struct AppConfig {
     pub models: BTreeMap<String, Model>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    pub routes: BTreeMap<String, Route>,
     #[serde(default)]
     pub current: Option<String>,
 }
@@ -73,10 +76,27 @@ impl AppConfig {
             },
         );
 
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "coding-route".to_string(),
+            Route {
+                primary: "claude".to_string(),
+                fallback: vec!["glm".to_string()],
+            },
+        );
+        routes.insert(
+            "fast-route".to_string(),
+            Route {
+                primary: "glm".to_string(),
+                fallback: Vec::new(),
+            },
+        );
+
         Self {
             providers,
             models,
             profiles,
+            routes,
             current: Some("claude".to_string()),
         }
     }
@@ -130,6 +150,24 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn add_route(&mut self, name: String, route: Route) -> Result<()> {
+        self.validate_route(&route)?;
+        self.routes.insert(name, route);
+        Ok(())
+    }
+
+    fn validate_route(&self, route: &Route) -> Result<()> {
+        if !self.models.contains_key(&route.primary) {
+            bail!("unknown primary model `{}`", route.primary);
+        }
+        for fallback in &route.fallback {
+            if !self.models.contains_key(fallback) {
+                bail!("unknown fallback model `{fallback}`");
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_target(&self, target: &str) -> Result<String> {
         if self.models.contains_key(target) {
             return Ok(target.to_string());
@@ -147,6 +185,24 @@ impl AppConfig {
         }
 
         bail!("unknown model/profile `{}`", target)
+    }
+
+    pub fn resolve_route(&self, target: &str) -> Result<ResolvedRoute> {
+        if let Some(route) = self.routes.get(target) {
+            self.validate_route(route)?;
+            return Ok(ResolvedRoute {
+                target: target.to_string(),
+                primary: route.primary.clone(),
+                fallback: route.fallback.clone(),
+            });
+        }
+
+        let model = self.resolve_target(target)?;
+        Ok(ResolvedRoute {
+            target: target.to_string(),
+            primary: model,
+            fallback: Vec::new(),
+        })
     }
 }
 
@@ -167,6 +223,15 @@ mod tests {
     }
 
     #[test]
+    fn resolves_named_route_without_collapsing_target() {
+        let config = AppConfig::starter();
+        let route = config.resolve_route("coding-route").unwrap();
+        assert_eq!(route.target, "coding-route");
+        assert_eq!(route.primary, "claude");
+        assert_eq!(route.fallback, vec!["glm"]);
+    }
+
+    #[test]
     fn rejects_unknown_target() {
         let config = AppConfig::starter();
         assert!(config.resolve_target("missing").is_err());
@@ -180,6 +245,19 @@ mod tests {
             Model {
                 provider: "missing".to_string(),
                 model_id: "x".to_string(),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_route_with_unknown_fallback() {
+        let mut config = AppConfig::starter();
+        let result = config.add_route(
+            "broken-route".to_string(),
+            Route {
+                primary: "claude".to_string(),
+                fallback: vec!["missing".to_string()],
             },
         );
         assert!(result.is_err());
