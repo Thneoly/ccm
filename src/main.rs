@@ -31,7 +31,10 @@ async fn main() -> Result<()> {
                 } else {
                     " "
                 };
-                println!("{} {:16} {:16} {}", marker, name, model.provider, model.model_id);
+                println!(
+                    "{} {:16} {:16} {}",
+                    marker, name, model.provider, model.model_id
+                );
             }
         }
         Command::Current => {
