@@ -22,6 +22,12 @@ pub enum Command {
     },
     /// Run local diagnostics for Claude Code and the selected model.
     Doctor,
+    /// Start the local Anthropic-compatible routing proxy.
+    Proxy {
+        /// Address to bind, for example 127.0.0.1:13521.
+        #[arg(long, default_value = "127.0.0.1:13521")]
+        bind: String,
+    },
     /// List configured models.
     List,
     /// Show the selected model alias.
