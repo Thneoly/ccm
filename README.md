@@ -2,7 +2,7 @@
 
 A fast local model manager and control plane for AI coding CLIs, starting with Claude Code.
 
-CCM manages providers, models, profiles, routes, and route policies locally. Claude Code can stay connected to one localhost endpoint while CCM switches the backend or route underneath it.
+CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, and model health state locally.
 
 ## Quick start
 
@@ -10,34 +10,24 @@ CCM manages providers, models, profiles, routes, and route policies locally. Cla
 git clone https://github.com/Thneoly/ccm.git
 cd ccm
 cargo build --release
-./target/release/ccm init
+ccm init
 ```
 
-Store credentials and check the setup:
+Store credentials and start the proxy:
 
 ```bash
 ccm auth set anthropic
 ccm auth set zai
-ccm doctor
-```
-
-## Direct mode
-
-```bash
-ccm use glm
-ccm run
-```
-
-Direct mode resolves models and profiles only. Routes are a proxy-mode concept because they may contain fallback chains and policies.
-
-## Proxy mode
-
-```bash
 ccm proxy
+```
+
+Then launch Claude Code through CCM:
+
+```bash
 ccm run --proxy
 ```
 
-Switch a model, profile, or route at runtime:
+## Runtime switching
 
 ```bash
 ccm switch glm
@@ -45,9 +35,9 @@ ccm switch fast
 ccm switch coding-route
 ```
 
-The runtime target is kept in memory and does not rewrite `config.toml`.
+`ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/config.toml`.
 
-## Route layer
+## Route model
 
 ```toml
 [routes.coding-route]
@@ -59,75 +49,105 @@ header_timeout_ms = 30000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 3
 backoff_ms = 200
+
+[routes.coding-route.policy.circuit_breaker]
+enabled = true
+failure_threshold = 3
+open_ms = 30000
 ```
 
-The architecture is:
+The routing stack is:
 
 ```text
 Provider
    ↓
 Model
    ↓
-Route (primary + fallback[])
+Route
    ↓
 RoutePolicy
    ↓
 Runtime Target
    ↓
-Routing Policy Executor
+Health-aware Routing Executor
    ↓
 CCM Proxy
 ```
 
 ## Route Policy
 
-Each route may configure four execution controls:
+Each route can configure:
+
+- `header_timeout_ms`: maximum wait for upstream response headers per attempt.
+- `fallback_on`: HTTP status codes that trigger fallback.
+- `max_attempts`: total real upstream attempts, including the primary.
+- `backoff_ms`: delay before trying the next candidate.
+
+If omitted, the defaults are:
 
 ```toml
-[routes.coding.policy]
 header_timeout_ms = 30000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 3
 backoff_ms = 200
 ```
-
-Meaning:
-
-- `header_timeout_ms`: maximum time to wait for upstream response headers for one attempt.
-- `fallback_on`: HTTP status codes that are eligible for fallback.
-- `max_attempts`: total attempts including the primary attempt. It is not the number of fallbacks.
-- `backoff_ms`: delay before trying the next candidate after a fallback-triggering failure.
 
 Connection/request errors and response-header timeouts are also fallback-eligible when another candidate is available.
 
-If a route omits `[routes.<name>.policy]`, CCM uses:
+Once an upstream response is accepted, CCM streams it directly back to Claude Code. CCM does not switch models in the middle of an already-started SSE stream.
+
+## Health-aware Routing / Circuit Breaker
+
+Each route also has a circuit breaker policy:
 
 ```toml
-header_timeout_ms = 30000
-fallback_on = [429, 502, 503, 504]
-max_attempts = 3
-backoff_ms = 200
+[routes.coding-route.policy.circuit_breaker]
+enabled = true
+failure_threshold = 3
+open_ms = 30000
 ```
 
-For a route with:
+Defaults:
 
 ```text
-primary = claude
-fallback = [glm, kimi, local]
-max_attempts = 2
+enabled = true
+failure_threshold = 3
+open_ms = 30000
 ```
 
-CCM will try at most:
+The model circuit states are:
 
 ```text
-claude → glm
+CLOSED
+   │
+   │ consecutive health failures >= failure_threshold
+   ▼
+OPEN
+   │
+   │ open_ms elapsed
+   ▼
+HALF_OPEN
+   │
+   ├─ probe succeeds ─────────────→ CLOSED
+   │
+   └─ probe fails ────────────────→ OPEN
 ```
 
-The remaining candidates are not attempted for that request.
+Health failures are:
 
-Once an upstream response is accepted, CCM streams it directly back to Claude Code. If that stream fails after it has started, CCM does not switch models mid-stream.
+```text
+connection/request error
+response-header timeout
+HTTP status listed in fallback_on
+```
 
-## Creating policy-aware routes from CLI
+Responses such as `400`, `401`, and `403` are not counted as model-health failures unless you explicitly add them to `fallback_on`. This prevents authentication or request-configuration problems from incorrectly marking a model as unhealthy.
+
+An OPEN model is skipped before an upstream request is sent and does not consume `max_attempts`. After the cooling period expires, one request is allowed through as a HALF_OPEN probe. Concurrent requests skip that model while the probe is in flight.
+
+Because circuit state is keyed by model alias, the same model's health state is shared across routes inside one running CCM proxy.
+
+## Creating a policy-aware route
 
 ```bash
 ccm add route coding \
@@ -136,13 +156,19 @@ ccm add route coding \
   --header-timeout-ms 30000 \
   --fallback-on 429,502,503,504 \
   --max-attempts 3 \
-  --backoff-ms 200
+  --backoff-ms 200 \
+  --circuit-enabled true \
+  --failure-threshold 3 \
+  --circuit-open-ms 30000
 ```
 
-Then:
+Disable circuit breaking for one route with:
 
 ```bash
-ccm switch coding
+ccm add route experimental \
+  --primary claude \
+  --fallback glm \
+  --circuit-enabled false
 ```
 
 ## Attempt tracing
@@ -152,6 +178,13 @@ Example stderr output:
 ```text
 ccm route=coding attempt=1 model=claude result=HTTP 429 Too Many Requests action=fallback
 ccm route=coding attempt=2 model=glm result=HTTP 200 OK
+```
+
+When a circuit is open:
+
+```text
+ccm route=coding attempt=1 model=claude result=skipped: circuit OPEN until ... action=fallback
+ccm route=coding attempt=1 model=glm result=HTTP 200 OK
 ```
 
 The proxy keeps the most recent 100 attempt traces in memory.
@@ -164,6 +197,7 @@ GET  /_ccm/status
 GET  /_ccm/models
 GET  /_ccm/routes
 GET  /_ccm/traces
+GET  /_ccm/circuits
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
@@ -173,25 +207,29 @@ Examples:
 curl http://127.0.0.1:13521/_ccm/status
 curl http://127.0.0.1:13521/_ccm/routes
 curl http://127.0.0.1:13521/_ccm/traces
+curl http://127.0.0.1:13521/_ccm/circuits
 ```
 
-The status and route endpoints expose the effective route policy. A status response looks like:
+Example circuit view:
 
 ```json
-{
-  "target": "coding-route",
-  "primary": "claude",
-  "model_id": "claude-sonnet-4-5",
-  "provider": "anthropic",
-  "fallback": ["glm"],
-  "policy": {
-    "header_timeout_ms": 30000,
-    "fallback_on": [429, 502, 503, 504],
-    "max_attempts": 3,
-    "backoff_ms": 200
+[
+  {
+    "model": "claude",
+    "state": "OPEN",
+    "consecutive_failures": 3,
+    "open_until_ms": 1790820030000
+  },
+  {
+    "model": "glm",
+    "state": "CLOSED",
+    "consecutive_failures": 0,
+    "open_until_ms": null
   }
-}
+]
 ```
+
+`/_ccm/status` and `/_ccm/routes` also expose the effective route policy, including circuit-breaker settings.
 
 ## In-session switching from Claude Code
 
@@ -220,6 +258,9 @@ ccm add route <name> --primary MODEL [--fallback MODEL1,MODEL2]
   [--fallback-on CODE1,CODE2]
   [--max-attempts N]
   [--backoff-ms MS]
+  [--circuit-enabled true|false]
+  [--failure-threshold N]
+  [--circuit-open-ms MS]
 ccm integrate claude [--remove]
 ccm doctor
 ccm proxy [--bind HOST:PORT]
@@ -233,61 +274,6 @@ ccm auth delete <provider>
 ccm health <model-or-profile>
 ```
 
-## Configuration example
-
-```toml
-current = "claude"
-
-[providers.anthropic]
-kind = "anthropic"
-base_url = "https://api.anthropic.com"
-
-[providers.zai]
-kind = "anthropic-compatible"
-base_url = "https://api.z.ai/api/anthropic"
-
-[models.claude]
-provider = "anthropic"
-model_id = "claude-sonnet-4-5"
-
-[models.glm]
-provider = "zai"
-model_id = "glm-5"
-
-[profiles.fast]
-model = "glm"
-
-[routes.coding-route]
-primary = "claude"
-fallback = ["glm"]
-
-[routes.coding-route.policy]
-header_timeout_ms = 30000
-fallback_on = [429, 502, 503, 504]
-max_attempts = 3
-backoff_ms = 200
-```
-
-Secrets are stored with the Rust `keyring` crate and are not written to `config.toml`.
-
-## Current proxy scope
-
-- Anthropic-compatible `/v1/messages`
-- request model rewriting
-- provider credential injection
-- streaming upstream responses
-- in-memory runtime target
-- first-class route objects
-- configurable per-route policy
-- ordered route fallback execution
-- response-header timeout
-- status-based fallback
-- max-attempt limiting
-- fixed backoff between fallback attempts
-- in-memory attempt tracing
-- no mid-stream failover
-- no OpenAI protocol translation yet
-
 ## Development
 
 ```bash
@@ -297,11 +283,21 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-GitHub Actions CI is currently disabled; run these checks locally before release commits.
+GitHub Actions CI is currently disabled.
 
-## Next
+## Current scope
 
-The next useful routing step is health-aware execution: per-model failure counters, cooldown windows, and simple circuit breaking so repeatedly failing candidates can be skipped temporarily.
+- Anthropic-compatible `/v1/messages`
+- streaming upstream responses
+- model/profile/route runtime switching
+- route-specific fallback policy
+- configurable timeout/backoff/max attempts
+- model-level circuit breaker
+- CLOSED / OPEN / HALF_OPEN behavior
+- in-memory attempt traces
+- circuit-state control API
+- no mid-stream failover
+- no OpenAI protocol translation yet
 
 ## License
 
