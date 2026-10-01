@@ -96,14 +96,11 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
-            bail!(
-                "config not found at {}. Run `ccm init` first",
-                path.display()
-            );
+            bail!("config not found at {}. Run `ccm init` first", path.display());
         }
 
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         toml::from_str(&raw).context("invalid TOML configuration")
     }
 
@@ -114,8 +111,7 @@ impl AppConfig {
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("cannot serialize configuration")?;
-        fs::write(&path, raw)
-            .with_context(|| format!("cannot write {}", path.display()))?;
+        fs::write(&path, raw).with_context(|| format!("cannot write {}", path.display()))?;
         Ok(())
     }
 
@@ -128,7 +124,11 @@ impl AppConfig {
             if self.models.contains_key(&profile.model) {
                 return Ok(profile.model.clone());
             }
-            bail!("profile `{}` references unknown model `{}`", target, profile.model);
+            bail!(
+                "profile `{}` references unknown model `{}`",
+                target,
+                profile.model
+            );
         }
 
         bail!("unknown model/profile `{}`", target)
