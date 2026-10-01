@@ -66,16 +66,31 @@ async fn main() -> Result<()> {
             config.save()?;
             println!("Selected {}", resolved);
         }
-        Command::Run { target } => {
+        Command::Run {
+            target,
+            proxy,
+            proxy_url,
+        } => {
             let config = load_config()?;
-            let name = match target {
-                Some(target) => config.resolve_target(&target)?,
-                None => config
-                    .current
-                    .clone()
-                    .context("no current model selected; run `ccm use <name>` first")?,
-            };
-            launcher::run_claude(&config, &name)?;
+            if proxy {
+                if let Some(target) = target {
+                    let resolved = config.resolve_target(&target)?;
+                    let mut updated = config.clone();
+                    updated.current = Some(resolved.clone());
+                    updated.save()?;
+                    println!("Selected {}", resolved);
+                }
+                launcher::run_claude_via_proxy(&proxy_url)?;
+            } else {
+                let name = match target {
+                    Some(target) => config.resolve_target(&target)?,
+                    None => config
+                        .current
+                        .clone()
+                        .context("no current model selected; run `ccm use <name>` first")?,
+                };
+                launcher::run_claude(&config, &name)?;
+            }
         }
         Command::Health { target } => {
             let config = load_config()?;
