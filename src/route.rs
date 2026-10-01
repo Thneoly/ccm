@@ -16,6 +16,38 @@ fn default_backoff_ms() -> u64 {
     200
 }
 
+fn default_circuit_enabled() -> bool {
+    true
+}
+
+fn default_failure_threshold() -> usize {
+    3
+}
+
+fn default_open_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerPolicy {
+    #[serde(default = "default_circuit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: usize,
+    #[serde(default = "default_open_ms")]
+    pub open_ms: u64,
+}
+
+impl Default for CircuitBreakerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_circuit_enabled(),
+            failure_threshold: default_failure_threshold(),
+            open_ms: default_open_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutePolicy {
     #[serde(default = "default_header_timeout_ms")]
@@ -26,6 +58,8 @@ pub struct RoutePolicy {
     pub max_attempts: usize,
     #[serde(default = "default_backoff_ms")]
     pub backoff_ms: u64,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerPolicy,
 }
 
 impl Default for RoutePolicy {
@@ -35,6 +69,7 @@ impl Default for RoutePolicy {
             fallback_on: default_fallback_on(),
             max_attempts: default_max_attempts(),
             backoff_ms: default_backoff_ms(),
+            circuit_breaker: CircuitBreakerPolicy::default(),
         }
     }
 }
