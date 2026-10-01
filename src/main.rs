@@ -1,8 +1,10 @@
 mod cli;
 mod config;
 mod credential;
+mod doctor;
 mod health;
 mod launcher;
+mod manage;
 mod model;
 mod provider;
 
@@ -19,6 +21,14 @@ async fn main() -> Result<()> {
         Command::Init { force } => {
             let path = AppConfig::init(force)?;
             println!("Initialized {}", path.display());
+        }
+        Command::Add { command } => {
+            let mut config = load_config()?;
+            manage::handle(&mut config, command)?;
+        }
+        Command::Doctor => {
+            let config = load_config()?;
+            doctor::run(&config).await?;
         }
         Command::Auth { command } => {
             credential::handle(command)?;
