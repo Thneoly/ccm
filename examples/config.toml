@@ -26,6 +26,18 @@ model = "glm"
 primary = "claude"
 fallback = ["glm"]
 
+[routes.coding-route.policy]
+header_timeout_ms = 30000
+fallback_on = [429, 502, 503, 504]
+max_attempts = 3
+backoff_ms = 200
+
 [routes.fast-route]
 primary = "glm"
 fallback = []
+
+[routes.fast-route.policy]
+header_timeout_ms = 15000
+fallback_on = [429, 502, 503, 504]
+max_attempts = 1
+backoff_ms = 0
