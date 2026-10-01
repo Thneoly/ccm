@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{model::{Model, Profile}, provider::Provider};
+use crate::{
+    model::{Model, Profile},
+    provider::{Provider, ProviderKind},
+};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -23,11 +26,78 @@ impl AppConfig {
         Ok(home.join(".ccm").join("config.toml"))
     }
 
+    pub fn starter() -> Self {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            Provider {
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com".to_string(),
+            },
+        );
+        providers.insert(
+            "zai".to_string(),
+            Provider {
+                kind: ProviderKind::AnthropicCompatible,
+                base_url: "https://api.z.ai/api/anthropic".to_string(),
+            },
+        );
+
+        let mut models = BTreeMap::new();
+        models.insert(
+            "claude".to_string(),
+            Model {
+                provider: "anthropic".to_string(),
+                model_id: "claude-sonnet-4-5".to_string(),
+            },
+        );
+        models.insert(
+            "glm".to_string(),
+            Model {
+                provider: "zai".to_string(),
+                model_id: "glm-5".to_string(),
+            },
+        );
+
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "coding".to_string(),
+            Profile {
+                model: "claude".to_string(),
+            },
+        );
+        profiles.insert(
+            "fast".to_string(),
+            Profile {
+                model: "glm".to_string(),
+            },
+        );
+
+        Self {
+            providers,
+            models,
+            profiles,
+            current: Some("claude".to_string()),
+        }
+    }
+
+    pub fn init(force: bool) -> Result<PathBuf> {
+        let path = Self::path()?;
+        if path.exists() && !force {
+            bail!(
+                "config already exists at {}; pass --force to overwrite it",
+                path.display()
+            );
+        }
+        Self::starter().save()?;
+        Ok(path)
+    }
+
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
             bail!(
-                "config not found at {}. Copy examples/config.toml to ~/.ccm/config.toml",
+                "config not found at {}. Run `ccm init` first",
                 path.display()
             );
         }
@@ -62,5 +132,28 @@ impl AppConfig {
         }
 
         bail!("unknown model/profile `{}`", target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_model_alias() {
+        let config = AppConfig::starter();
+        assert_eq!(config.resolve_target("glm").unwrap(), "glm");
+    }
+
+    #[test]
+    fn resolves_profile_alias() {
+        let config = AppConfig::starter();
+        assert_eq!(config.resolve_target("fast").unwrap(), "glm");
+    }
+
+    #[test]
+    fn rejects_unknown_target() {
+        let config = AppConfig::starter();
+        assert!(config.resolve_target("missing").is_err());
     }
 }
