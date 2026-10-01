@@ -20,32 +20,22 @@ pub enum Command {
     /// Show the selected model alias.
     Current,
     /// Select a model or profile alias.
-    Use {
-        target: String,
-    },
+    Use { target: String },
     /// Launch Claude Code using a model/profile alias, or the current selection.
-    Run {
-        target: Option<String>,
-    },
+    Run { target: Option<String> },
     /// Manage provider credentials.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
     /// Check whether a model's provider endpoint is reachable.
-    Health {
-        target: String,
-    },
+    Health { target: String },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Store a provider API key in the OS keyring.
-    Set {
-        provider: String,
-    },
+    Set { provider: String },
     /// Delete a provider API key from the OS keyring.
-    Delete {
-        provider: String,
-    },
+    Delete { provider: String },
 }
