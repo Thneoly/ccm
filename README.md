@@ -2,15 +2,7 @@
 
 A fast local model manager for AI coding CLIs, starting with Claude Code.
 
-CCM keeps provider/model switching local and lightweight. The v0.1 scope focuses on configuration, credential management, model aliases, diagnostics, health checks, and launching Claude Code with the selected backend. A local proxy for in-session switching is planned for v0.2.
-
-## Goals
-
-- Switch Claude Code backends with short aliases such as `ccm use glm`.
-- Keep API keys out of plaintext config files.
-- Support multiple Anthropic-compatible providers.
-- Make setup and diagnostics simple enough for daily use.
-- Provide a clean path toward a local routing proxy without turning v0.1 into a gateway platform.
+CCM manages provider/model aliases locally and can now run as a local Anthropic-compatible proxy, so Claude Code can stay connected to one localhost endpoint while `ccm use ...` switches the backend underneath it.
 
 ## Quick start
 
@@ -18,60 +10,98 @@ CCM keeps provider/model switching local and lightweight. The v0.1 scope focuses
 git clone https://github.com/Thneoly/ccm.git
 cd ccm
 cargo build --release
-```
-
-Initialize a starter configuration:
-
-```bash
 ./target/release/ccm init
 ```
 
-Store credentials in the operating-system keyring:
+Store provider credentials in the operating-system keyring:
 
 ```bash
 ./target/release/ccm auth set anthropic
 ./target/release/ccm auth set zai
 ```
 
-Run diagnostics:
+Check the setup:
 
 ```bash
 ./target/release/ccm doctor
 ```
 
-Then switch and launch Claude Code:
+## Direct mode
+
+Launch Claude Code directly against the selected provider:
 
 ```bash
-./target/release/ccm list
-./target/release/ccm use glm
-./target/release/ccm run
+ccm use glm
+ccm run
 ```
 
-You can also select a model for one launch without changing the current selection:
+Or select a model for one launch:
 
 ```bash
-./target/release/ccm run claude
+ccm run claude
 ```
 
-## v0.1 commands
+## Proxy mode (v0.2)
+
+Start the local router in terminal 1:
+
+```bash
+ccm proxy
+```
+
+By default it listens on:
+
+```text
+http://127.0.0.1:13521
+```
+
+Launch Claude Code through the proxy in terminal 2:
+
+```bash
+ccm run --proxy
+```
+
+Now switch backends without restarting the proxy or changing the Claude Code endpoint:
+
+```bash
+ccm use glm
+ccm use claude
+ccm use fast
+```
+
+The proxy reloads `~/.ccm/config.toml` on every request. It rewrites the request `model` field to the currently selected CCM model, injects the selected provider credential, forwards the request to the configured Anthropic-compatible `/v1/messages` endpoint, and streams the upstream response back to Claude Code.
+
+You can also switch and launch in one command:
+
+```bash
+ccm run glm --proxy
+```
+
+Use another local port if needed:
+
+```bash
+ccm proxy --bind 127.0.0.1:14521
+ccm run --proxy --proxy-url http://127.0.0.1:14521
+```
+
+## Commands
 
 ```text
 ccm init [--force]
 ccm add provider <name> [--base-url URL] [--kind KIND]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
 ccm doctor
+ccm proxy [--bind HOST:PORT]
 ccm list
 ccm current
 ccm use <model-or-profile>
-ccm run [model-or-profile]
+ccm run [model-or-profile] [--proxy] [--proxy-url URL]
 ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>
 ```
 
-Missing values for `ccm add provider` and `ccm add model` are prompted interactively.
-
-Examples:
+## Add providers and models
 
 ```bash
 ccm add provider moonshot \
@@ -83,28 +113,18 @@ ccm add model kimi \
   --model-id kimi-k2.5
 ```
 
-Or just:
+Missing values are prompted interactively:
 
 ```bash
 ccm add provider moonshot
 ccm add model kimi
 ```
 
-## Doctor
+## Doctor and health
 
-`ccm doctor` checks the selected local setup without exposing secrets:
+`ccm doctor` checks local configuration, Claude Code availability, selected model/provider, credential presence, and basic endpoint reachability.
 
-```text
-✓ Claude Code: installed
-✓ current model: glm
-✓ model id: glm-5
-✓ provider: zai
-✓ base URL: https://api.z.ai/api/anthropic
-✓ credential: present
-✓ endpoint: reachable (...)
-```
-
-For a full authenticated model request, use:
+For an authenticated model request, use:
 
 ```bash
 ccm health glm
@@ -112,7 +132,7 @@ ccm health glm
 
 ## Configuration
 
-CCM reads `~/.ccm/config.toml` by default. `ccm init` creates a starter configuration containing Anthropic and Z.AI examples.
+CCM reads `~/.ccm/config.toml`.
 
 ```toml
 current = "claude"
@@ -140,37 +160,20 @@ model = "claude"
 model = "glm"
 ```
 
-The same starter configuration is available at `examples/config.toml`.
+Secrets are stored with the Rust `keyring` crate and are not written to `config.toml`.
 
-## Credentials
+## Proxy scope
 
-CCM uses the operating-system keyring through the Rust `keyring` crate. Secrets are not written to `config.toml`.
+The v0.2 proxy intentionally stays small:
 
-```bash
-ccm auth set zai
-```
+- Anthropic-compatible `/v1/messages` only
+- request model rewriting
+- provider credential injection
+- streaming upstream responses
+- dynamic routing via the current CCM model
+- no OpenAI protocol translation yet
 
-Credentials use service name `ccm` and the provider name as the account key.
-
-## Running Claude Code
-
-```bash
-ccm run glm
-```
-
-CCM resolves the model alias, retrieves the provider credential, and launches `claude` with:
-
-```text
-ANTHROPIC_BASE_URL
-ANTHROPIC_AUTH_TOKEN
-ANTHROPIC_MODEL
-```
-
-Profiles are aliases to model aliases, so this also works:
-
-```bash
-ccm run fast
-```
+OpenAI-compatible adapters, fallback chains, retries, and routing policies are deferred to later versions.
 
 ## Development
 
@@ -185,25 +188,13 @@ GitHub Actions runs these checks on Linux, Windows, and macOS.
 
 ## Roadmap
 
-### v0.1
-
-- CLI with clap
-- First-run `ccm init`
-- Interactive provider/model setup
-- `ccm doctor`
-- TOML config
-- OS keyring credentials
-- Provider/model/profile aliases
-- Claude Code launcher
-- Health checks
-- Cross-platform CI
-
 ### v0.2
 
 - Local Axum proxy
 - Stable localhost endpoint for Claude Code
 - In-session backend switching
-- `ccm proxy`
+- Streaming Anthropic-compatible forwarding
+- Proxy-aware Claude Code launcher
 
 ### v0.3
 
@@ -218,7 +209,7 @@ GitHub Actions runs these checks on Linux, Windows, and macOS.
 2. Aliases over raw provider model IDs.
 3. Secrets never stored in `config.toml`.
 4. Prefer transparent Anthropic-compatible forwarding before protocol translation.
-5. Keep v0.1 small enough to understand in one sitting.
+5. Keep the proxy small and inspectable.
 
 ## License
 
