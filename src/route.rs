@@ -29,6 +29,20 @@ fn default_open_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionStrategy {
+    Ordered,
+    Healthiest,
+    LowestLatency,
+}
+
+impl Default for SelectionStrategy {
+    fn default() -> Self {
+        Self::Ordered
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerPolicy {
     #[serde(default = "default_circuit_enabled")]
     pub enabled: bool,
@@ -50,6 +64,8 @@ impl Default for CircuitBreakerPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutePolicy {
+    #[serde(default)]
+    pub selection: SelectionStrategy,
     #[serde(default = "default_header_timeout_ms")]
     pub header_timeout_ms: u64,
     #[serde(default = "default_fallback_on")]
@@ -65,6 +81,7 @@ pub struct RoutePolicy {
 impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
+            selection: SelectionStrategy::default(),
             header_timeout_ms: default_header_timeout_ms(),
             fallback_on: default_fallback_on(),
             max_attempts: default_max_attempts(),
