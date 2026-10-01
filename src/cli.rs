@@ -35,10 +35,17 @@ pub enum Command {
     },
     /// List configured models.
     List,
-    /// Show the selected model alias.
+    /// Show the selected persisted model alias.
     Current,
-    /// Select a model or profile alias.
+    /// Persist a model or profile alias as the default selection.
     Use { target: String },
+    /// Switch the active route of a running CCM proxy without changing config.toml.
+    Switch {
+        target: String,
+        /// Local CCM proxy base URL.
+        #[arg(long, default_value = "http://127.0.0.1:13521")]
+        proxy_url: String,
+    },
     /// Launch Claude Code using a model/profile alias, or through the local CCM proxy.
     Run {
         target: Option<String>,
