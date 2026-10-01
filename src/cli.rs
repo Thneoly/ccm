@@ -78,7 +78,7 @@ pub enum AddCommand {
         #[arg(long)]
         model_id: Option<String>,
     },
-    /// Add or update a route and its fallback policy.
+    /// Add or update a route, fallback policy, and circuit breaker policy.
     Route {
         name: String,
         #[arg(long)]
@@ -93,6 +93,12 @@ pub enum AddCommand {
         max_attempts: usize,
         #[arg(long, default_value_t = 200)]
         backoff_ms: u64,
+        #[arg(long, default_value_t = true)]
+        circuit_enabled: bool,
+        #[arg(long, default_value_t = 3)]
+        failure_threshold: usize,
+        #[arg(long, default_value_t = 30_000)]
+        circuit_open_ms: u64,
     },
 }
 
