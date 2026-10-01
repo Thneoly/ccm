@@ -34,8 +34,16 @@ pub enum Command {
     Current,
     /// Select a model or profile alias.
     Use { target: String },
-    /// Launch Claude Code using a model/profile alias, or the current selection.
-    Run { target: Option<String> },
+    /// Launch Claude Code using a model/profile alias, or through the local CCM proxy.
+    Run {
+        target: Option<String>,
+        /// Connect Claude Code to the local CCM proxy instead of directly to the provider.
+        #[arg(long)]
+        proxy: bool,
+        /// Local proxy base URL used with --proxy.
+        #[arg(long, default_value = "http://127.0.0.1:13521")]
+        proxy_url: String,
+    },
     /// Manage provider credentials.
     Auth {
         #[command(subcommand)]
