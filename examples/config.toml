@@ -21,3 +21,11 @@ model = "claude"
 
 [profiles.fast]
 model = "glm"
+
+[routes.coding-route]
+primary = "claude"
+fallback = ["glm"]
+
+[routes.fast-route]
+primary = "glm"
+fallback = []
