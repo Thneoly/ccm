@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
@@ -25,11 +26,12 @@ use tokio::{
 use crate::{
     config::AppConfig,
     credential,
-    route::{CircuitBreakerPolicy, RoutePolicy},
+    route::{CircuitBreakerPolicy, RoutePolicy, SelectionStrategy},
 };
 
 const TRACE_CAPACITY: usize = 100;
 const LATENCY_EWMA_ALPHA: f64 = 0.2;
+const HEALTH_MIN_SAMPLES: u64 = 3;
 
 #[derive(Clone)]
 struct ProxyState {
@@ -75,6 +77,7 @@ struct ModelMetricsView {
     attempts: u64,
     successes: u64,
     success_rate: f64,
+    health_score: Option<f64>,
     http_errors: u64,
     fallback_failures: u64,
     timeouts: u64,
@@ -114,6 +117,7 @@ impl From<&CircuitBreakerPolicy> for CircuitPolicyView {
 
 #[derive(Clone, Serialize)]
 struct PolicyView {
+    selection: String,
     header_timeout_ms: u64,
     fallback_on: Vec<u16>,
     max_attempts: usize,
@@ -124,6 +128,7 @@ struct PolicyView {
 impl From<&RoutePolicy> for PolicyView {
     fn from(policy: &RoutePolicy) -> Self {
         Self {
+            selection: selection_name(&policy.selection).to_string(),
             header_timeout_ms: policy.header_timeout_ms,
             fallback_on: policy.fallback_on.clone(),
             max_attempts: policy.max_attempts,
@@ -308,6 +313,7 @@ async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetri
             attempts: metrics.attempts,
             successes: metrics.successes,
             success_rate: success_rate(metrics),
+            health_score: health_score(metrics),
             http_errors: metrics.http_errors,
             fallback_failures: metrics.fallback_failures,
             timeouts: metrics.timeouts,
@@ -384,7 +390,8 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let target = state.target.read().await.clone();
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
-    let candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
+    let configured_candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
+    let candidates = select_candidates(&state, configured_candidates, &route.policy.selection).await;
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -532,6 +539,52 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     )
 }
 
+async fn select_candidates(
+    state: &ProxyState,
+    mut candidates: Vec<String>,
+    selection: &SelectionStrategy,
+) -> Vec<String> {
+    match selection {
+        SelectionStrategy::Ordered => candidates,
+        SelectionStrategy::Healthiest => {
+            let metrics = state.metrics.read().await;
+            candidates.sort_by(|left, right| {
+                let left_score = candidate_health_rank(metrics.get(left));
+                let right_score = candidate_health_rank(metrics.get(right));
+                right_score
+                    .partial_cmp(&left_score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| compare_latency(metrics.get(left), metrics.get(right)))
+            });
+            candidates
+        }
+        SelectionStrategy::LowestLatency => {
+            let metrics = state.metrics.read().await;
+            candidates.sort_by(|left, right| compare_latency(metrics.get(left), metrics.get(right)));
+            candidates
+        }
+    }
+}
+
+fn candidate_health_rank(metrics: Option<&ModelMetrics>) -> f64 {
+    match metrics {
+        Some(metrics) if metrics.attempts >= HEALTH_MIN_SAMPLES => success_rate(metrics),
+        _ => 1.0,
+    }
+}
+
+fn compare_latency(left: Option<&ModelMetrics>, right: Option<&ModelMetrics>) -> Ordering {
+    match (
+        left.and_then(|metrics| metrics.latency_ewma_ms),
+        right.and_then(|metrics| metrics.latency_ewma_ms),
+    ) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 async fn circuit_admit(
     state: &ProxyState,
     model: &str,
@@ -658,8 +711,24 @@ fn success_rate(metrics: &ModelMetrics) -> f64 {
     }
 }
 
+fn health_score(metrics: &ModelMetrics) -> Option<f64> {
+    if metrics.attempts == 0 {
+        None
+    } else {
+        Some(success_rate(metrics) * 100.0)
+    }
+}
+
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn selection_name(selection: &SelectionStrategy) -> &'static str {
+    match selection {
+        SelectionStrategy::Ordered => "ordered",
+        SelectionStrategy::Healthiest => "healthiest",
+        SelectionStrategy::LowestLatency => "lowest-latency",
+    }
 }
 
 async fn apply_backoff(backoff_ms: u64) {
@@ -791,6 +860,7 @@ mod tests {
         assert_eq!(status.primary, "claude");
         assert_eq!(status.fallback, vec!["glm"]);
         assert_eq!(status.policy.header_timeout_ms, 30_000);
+        assert_eq!(status.policy.selection, "ordered");
         assert!(status.policy.circuit_breaker.enabled);
     }
 
@@ -830,5 +900,16 @@ mod tests {
             ..ModelMetrics::default()
         };
         assert_eq!(success_rate(&metrics), 0.75);
+        assert_eq!(health_score(&metrics), Some(75.0));
+    }
+
+    #[test]
+    fn healthiest_waits_for_minimum_samples() {
+        let metrics = ModelMetrics {
+            attempts: 2,
+            successes: 0,
+            ..ModelMetrics::default()
+        };
+        assert_eq!(candidate_health_rank(Some(&metrics)), 1.0);
     }
 }
