@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod control;
 mod credential;
 mod doctor;
 mod health;
@@ -68,7 +69,10 @@ async fn main() -> Result<()> {
             let resolved = config.resolve_target(&target)?;
             config.current = Some(resolved.clone());
             config.save()?;
-            println!("Selected {}", resolved);
+            println!("Selected {} as persisted default", resolved);
+        }
+        Command::Switch { target, proxy_url } => {
+            control::switch(&proxy_url, &target).await?;
         }
         Command::Run {
             target,
@@ -78,11 +82,7 @@ async fn main() -> Result<()> {
             let config = load_config()?;
             if proxy {
                 if let Some(target) = target {
-                    let resolved = config.resolve_target(&target)?;
-                    let mut updated = config.clone();
-                    updated.current = Some(resolved.clone());
-                    updated.save()?;
-                    println!("Selected {}", resolved);
+                    control::switch(&proxy_url, &target).await?;
                 }
                 launcher::run_claude_via_proxy(&proxy_url)?;
             } else {
