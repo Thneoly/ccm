@@ -10,6 +10,7 @@ mod manage;
 mod model;
 mod provider;
 mod proxy;
+mod route;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -56,20 +57,35 @@ async fn main() -> Result<()> {
                     marker, name, model.provider, model.model_id
                 );
             }
+            if !config.routes.is_empty() {
+                println!("\nRoutes:");
+                for (name, route) in &config.routes {
+                    println!(
+                        "  {:16} primary={} fallback={}",
+                        name,
+                        route.primary,
+                        if route.fallback.is_empty() {
+                            "-".to_string()
+                        } else {
+                            route.fallback.join(",")
+                        }
+                    );
+                }
+            }
         }
         Command::Current => {
             let config = load_config()?;
             match &config.current {
                 Some(name) => println!("{}", name),
-                None => println!("No model selected"),
+                None => println!("No target selected"),
             }
         }
         Command::Use { target } => {
             let mut config = load_config()?;
-            let resolved = config.resolve_target(&target)?;
-            config.current = Some(resolved.clone());
+            config.resolve_route(&target)?;
+            config.current = Some(target.clone());
             config.save()?;
-            println!("Selected {} as persisted default", resolved);
+            println!("Selected {} as persisted default", target);
         }
         Command::Switch { target, proxy_url } => {
             control::switch(&proxy_url, &target).await?;
@@ -88,10 +104,12 @@ async fn main() -> Result<()> {
             } else {
                 let name = match target {
                     Some(target) => config.resolve_target(&target)?,
-                    None => config
-                        .current
-                        .clone()
-                        .context("no current model selected; run `ccm use <name>` first")?,
+                    None => {
+                        let target = config.current.clone().context(
+                            "no current model selected; run `ccm use <name>` first",
+                        )?;
+                        config.resolve_target(&target)?
+                    }
                 };
                 launcher::run_claude(&config, &name)?;
             }
