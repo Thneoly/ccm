@@ -22,8 +22,8 @@ pub enum Command {
     Use { target: String },
     Switch {
         target: String,
-        #[arg(long, default_value = "http://127.0.0.1:13521")]
-        proxy_url: String,
+        #[arg(long)]
+        proxy_url: Option<String>,
     },
     Run {
         target: Option<String>,
