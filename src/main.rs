@@ -101,6 +101,9 @@ async fn main() -> Result<()> {
             println!("Selected {} as persisted default", target);
         }
         Command::Switch { target, proxy_url } => {
+            let proxy_url = proxy_url
+                .or_else(|| std::env::var("CCM_PROXY_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:13521".to_string());
             control::switch(&proxy_url, &target).await?;
         }
         Command::Run {
