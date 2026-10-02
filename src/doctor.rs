@@ -1,8 +1,8 @@
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::Result;
 
-use crate::{config::AppConfig, credential, state::AppState};
+use crate::{config::AppConfig, credential, launcher, state::AppState};
 
 pub async fn run(config: &AppConfig) -> Result<()> {
     println!("CCM doctor\n");
@@ -68,7 +68,7 @@ pub async fn run(config: &AppConfig) -> Result<()> {
 }
 
 fn check_claude() {
-    let result = Command::new("claude")
+    let result = launcher::claude_command()
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

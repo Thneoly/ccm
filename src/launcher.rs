@@ -47,6 +47,18 @@ fn run_command_with_proxy_env(
     run_command_inner(base_url, token, model, auth, Some(proxy_url))
 }
 
+pub fn claude_command() -> Command {
+    // Windows: npm installs ship only claude.cmd shims and CreateProcessW resolves
+    // bare names to .exe only, so route through cmd for both .cmd and .exe.
+    if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.arg("/c").arg("claude");
+        command
+    } else {
+        Command::new("claude")
+    }
+}
+
 fn run_command_inner(
     base_url: &str,
     token: &str,
@@ -54,7 +66,7 @@ fn run_command_inner(
     auth: ProviderAuth,
     proxy_url: Option<&str>,
 ) -> Result<()> {
-    let mut command = Command::new("claude");
+    let mut command = claude_command();
     command
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("ANTHROPIC_MODEL", model)
