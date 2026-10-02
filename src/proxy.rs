@@ -1460,7 +1460,12 @@ open_ms = {open_ms}
             let requests = primary.requests.lock().unwrap();
             let captured = requests.last().unwrap();
             assert_eq!(
-                captured.headers.get("x-api-key").unwrap(),
+                captured
+                    .headers
+                    .get("x-api-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "primary-secret"
             );
             assert!(captured.headers.get(header::AUTHORIZATION).is_none());
@@ -1476,7 +1481,12 @@ open_ms = {open_ms}
             let requests = fallback.requests.lock().unwrap();
             let captured = requests.last().unwrap();
             assert_eq!(
-                captured.headers.get(header::AUTHORIZATION).unwrap(),
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "Bearer fallback-secret"
             );
             assert!(captured.headers.get("x-api-key").is_none());
