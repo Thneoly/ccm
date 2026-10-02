@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{Model, ModelRouting, Profile},
-    provider::{Provider, ProviderKind},
+    provider::{Provider, ProviderAuth, ProviderKind},
     route::{ResolvedRoute, Route, RoutePolicy, SelectionStrategy},
 };
 
@@ -36,6 +36,7 @@ impl AppConfig {
             Provider {
                 kind: ProviderKind::Anthropic,
                 base_url: "https://api.anthropic.com".to_string(),
+                auth: ProviderAuth::XApiKey,
             },
         );
         providers.insert(
@@ -43,6 +44,7 @@ impl AppConfig {
             Provider {
                 kind: ProviderKind::AnthropicCompatible,
                 base_url: "https://api.z.ai/api/anthropic".to_string(),
+                auth: ProviderAuth::XApiKey,
             },
         );
 
