@@ -4,12 +4,15 @@ A fast local model manager and control plane for AI coding CLIs, starting with C
 
 CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, circuit breaking, metrics, and dynamic model selection locally.
 
+User guide (中文): `docs/USAGE.md`.
+
 ## Agent handoff
 
 For implementation continuation and release stabilization, read:
 
 - `docs/DESIGN.md` — architecture, routing semantics, invariants, module responsibilities, known design debt.
 - `docs/V0.3_PLAN.md` — current verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
+- `docs/USAGE.md` — task-oriented user guide (Chinese).
 
 Current status:
 
