@@ -40,6 +40,7 @@ impl AppState {
             if let Some(current) = config.legacy_current.clone() {
                 state.current = Some(current);
                 state.save()?;
+                config.save()?;
             }
         }
         Ok(state)
