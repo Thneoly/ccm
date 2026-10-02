@@ -258,6 +258,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_current_deserializes_but_is_not_serialized() {
+        let raw = r#"
+current = "glm"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.legacy_current.as_deref(), Some("glm"));
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("current ="));
+    }
+
+    #[test]
     fn resolves_model_alias() {
         let config = AppConfig::starter();
         assert_eq!(config.resolve_target("glm").unwrap(), "glm");
