@@ -4,6 +4,19 @@ A fast local model manager and control plane for AI coding CLIs, starting with C
 
 CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, circuit breaking, metrics, and dynamic model selection locally.
 
+## Agent handoff
+
+For implementation continuation and release stabilization, read:
+
+- `docs/DESIGN.md` — architecture, routing semantics, invariants, module responsibilities, known design debt.
+- `docs/V0.3_PLAN.md` — current verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
+
+Current status:
+
+> **v0.3 feature-complete; release stabilization in progress.**
+
+Do not add new routing strategies before v0.3 release. The next work should begin with the Rust Release Gate and platform smoke tests described in `docs/V0.3_PLAN.md`.
+
 ## Quick start
 
 ```bash
