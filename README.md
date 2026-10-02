@@ -17,6 +17,30 @@ Current status:
 
 Do not add new routing strategies before v0.3 release. The next work should begin with the Rust Release Gate and platform smoke tests described in `docs/V0.3_PLAN.md`.
 
+## Install
+
+Build the release binary and install it onto your PATH:
+
+```powershell
+# Windows PowerShell
+./scripts/install.ps1
+```
+
+```bash
+# Linux / macOS
+./scripts/install.sh
+```
+
+Default install locations:
+
+```text
+Windows  %LOCALAPPDATA%\Programs\ccm   (user PATH, no admin required)
+Linux    ~/.local/bin
+macOS    ~/.local/bin
+```
+
+Override the destination with `-Destination <dir>` (PowerShell) or `CCM_INSTALL_DIR=<dir>` (sh). Re-running the script upgrades an existing installation in place.
+
 ## Quick start
 
 ```bash
