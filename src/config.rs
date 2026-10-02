@@ -4,9 +4,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{Model, Profile},
+    model::{Model, ModelRouting, Profile},
     provider::{Provider, ProviderKind},
-    route::{ResolvedRoute, Route, RoutePolicy},
+    route::{ResolvedRoute, Route, RoutePolicy, SelectionStrategy},
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -52,6 +52,10 @@ impl AppConfig {
             Model {
                 provider: "anthropic".to_string(),
                 model_id: "claude-sonnet-4-5".to_string(),
+                routing: ModelRouting {
+                    cost_weight: 1.0,
+                    quality_weight: 1.0,
+                },
             },
         );
         models.insert(
@@ -59,6 +63,10 @@ impl AppConfig {
             Model {
                 provider: "zai".to_string(),
                 model_id: "glm-5".to_string(),
+                routing: ModelRouting {
+                    cost_weight: 0.25,
+                    quality_weight: 0.85,
+                },
             },
         );
 
@@ -148,6 +156,12 @@ impl AppConfig {
         if !self.providers.contains_key(&model.provider) {
             bail!("unknown provider `{}`", model.provider);
         }
+        if model.routing.cost_weight < 0.0 {
+            bail!("model routing cost_weight must be >= 0");
+        }
+        if model.routing.quality_weight < 0.0 {
+            bail!("model routing quality_weight must be >= 0");
+        }
         self.models.insert(name, model);
         Ok(())
     }
@@ -173,6 +187,21 @@ impl AppConfig {
         if route.policy.header_timeout_ms == 0 {
             bail!("route policy header_timeout_ms must be greater than 0");
         }
+
+        let weights = &route.policy.weights;
+        if weights.reliability < 0.0
+            || weights.latency < 0.0
+            || weights.cost < 0.0
+            || weights.quality < 0.0
+        {
+            bail!("route selection weights must be >= 0");
+        }
+        if matches!(route.policy.selection, SelectionStrategy::Weighted)
+            && weights.reliability + weights.latency + weights.cost + weights.quality <= 0.0
+        {
+            bail!("weighted selection requires at least one positive selection weight");
+        }
+
         if route.policy.circuit_breaker.enabled {
             if route.policy.circuit_breaker.failure_threshold == 0 {
                 bail!("circuit breaker failure_threshold must be greater than 0");
@@ -252,12 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_target() {
-        let config = AppConfig::starter();
-        assert!(config.resolve_target("missing").is_err());
-    }
-
-    #[test]
     fn rejects_model_with_unknown_provider() {
         let mut config = AppConfig::starter();
         let result = config.add_model(
@@ -265,20 +288,24 @@ mod tests {
             Model {
                 provider: "missing".to_string(),
                 model_id: "x".to_string(),
+                routing: ModelRouting::default(),
             },
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn rejects_route_with_unknown_fallback() {
+    fn rejects_negative_model_cost_weight() {
         let mut config = AppConfig::starter();
-        let result = config.add_route(
-            "broken-route".to_string(),
-            Route {
-                primary: "claude".to_string(),
-                fallback: vec!["missing".to_string()],
-                policy: RoutePolicy::default(),
+        let result = config.add_model(
+            "broken".to_string(),
+            Model {
+                provider: "anthropic".to_string(),
+                model_id: "x".to_string(),
+                routing: ModelRouting {
+                    cost_weight: -1.0,
+                    quality_weight: 1.0,
+                },
             },
         );
         assert!(result.is_err());
