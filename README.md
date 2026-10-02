@@ -308,10 +308,11 @@ GET  /_ccm/routes
 GET  /_ccm/traces
 GET  /_ccm/circuits
 GET  /_ccm/metrics
+GET  /_ccm/scores
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's candidate ranking by returning each reliability, latency, cost, and quality sub-score plus the final weighted score.
 
 ## In-session switching from Claude Code
 
@@ -385,6 +386,7 @@ GitHub Actions CI is currently disabled.
 - model cost/quality routing metadata
 - `ordered`, `healthiest`, `lowest-latency`, `lowest-cost`, and `weighted` selection
 - transparent weighted scoring
+- explainable candidate score control API
 - in-memory traces, metrics, and circuit-state control APIs
 - no mid-stream failover
 - no OpenAI protocol translation yet
