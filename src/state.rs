@@ -36,12 +36,12 @@ impl AppState {
 
     pub fn load_or_migrate(config: &AppConfig) -> Result<Self> {
         let mut state = Self::load()?;
-        if state.current.is_none() {
-            if let Some(current) = config.legacy_current.clone() {
+        if let Some(current) = config.legacy_current.clone() {
+            if state.current.is_none() {
                 state.current = Some(current);
                 state.save()?;
-                config.save()?;
             }
+            config.save()?;
         }
         Ok(state)
     }
