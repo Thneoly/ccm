@@ -44,9 +44,25 @@ impl AppState {
                 state.current = Some(current);
                 state.save()?;
             }
-            config.save()?;
+            Self::strip_legacy_current()?;
         }
         Ok(state)
+    }
+
+    // Remove only the legacy `current` key so that unknown keys and comments in
+    // config.toml survive the migration instead of a full round-trip rewrite.
+    fn strip_legacy_current() -> Result<()> {
+        let path = AppConfig::path()?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let mut document = raw
+            .parse::<toml_edit::DocumentMut>()
+            .context("invalid TOML configuration")?;
+        if document.remove("current").is_some() {
+            fs::write(&path, document.to_string())
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn init(force: bool) -> Result<PathBuf> {
