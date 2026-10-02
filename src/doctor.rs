@@ -2,21 +2,31 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-use crate::{config::AppConfig, credential};
+use crate::{config::AppConfig, credential, state::AppState};
 
 pub async fn run(config: &AppConfig) -> Result<()> {
     println!("CCM doctor\n");
 
     check_claude();
 
-    let Some(current) = config.current.as_deref() else {
-        println!("! current model: not selected");
+    let state = AppState::load_or_migrate(config)?;
+    let Some(current) = state.current.as_deref() else {
+        println!("! current target: not selected");
         return Ok(());
     };
-    println!("✓ current model: {current}");
+    println!("✓ current target: {current}");
 
-    let Some(model) = config.models.get(current) else {
-        println!("✗ model `{current}` is missing from config");
+    let route = match config.resolve_route(current) {
+        Ok(route) => route,
+        Err(error) => {
+            println!("✗ target `{current}`: {error}");
+            return Ok(());
+        }
+    };
+    println!("✓ primary model: {}", route.primary);
+
+    let Some(model) = config.models.get(&route.primary) else {
+        println!("✗ model `{}` is missing from config", route.primary);
         return Ok(());
     };
     println!("✓ model id: {}", model.model_id);
@@ -30,7 +40,19 @@ pub async fn run(config: &AppConfig) -> Result<()> {
 
     match credential::get(&model.provider) {
         Ok(_) => println!("✓ credential: present"),
-        Err(_) => println!("✗ credential: missing (`ccm auth set {}`)", model.provider),
+        Err(_) => println!(
+            "✗ credential: missing (set CCM_{}_API_KEY or run `ccm auth set {}`)",
+            model
+                .provider
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>(),
+            model.provider
+        ),
     }
 
     match reqwest::Client::new().get(&provider.base_url).send().await {
@@ -38,7 +60,10 @@ pub async fn run(config: &AppConfig) -> Result<()> {
         Err(error) => println!("✗ endpoint: {error}"),
     }
 
-    println!("\nFor a full authenticated model check, run `ccm health {current}`.");
+    println!(
+        "\nFor a full authenticated model check, run `ccm health {}`.",
+        route.primary
+    );
     Ok(())
 }
 
