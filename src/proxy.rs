@@ -1257,4 +1257,340 @@ mod tests {
         };
         assert_eq!(candidate_health_rank(Some(&metrics)), 1.0);
     }
+
+    #[derive(Clone)]
+    enum MockBehavior {
+        OkStream,
+        Status(StatusCode),
+        DelayOk(u64),
+    }
+
+    #[derive(Clone)]
+    struct CapturedRequest {
+        headers: HeaderMap,
+        body: Value,
+    }
+
+    #[derive(Clone)]
+    struct MockProviderState {
+        behavior: Arc<RwLock<MockBehavior>>,
+        requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    }
+
+    async fn mock_messages(
+        State(state): State<MockProviderState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response<Body> {
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(CapturedRequest { headers, body });
+
+        match state.behavior.read().await.clone() {
+            MockBehavior::OkStream => stream_ok(),
+            MockBehavior::Status(status) => Response::builder()
+                .status(status)
+                .body(Body::from(format!("mock {status}")))
+                .unwrap(),
+            MockBehavior::DelayOk(delay_ms) => {
+                sleep(Duration::from_millis(delay_ms)).await;
+                stream_ok()
+            }
+        }
+    }
+
+    fn stream_ok() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            ))
+            .unwrap()
+    }
+
+    async fn spawn_mock(
+        behavior: MockBehavior,
+    ) -> (SocketAddr, MockProviderState, tokio::task::JoinHandle<()>) {
+        let state = MockProviderState {
+            behavior: Arc::new(RwLock::new(behavior)),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(mock_messages))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, state, handle)
+    }
+
+    fn integration_proxy_state() -> ProxyState {
+        ProxyState {
+            client: Client::new(),
+            target: Arc::new(RwLock::new("test-route".to_string())),
+            traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
+            circuits: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(RwLock::new(HashMap::new())),
+            decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
+            decision_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn integration_request() -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"ccm","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            ))
+            .unwrap()
+    }
+
+    fn write_integration_config(
+        root: &std::path::Path,
+        primary_url: &str,
+        fallback_url: &str,
+        selection: &str,
+        header_timeout_ms: u64,
+        failure_threshold: usize,
+        open_ms: u64,
+    ) {
+        std::fs::create_dir_all(root).unwrap();
+        let raw = format!(
+            r#"
+[providers.primary]
+kind = "anthropic-compatible"
+base_url = "{primary_url}"
+auth = "x-api-key"
+
+[providers.fallback]
+kind = "anthropic-compatible"
+base_url = "{fallback_url}"
+auth = "bearer"
+
+[models.primary]
+provider = "primary"
+model_id = "upstream-primary"
+
+[models.primary.routing]
+cost_weight = 10.0
+quality_weight = 0.2
+
+[models.fallback]
+provider = "fallback"
+model_id = "upstream-fallback"
+
+[models.fallback.routing]
+cost_weight = 0.1
+quality_weight = 0.9
+
+[routes.test-route]
+primary = "primary"
+fallback = ["fallback"]
+
+[routes.test-route.policy]
+selection = "{selection}"
+header_timeout_ms = {header_timeout_ms}
+fallback_on = [429, 503]
+max_attempts = 2
+backoff_ms = 0
+
+[routes.test-route.policy.weights]
+reliability = 0.0
+latency = 0.0
+cost = 0.5
+quality = 0.5
+
+[routes.test-route.policy.circuit_breaker]
+enabled = true
+failure_threshold = {failure_threshold}
+open_ms = {open_ms}
+"#,
+        );
+        std::fs::write(root.join("config.toml"), raw).unwrap();
+    }
+
+    async fn body_text(response: Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn mock_provider_integration_covers_v03_routing_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "ccm-mock-integration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PRIMARY_API_KEY", "primary-secret");
+        std::env::set_var("CCM_FALLBACK_API_KEY", "fallback-secret");
+
+        let (primary_addr, primary, primary_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (fallback_addr, fallback, fallback_task) = spawn_mock(MockBehavior::OkStream).await;
+        let primary_url = format!("http://{primary_addr}");
+        let fallback_url = format!("http://{fallback_addr}");
+        let state = integration_proxy_state();
+
+        // 200 streaming + x-api-key + model rewrite.
+        write_integration_config(
+            &root,
+            &primary_url,
+            &fallback_url,
+            "ordered",
+            250,
+            3,
+            50,
+        );
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_start"));
+        {
+            let requests = primary.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(
+                captured.headers.get("x-api-key").unwrap(),
+                "primary-secret"
+            );
+            assert!(captured.headers.get(header::AUTHORIZATION).is_none());
+            assert_eq!(captured.body["model"], "upstream-primary");
+        }
+
+        // 429 fallback + bearer auth + decision trace.
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_start"));
+        {
+            let requests = fallback.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(
+                captured.headers.get(header::AUTHORIZATION).unwrap(),
+                "Bearer fallback-secret"
+            );
+            assert!(captured.headers.get("x-api-key").is_none());
+            assert_eq!(captured.body["model"], "upstream-fallback");
+        }
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.selected.as_deref(), Some("fallback"));
+            assert_eq!(decision.attempts.len(), 2);
+            assert!(decision.attempts[0].result.contains("429"));
+            assert!(decision.attempts[0].fallback);
+        }
+
+        // Header timeout falls back.
+        state.circuits.write().await.clear();
+        *primary.behavior.write().await = MockBehavior::DelayOk(100);
+        write_integration_config(
+            &root,
+            &primary_url,
+            &fallback_url,
+            "ordered",
+            20,
+            3,
+            50,
+        );
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.selected.as_deref(), Some("fallback"));
+            assert!(decision.attempts[0].result.contains("timeout"));
+        }
+
+        // 503 opens the circuit; next request skips primary; cooldown allows HALF_OPEN recovery.
+        state.circuits.write().await.clear();
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::SERVICE_UNAVAILABLE);
+        write_integration_config(
+            &root,
+            &primary_url,
+            &fallback_url,
+            "ordered",
+            250,
+            1,
+            30,
+        );
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let primary_count_after_open = primary.requests.lock().unwrap().len();
+
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            primary.requests.lock().unwrap().len(),
+            primary_count_after_open
+        );
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert!(decision.attempts[0].result.contains("circuit OPEN"));
+            assert_eq!(decision.selected.as_deref(), Some("fallback"));
+        }
+
+        sleep(Duration::from_millis(40)).await;
+        *primary.behavior.write().await = MockBehavior::OkStream;
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.selected.as_deref(), Some("primary"));
+            assert_eq!(decision.attempts[0].circuit, "HALF_OPEN");
+        }
+        {
+            let circuits = state.circuits.read().await;
+            let primary_circuit = circuits.get("primary").unwrap();
+            assert!(primary_circuit.open_until_ms.is_none());
+            assert_eq!(primary_circuit.consecutive_failures, 0);
+        }
+
+        // Weighted routing uses static cost/quality metadata and selects fallback first.
+        state.circuits.write().await.clear();
+        write_integration_config(
+            &root,
+            &primary_url,
+            &fallback_url,
+            "weighted",
+            250,
+            3,
+            50,
+        );
+        let primary_before = primary.requests.lock().unwrap().len();
+        let fallback_before = fallback.requests.lock().unwrap().len();
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(primary.requests.lock().unwrap().len(), primary_before);
+        assert_eq!(
+            fallback.requests.lock().unwrap().len(),
+            fallback_before + 1
+        );
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.selection, "weighted");
+            assert_eq!(decision.ranked_candidates[0].model, "fallback");
+            assert_eq!(decision.selected.as_deref(), Some("fallback"));
+        }
+
+        primary_task.abort();
+        fallback_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PRIMARY_API_KEY");
+        std::env::remove_var("CCM_FALLBACK_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
