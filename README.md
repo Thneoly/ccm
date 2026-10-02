@@ -2,7 +2,7 @@
 
 A fast local model manager and control plane for AI coding CLIs, starting with Claude Code.
 
-CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, circuit breaking, and metric-aware model selection locally.
+CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, circuit breaking, metrics, and dynamic model selection locally.
 
 ## Quick start
 
@@ -17,6 +17,42 @@ ccm proxy
 ccm run --proxy
 ```
 
+## Model routing metadata
+
+Models can declare static metadata used by cost-aware and weighted routing:
+
+```toml
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-4-5"
+
+[models.claude.routing]
+cost_weight = 1.0
+quality_weight = 1.0
+
+[models.glm]
+provider = "zai"
+model_id = "glm-5"
+
+[models.glm.routing]
+cost_weight = 0.25
+quality_weight = 0.85
+```
+
+`cost_weight` is a relative cost factor where lower is cheaper. `quality_weight` is a user-supplied relative quality signal; weighted routing clamps it to the 0..1 range. These are routing hints, not measured billing or benchmark data.
+
+Create models from CLI with:
+
+```bash
+ccm add model glm \
+  --provider zai \
+  --model-id glm-5 \
+  --cost-weight 0.25 \
+  --quality-weight 0.85
+```
+
+Existing model configs that omit `[models.<name>.routing]` remain valid and default both values to `1.0`.
+
 ## Route model
 
 ```toml
@@ -25,11 +61,17 @@ primary = "claude"
 fallback = ["glm", "kimi"]
 
 [routes.coding-route.policy]
-selection = "healthiest"
+selection = "weighted"
 header_timeout_ms = 30000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 3
 backoff_ms = 200
+
+[routes.coding-route.policy.weights]
+reliability = 0.4
+latency = 0.2
+cost = 0.2
+quality = 0.2
 
 [routes.coding-route.policy.circuit_breaker]
 enabled = true
@@ -40,19 +82,19 @@ open_ms = 30000
 The routing stack is:
 
 ```text
-Provider
-   ↓
-Model
-   ↓
-Route
-   ↓
-RoutePolicy
-   ↓
-Runtime metrics + Circuit state
-   ↓
-Metric-aware Routing Executor
-   ↓
-CCM Proxy
+Model metadata + Runtime metrics
+              │
+              ▼
+Route → Candidate Selector
+              │
+              ▼
+       Circuit Breaker
+              │
+              ▼
+       Policy Executor
+              │
+              ▼
+            Proxy
 ```
 
 ## Selection strategies
@@ -63,6 +105,8 @@ CCM Proxy
 ordered
 healthiest
 lowest-latency
+lowest-cost
+weighted
 ```
 
 ### ordered
@@ -73,17 +117,59 @@ Preserves the configured candidate order:
 primary → fallback[0] → fallback[1]
 ```
 
-This is the default and preserves existing CCM behavior.
+This is the default.
 
 ### healthiest
 
-Ranks candidates by observed success rate after at least three real upstream attempts. Candidates with fewer than three samples are treated as neutral so CCM does not aggressively reorder on one noisy request. Ties are broken by lower EWMA response-header latency.
+Ranks candidates by observed success rate after at least three real upstream attempts. Candidates with fewer than three samples use a neutral reliability rank. Ties prefer lower response-header latency.
 
 ### lowest-latency
 
-Ranks candidates by EWMA response-header latency. Candidates without latency samples remain behind measured candidates; equal/unknown candidates preserve configured order.
+Ranks candidates by EWMA response-header latency. Candidates without samples remain behind measured candidates.
 
-Circuit Breaker admission always runs after selection. An OPEN model is skipped even if a metric strategy ranked it first.
+### lowest-cost
+
+Ranks candidates by ascending model `routing.cost_weight`. This uses static user-configured metadata and does not require runtime samples.
+
+### weighted
+
+Computes an explicit score for every candidate:
+
+```text
+reliability_score = success_rate, or 1.0 before 3 samples
+latency_score     = 1 / (1 + latency_ewma_ms / 1000)
+cost_score        = 1 / (1 + model.cost_weight)
+quality_score     = clamp(model.quality_weight, 0, 1)
+
+weighted_score =
+  (
+    reliability_weight × reliability_score +
+    latency_weight     × latency_score +
+    cost_weight        × cost_score +
+    quality_weight     × quality_score
+  )
+  /
+  (
+    reliability_weight +
+    latency_weight +
+    cost_weight +
+    quality_weight
+  )
+```
+
+Default route weights are:
+
+```toml
+[routes.example.policy.weights]
+reliability = 0.4
+latency = 0.2
+cost = 0.2
+quality = 0.2
+```
+
+All weights must be non-negative. Weighted selection requires at least one positive weight.
+
+Circuit Breaker admission always runs after candidate sorting. A model with a high score is still skipped when its circuit is OPEN or a HALF_OPEN probe is already in flight.
 
 ## Runtime metrics
 
@@ -104,40 +190,18 @@ last_success_ms
 last_failure_ms
 ```
 
-`health_score` is currently an intentionally simple and explainable reliability score:
+`health_score` is currently:
 
 ```text
 health_score = success_rate × 100
 ```
 
-`latency_ewma_ms` measures time to upstream response headers, not full streamed completion time, so CCM does not need to buffer SSE responses. EWMA uses alpha = 0.2.
+`latency_ewma_ms` measures time to upstream response headers so CCM does not buffer streamed responses. EWMA alpha is `0.2`.
 
-Inspect metrics with:
+Inspect metrics:
 
 ```bash
 curl http://127.0.0.1:13521/_ccm/metrics
-```
-
-Example:
-
-```json
-[
-  {
-    "model": "claude",
-    "attempts": 12,
-    "successes": 9,
-    "success_rate": 0.75,
-    "health_score": 75.0,
-    "http_errors": 3,
-    "fallback_failures": 2,
-    "timeouts": 0,
-    "request_errors": 0,
-    "rate_limited": 2,
-    "latency_ewma_ms": 842.4,
-    "last_success_ms": 1790820000000,
-    "last_failure_ms": 1790819900000
-  }
-]
 ```
 
 ## Fallback policy
@@ -151,7 +215,7 @@ max_attempts = 3
 backoff_ms = 200
 ```
 
-Connection/request errors and response-header timeouts are fallback-eligible. `max_attempts` counts real upstream attempts; models skipped by an OPEN/HALF_OPEN circuit do not consume attempt budget.
+Connection/request errors and response-header timeouts are fallback-eligible. `max_attempts` counts real upstream attempts; circuit-skipped models do not consume the budget.
 
 Once an upstream response is accepted, CCM streams it directly back to Claude Code. CCM does not switch models in the middle of an already-started stream.
 
@@ -178,33 +242,22 @@ HALF_OPEN
    └─ probe fails    → OPEN
 ```
 
-Health failures are connection/request errors, response-header timeouts, and HTTP statuses listed in `fallback_on`. Authentication/request errors such as 400/401/403 are not health failures unless explicitly configured in `fallback_on`.
+Health failures are connection/request errors, response-header timeouts, and HTTP statuses listed in `fallback_on`. Authentication/request errors such as 400/401/403 are not health failures unless explicitly configured.
 
 Circuit state is keyed by model alias and shared across routes inside one running proxy.
 
-Inspect it with:
+## Creating dynamic routes from CLI
 
-```bash
-curl http://127.0.0.1:13521/_ccm/circuits
-```
-
-## Creating routes from CLI
+Reliability-focused:
 
 ```bash
 ccm add route coding \
   --primary claude \
   --fallback glm,kimi \
-  --selection healthiest \
-  --header-timeout-ms 30000 \
-  --fallback-on 429,502,503,504 \
-  --max-attempts 3 \
-  --backoff-ms 200 \
-  --circuit-enabled true \
-  --failure-threshold 3 \
-  --circuit-open-ms 30000
+  --selection healthiest
 ```
 
-For latency-first routing:
+Latency-focused:
 
 ```bash
 ccm add route fast \
@@ -213,12 +266,34 @@ ccm add route fast \
   --selection lowest-latency
 ```
 
+Cost-focused:
+
+```bash
+ccm add route cheap \
+  --primary claude \
+  --fallback glm,kimi \
+  --selection lowest-cost
+```
+
+Balanced weighted routing:
+
+```bash
+ccm add route balanced \
+  --primary claude \
+  --fallback glm,kimi \
+  --selection weighted \
+  --reliability-weight 0.4 \
+  --latency-weight 0.2 \
+  --cost-weight 0.2 \
+  --quality-weight 0.2
+```
+
 ## Runtime switching
 
 ```bash
 ccm switch glm
 ccm switch fast
-ccm switch coding-route
+ccm switch balanced
 ```
 
 `ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/config.toml`.
@@ -236,7 +311,7 @@ GET  /_ccm/metrics
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-The status and route endpoints expose the effective selection, fallback, and circuit-breaker policy.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy.
 
 ## In-session switching from Claude Code
 
@@ -251,7 +326,7 @@ Then inside a Claude Code session started with `ccm run --proxy`:
 ```text
 /switch glm
 /switch claude
-/switch coding-route
+/switch balanced
 ```
 
 ## Commands
@@ -260,8 +335,14 @@ Then inside a Claude Code session started with `ccm run --proxy`:
 ccm init [--force]
 ccm add provider <name> [--base-url URL] [--kind KIND]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
+  [--cost-weight N]
+  [--quality-weight N]
 ccm add route <name> --primary MODEL [--fallback MODEL1,MODEL2]
-  [--selection ordered|healthiest|lowest-latency]
+  [--selection ordered|healthiest|lowest-latency|lowest-cost|weighted]
+  [--reliability-weight N]
+  [--latency-weight N]
+  [--cost-weight N]
+  [--quality-weight N]
   [--header-timeout-ms MS]
   [--fallback-on CODE1,CODE2]
   [--max-attempts N]
@@ -298,17 +379,14 @@ GitHub Actions CI is currently disabled.
 - Anthropic-compatible `/v1/messages`
 - streaming upstream responses
 - model/profile/route runtime switching
-- route-specific fallback policy
-- timeout/backoff/max attempts
+- fallback policy and retry budget
 - model-level circuit breaker
-- CLOSED / OPEN / HALF_OPEN behavior
-- per-model runtime metrics
-- success-rate health score
-- latency EWMA
-- `ordered`, `healthiest`, and `lowest-latency` selection
+- runtime reliability and latency metrics
+- model cost/quality routing metadata
+- `ordered`, `healthiest`, `lowest-latency`, `lowest-cost`, and `weighted` selection
+- transparent weighted scoring
 - in-memory traces, metrics, and circuit-state control APIs
 - no mid-stream failover
-- no cost-aware/weighted routing yet
 - no OpenAI protocol translation yet
 
 ## License
