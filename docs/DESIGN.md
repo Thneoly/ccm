@@ -291,6 +291,8 @@ HALF_OPEN
 
 Only one HALF_OPEN probe is admitted at a time.
 
+The `/_ccm/circuits` control view reports `HALF_OPEN_READY` once the OPEN cooldown has elapsed but before the next HALF_OPEN probe is admitted.
+
 Other concurrent requests skip that candidate and continue routing.
 
 A circuit skip does **not** consume `max_attempts`.

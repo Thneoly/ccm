@@ -323,6 +323,8 @@ HALF_OPEN
    └─ probe fails    → OPEN
 ```
 
+While the OPEN cooldown has elapsed but the next HALF_OPEN probe has not been admitted yet, `/_ccm/circuits` reports the model as `HALF_OPEN_READY`.
+
 Health failures are connection/request errors, response-header timeouts, and HTTP statuses listed in `fallback_on`. Authentication/request errors such as 400/401/403 are not health failures unless explicitly configured.
 
 Circuit state is keyed by model alias and shared across routes inside one running proxy.
