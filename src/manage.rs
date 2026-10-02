@@ -6,7 +6,7 @@ use crate::{
     cli::AddCommand,
     config::AppConfig,
     model::{Model, ModelRouting},
-    provider::{Provider, ProviderKind},
+    provider::{Provider, ProviderAuth, ProviderKind},
     route::{
         CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy, SelectionWeights,
     },
@@ -18,11 +18,20 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             name,
             base_url,
             kind,
+            auth,
         } => {
             let base_url = required(base_url, "Base URL")?;
             let kind = required(kind, "Kind (anthropic / anthropic-compatible)")?;
             let kind = parse_kind(&kind)?;
-            config.add_provider(name.clone(), Provider { kind, base_url });
+            let auth = parse_auth(&auth)?;
+            config.add_provider(
+                name.clone(),
+                Provider {
+                    kind,
+                    base_url,
+                    auth,
+                },
+            );
             config.save()?;
             println!("Saved provider {name}");
         }
@@ -155,6 +164,14 @@ fn parse_selection(value: &str) -> Result<SelectionStrategy> {
         other => bail!(
             "unsupported selection strategy `{other}`; expected ordered, healthiest, lowest-latency, lowest-cost, or weighted"
         ),
+    }
+}
+
+fn parse_auth(value: &str) -> Result<ProviderAuth> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "x-api-key" | "x_api_key" | "apikey" | "api-key" => Ok(ProviderAuth::XApiKey),
+        "bearer" | "authorization" => Ok(ProviderAuth::Bearer),
+        other => bail!("unsupported provider auth `{other}`; expected x-api-key or bearer"),
     }
 }
 
