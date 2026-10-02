@@ -53,7 +53,7 @@ impl AppConfig {
             "claude".to_string(),
             Model {
                 provider: "anthropic".to_string(),
-                model_id: "claude-sonnet-4-5".to_string(),
+                model_id: "claude-sonnet-5-5".to_string(),
                 routing: ModelRouting {
                     cost_weight: 1.0,
                     quality_weight: 1.0,
@@ -64,7 +64,7 @@ impl AppConfig {
             "glm".to_string(),
             Model {
                 provider: "zai".to_string(),
-                model_id: "glm-5".to_string(),
+                model_id: "glm-5.3".to_string(),
                 routing: ModelRouting {
                     cost_weight: 0.25,
                     quality_weight: 0.85,
