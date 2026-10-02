@@ -17,6 +17,38 @@ ccm proxy
 ccm run --proxy
 ```
 
+## Configuration and state
+
+CCM separates declarative configuration from mutable local state:
+
+```text
+~/.ccm/config.toml
+  providers
+  models
+  profiles
+  routes
+  route policies
+
+~/.ccm/state.toml
+  current
+```
+
+A fresh `ccm init` creates both files. Example state:
+
+```toml
+current = "claude"
+```
+
+`ccm use <target>` writes only `state.toml`. Runtime `ccm switch <target>` remains in-memory and does not modify either file.
+
+Older CCM configurations that stored:
+
+```toml
+current = "glm"
+```
+
+inside `config.toml` are migrated automatically the first time CCM loads persisted state. CCM writes that value to `state.toml` and rewrites `config.toml` without the legacy `current` field.
+
 ## Model routing metadata
 
 Models can declare static metadata used by cost-aware and weighted routing:
@@ -296,7 +328,7 @@ ccm switch fast
 ccm switch balanced
 ```
 
-`ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/config.toml`.
+`ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/state.toml`.
 
 ## Control API
 
@@ -384,7 +416,6 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-state.toml / runtime-state persistence
 provider authentication strategy cleanup
 official Claude Code compatibility verification
 mock-provider integration tests
@@ -459,6 +490,8 @@ GitHub Actions CI is currently disabled.
 - Anthropic-compatible `/v1/messages`
 - streaming upstream responses
 - model/profile/route runtime switching
+- static config / persisted state separation via config.toml + state.toml
+- automatic migration from legacy config current
 - fallback policy and retry budget
 - model-level circuit breaker
 - runtime reliability and latency metrics
