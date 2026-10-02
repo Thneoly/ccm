@@ -37,3 +37,20 @@ pub enum ProviderKind {
     Anthropic,
     AnthropicCompatible,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_auth_defaults_to_x_api_key() {
+        let provider: Provider = toml::from_str(
+            r#"
+kind = "anthropic-compatible"
+base_url = "https://example.com"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(provider.auth, ProviderAuth::XApiKey));
+    }
+}
