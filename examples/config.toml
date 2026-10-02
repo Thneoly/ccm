@@ -10,7 +10,7 @@ auth = "x-api-key"
 
 [models.claude]
 provider = "anthropic"
-model_id = "claude-sonnet-4-5"
+model_id = "claude-sonnet-5-5"
 
 [models.claude.routing]
 cost_weight = 1.0
@@ -18,7 +18,7 @@ quality_weight = 1.0
 
 [models.glm]
 provider = "zai"
-model_id = "glm-5"
+model_id = "glm-5.3"
 
 [models.glm.routing]
 cost_weight = 0.25
