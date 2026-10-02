@@ -603,9 +603,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
 
         let mut builder = state.client.post(upstream).body(body);
         builder = copy_request_headers(builder, &parts.headers);
-        builder = builder
-            .header("x-api-key", &token)
-            .header("authorization", format!("Bearer {token}"));
+        builder = provider.apply_auth(builder, &token);
 
         let started = Instant::now();
         record_attempt_started(&state, candidate).await;
