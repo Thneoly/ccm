@@ -505,7 +505,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let candidates = select_candidates(
         &state,
         &config,
-        configured_candidates,
+        configured_candidates.clone(),
         &route.policy.selection,
         &route.policy.weights,
     )
