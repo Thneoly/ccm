@@ -9,18 +9,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
-    Add {
-        #[command(subcommand)]
-        command: AddCommand,
-    },
-    Integrate {
-        #[command(subcommand)]
-        command: IntegrateCommand,
-    },
+    Init { #[arg(long)] force: bool },
+    Add { #[command(subcommand)] command: AddCommand },
+    Integrate { #[command(subcommand)] command: IntegrateCommand },
     Doctor,
     Proxy {
         #[arg(long, default_value = "127.0.0.1:13521")]
@@ -41,10 +32,7 @@ pub enum Command {
         #[arg(long, default_value = "http://127.0.0.1:13521")]
         proxy_url: String,
     },
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
+    Auth { #[command(subcommand)] command: AuthCommand },
     Health { target: String },
 }
 
@@ -63,6 +51,10 @@ pub enum AddCommand {
         provider: Option<String>,
         #[arg(long)]
         model_id: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        cost_weight: f64,
+        #[arg(long, default_value_t = 1.0)]
+        quality_weight: f64,
     },
     Route {
         name: String,
@@ -72,6 +64,14 @@ pub enum AddCommand {
         fallback: Option<String>,
         #[arg(long, default_value = "ordered")]
         selection: String,
+        #[arg(long, default_value_t = 0.4)]
+        reliability_weight: f64,
+        #[arg(long, default_value_t = 0.2)]
+        latency_weight: f64,
+        #[arg(long, default_value_t = 0.2)]
+        cost_weight: f64,
+        #[arg(long, default_value_t = 0.2)]
+        quality_weight: f64,
         #[arg(long, default_value_t = 30_000)]
         header_timeout_ms: u64,
         #[arg(long, default_value = "429,502,503,504")]
@@ -91,10 +91,7 @@ pub enum AddCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum IntegrateCommand {
-    Claude {
-        #[arg(long)]
-        remove: bool,
-    },
+    Claude { #[arg(long)] remove: bool },
 }
 
 #[derive(Debug, Subcommand)]
