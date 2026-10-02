@@ -49,6 +49,42 @@ current = "glm"
 
 inside `config.toml` are migrated automatically the first time CCM loads persisted state. CCM writes that value to `state.toml` and rewrites `config.toml` without the legacy `current` field.
 
+## Provider authentication
+
+Provider authentication is explicit and only one upstream auth header is emitted:
+
+```toml
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+auth = "x-api-key"
+
+[providers.gateway]
+kind = "anthropic-compatible"
+base_url = "https://gateway.example.com"
+auth = "bearer"
+```
+
+Supported values:
+
+```text
+x-api-key
+bearer
+```
+
+If an older provider entry omits `auth`, CCM defaults to `x-api-key`.
+
+For direct Claude Code launches, CCM also isolates the environment: `x-api-key` sets only `ANTHROPIC_API_KEY`, while `bearer` sets only `ANTHROPIC_AUTH_TOKEN`. This avoids accidentally inheriting both authentication variables from the parent shell.
+
+Create a provider explicitly with:
+
+```bash
+ccm add provider gateway \
+  --kind anthropic-compatible \
+  --base-url https://gateway.example.com \
+  --auth bearer
+```
+
 ## Model routing metadata
 
 Models can declare static metadata used by cost-aware and weighted routing:
@@ -416,7 +452,6 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-provider authentication strategy cleanup
 official Claude Code compatibility verification
 mock-provider integration tests
 Windows / Linux / macOS validation
@@ -444,7 +479,7 @@ Then inside a Claude Code session started with `ccm run --proxy`:
 
 ```text
 ccm init [--force]
-ccm add provider <name> [--base-url URL] [--kind KIND]
+ccm add provider <name> [--base-url URL] [--kind KIND] [--auth x-api-key|bearer]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
   [--cost-weight N]
   [--quality-weight N]
@@ -492,6 +527,8 @@ GitHub Actions CI is currently disabled.
 - model/profile/route runtime switching
 - static config / persisted state separation via config.toml + state.toml
 - automatic migration from legacy config current
+- explicit x-api-key / bearer provider authentication
+- single-header upstream credential injection
 - fallback policy and retry budget
 - model-level circuit breaker
 - runtime reliability and latency metrics
