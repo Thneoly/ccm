@@ -122,9 +122,10 @@ async fn main() -> Result<()> {
                 let name = match target {
                     Some(target) => config.resolve_target(&target)?,
                     None => {
-                        let target = state.current.clone().context(
-                            "no current model selected; run `ccm use <name>` first",
-                        )?;
+                        let target = state
+                            .current
+                            .clone()
+                            .context("no current model selected; run `ccm use <name>` first")?;
                         config.resolve_target(&target)?
                     }
                 };

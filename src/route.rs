@@ -1,16 +1,38 @@
 use serde::{Deserialize, Serialize};
 
-fn default_header_timeout_ms() -> u64 { 30_000 }
-fn default_fallback_on() -> Vec<u16> { vec![429, 502, 503, 504] }
-fn default_max_attempts() -> usize { 3 }
-fn default_backoff_ms() -> u64 { 200 }
-fn default_circuit_enabled() -> bool { true }
-fn default_failure_threshold() -> usize { 3 }
-fn default_open_ms() -> u64 { 30_000 }
-fn default_reliability_weight() -> f64 { 0.4 }
-fn default_latency_weight() -> f64 { 0.2 }
-fn default_cost_weight() -> f64 { 0.2 }
-fn default_quality_weight() -> f64 { 0.2 }
+fn default_header_timeout_ms() -> u64 {
+    30_000
+}
+fn default_fallback_on() -> Vec<u16> {
+    vec![429, 502, 503, 504]
+}
+fn default_max_attempts() -> usize {
+    3
+}
+fn default_backoff_ms() -> u64 {
+    200
+}
+fn default_circuit_enabled() -> bool {
+    true
+}
+fn default_failure_threshold() -> usize {
+    3
+}
+fn default_open_ms() -> u64 {
+    30_000
+}
+fn default_reliability_weight() -> f64 {
+    0.4
+}
+fn default_latency_weight() -> f64 {
+    0.2
+}
+fn default_cost_weight() -> f64 {
+    0.2
+}
+fn default_quality_weight() -> f64 {
+    0.2
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -23,7 +45,9 @@ pub enum SelectionStrategy {
 }
 
 impl Default for SelectionStrategy {
-    fn default() -> Self { Self::Ordered }
+    fn default() -> Self {
+        Self::Ordered
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

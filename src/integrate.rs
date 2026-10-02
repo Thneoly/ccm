@@ -50,8 +50,7 @@ fn install_claude_integration() -> Result<()> {
     let parent = path
         .parent()
         .context("cannot determine Claude skill directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("cannot create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
     fs::write(&path, CLAUDE_SWITCH_SKILL)
         .with_context(|| format!("cannot write {}", path.display()))?;
 
@@ -70,8 +69,7 @@ fn install_claude_integration() -> Result<()> {
 fn remove_claude_integration() -> Result<()> {
     let path = skill_path()?;
     if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("cannot remove {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir(parent);
         }

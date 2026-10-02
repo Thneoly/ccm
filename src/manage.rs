@@ -7,9 +7,7 @@ use crate::{
     config::AppConfig,
     model::{Model, ModelRouting},
     provider::{Provider, ProviderAuth, ProviderKind},
-    route::{
-        CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy, SelectionWeights,
-    },
+    route::{CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy, SelectionWeights},
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {

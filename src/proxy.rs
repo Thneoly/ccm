@@ -303,7 +303,9 @@ pub async fn serve(bind: &str) -> Result<()> {
     println!("Claude Code base URL: http://{addr}");
     println!("Runtime switch: `ccm switch <model-or-profile-or-route>`.");
 
-    axum::serve(listener, app).await.context("proxy server failed")
+    axum::serve(listener, app)
+        .await
+        .context("proxy server failed")
 }
 
 async fn health() -> &'static str {
@@ -425,7 +427,9 @@ async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {
     let metrics = state.metrics.read().await;
     let mut views = route
         .candidates()
-        .map(|model| candidate_score_view(&config, metrics.get(model), model, &route.policy.weights))
+        .map(|model| {
+            candidate_score_view(&config, metrics.get(model), model, &route.policy.weights)
+        })
         .collect::<Vec<_>>();
     views.sort_by(|left, right| {
         right
@@ -487,11 +491,7 @@ async fn forward_messages(
 ) -> impl IntoResponse {
     match forward(state, request).await {
         Ok(response) => response,
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            format!("CCM proxy error: {err:#}"),
-        )
-            .into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("CCM proxy error: {err:#}")).into_response(),
     }
 }
 
@@ -689,15 +689,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
 
         circuit_success(&state, candidate, &route.policy.circuit_breaker).await;
         let result = format!("HTTP {status}");
-        trace_attempt(
-            &state,
-            &target,
-            attempt,
-            candidate,
-            &result,
-            false,
-        )
-        .await;
+        trace_attempt(&state, &target, attempt, candidate, &result, false).await;
         decision.attempts.push(DecisionAttempt {
             attempt,
             model: candidate.clone(),
@@ -800,7 +792,8 @@ async fn select_candidates(
         }
         SelectionStrategy::LowestLatency => {
             let metrics = state.metrics.read().await;
-            candidates.sort_by(|left, right| compare_latency(metrics.get(left), metrics.get(right)));
+            candidates
+                .sort_by(|left, right| compare_latency(metrics.get(left), metrics.get(right)));
             candidates
         }
         SelectionStrategy::LowestCost => {
@@ -942,11 +935,7 @@ async fn circuit_admit(
     }
 }
 
-async fn circuit_failure(
-    state: &ProxyState,
-    model: &str,
-    policy: &CircuitBreakerPolicy,
-) {
+async fn circuit_failure(state: &ProxyState, model: &str, policy: &CircuitBreakerPolicy) {
     if !policy.enabled {
         return;
     }
@@ -955,19 +944,14 @@ async fn circuit_failure(
     let circuit = circuits.entry(model.to_string()).or_default();
     circuit.consecutive_failures += 1;
 
-    if circuit.half_open_probe_in_flight
-        || circuit.consecutive_failures >= policy.failure_threshold
+    if circuit.half_open_probe_in_flight || circuit.consecutive_failures >= policy.failure_threshold
     {
         circuit.open_until_ms = Some(now_ms().saturating_add(policy.open_ms));
         circuit.half_open_probe_in_flight = false;
     }
 }
 
-async fn circuit_success(
-    state: &ProxyState,
-    model: &str,
-    policy: &CircuitBreakerPolicy,
-) {
+async fn circuit_success(state: &ProxyState, model: &str, policy: &CircuitBreakerPolicy) {
     if !policy.enabled {
         return;
     }
@@ -1029,9 +1013,7 @@ async fn record_http_response(
 
 fn update_latency_ewma(metrics: &mut ModelMetrics, latency_ms: f64) {
     metrics.latency_ewma_ms = Some(match metrics.latency_ewma_ms {
-        Some(previous) => {
-            LATENCY_EWMA_ALPHA * latency_ms + (1.0 - LATENCY_EWMA_ALPHA) * previous
-        }
+        Some(previous) => LATENCY_EWMA_ALPHA * latency_ms + (1.0 - LATENCY_EWMA_ALPHA) * previous,
         None => latency_ms,
     });
 }
@@ -1135,7 +1117,8 @@ fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>
 }
 
 fn rewrite_model(bytes: Bytes, model_id: &str) -> Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(&bytes).context("request body is not valid JSON")?;
+    let mut value: Value =
+        serde_json::from_slice(&bytes).context("request body is not valid JSON")?;
     let object = value
         .as_object_mut()
         .context("request body must be a JSON object")?;
@@ -1322,9 +1305,7 @@ mod tests {
         let app = Router::new()
             .route("/v1/messages", post(mock_messages))
             .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -1444,15 +1425,7 @@ open_ms = {open_ms}
         let state = integration_proxy_state();
 
         // 200 streaming + x-api-key + model rewrite.
-        write_integration_config(
-            &root,
-            &primary_url,
-            &fallback_url,
-            "ordered",
-            250,
-            3,
-            50,
-        );
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 250, 3, 50);
         let response = forward(state.clone(), integration_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.contains("message_start"));
@@ -1460,12 +1433,7 @@ open_ms = {open_ms}
             let requests = primary.requests.lock().unwrap();
             let captured = requests.last().unwrap();
             assert_eq!(
-                captured
-                    .headers
-                    .get("x-api-key")
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
+                captured.headers.get("x-api-key").unwrap().to_str().unwrap(),
                 "primary-secret"
             );
             assert!(captured.headers.get(header::AUTHORIZATION).is_none());
@@ -1504,15 +1472,7 @@ open_ms = {open_ms}
         // Header timeout falls back.
         state.circuits.write().await.clear();
         *primary.behavior.write().await = MockBehavior::DelayOk(100);
-        write_integration_config(
-            &root,
-            &primary_url,
-            &fallback_url,
-            "ordered",
-            20,
-            3,
-            50,
-        );
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 20, 3, 50);
         let response = forward(state.clone(), integration_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         {
@@ -1525,15 +1485,7 @@ open_ms = {open_ms}
         // 503 opens the circuit; next request skips primary; cooldown allows HALF_OPEN recovery.
         state.circuits.write().await.clear();
         *primary.behavior.write().await = MockBehavior::Status(StatusCode::SERVICE_UNAVAILABLE);
-        write_integration_config(
-            &root,
-            &primary_url,
-            &fallback_url,
-            "ordered",
-            250,
-            1,
-            30,
-        );
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 250, 1, 30);
         let response = forward(state.clone(), integration_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let primary_count_after_open = primary.requests.lock().unwrap().len();
@@ -1570,24 +1522,13 @@ open_ms = {open_ms}
 
         // Weighted routing uses static cost/quality metadata and selects fallback first.
         state.circuits.write().await.clear();
-        write_integration_config(
-            &root,
-            &primary_url,
-            &fallback_url,
-            "weighted",
-            250,
-            3,
-            50,
-        );
+        write_integration_config(&root, &primary_url, &fallback_url, "weighted", 250, 3, 50);
         let primary_before = primary.requests.lock().unwrap().len();
         let fallback_before = fallback.requests.lock().unwrap().len();
         let response = forward(state.clone(), integration_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(primary.requests.lock().unwrap().len(), primary_before);
-        assert_eq!(
-            fallback.requests.lock().unwrap().len(),
-            fallback_before + 1
-        );
+        assert_eq!(fallback.requests.lock().unwrap().len(), fallback_before + 1);
         {
             let decisions = state.decisions.read().await;
             let decision = decisions.back().unwrap();

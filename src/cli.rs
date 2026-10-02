@@ -9,9 +9,18 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Init { #[arg(long)] force: bool },
-    Add { #[command(subcommand)] command: AddCommand },
-    Integrate { #[command(subcommand)] command: IntegrateCommand },
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    Add {
+        #[command(subcommand)]
+        command: AddCommand,
+    },
+    Integrate {
+        #[command(subcommand)]
+        command: IntegrateCommand,
+    },
     Doctor,
     Proxy {
         #[arg(long, default_value = "127.0.0.1:13521")]
@@ -19,7 +28,9 @@ pub enum Command {
     },
     List,
     Current,
-    Use { target: String },
+    Use {
+        target: String,
+    },
     Switch {
         target: String,
         #[arg(long)]
@@ -32,8 +43,13 @@ pub enum Command {
         #[arg(long, default_value = "http://127.0.0.1:13521")]
         proxy_url: String,
     },
-    Auth { #[command(subcommand)] command: AuthCommand },
-    Health { target: String },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    Health {
+        target: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,7 +109,10 @@ pub enum AddCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum IntegrateCommand {
-    Claude { #[arg(long)] remove: bool },
+    Claude {
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
