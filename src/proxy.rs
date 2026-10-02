@@ -26,7 +26,7 @@ use tokio::{
 use crate::{
     config::AppConfig,
     credential,
-    route::{CircuitBreakerPolicy, RoutePolicy, SelectionStrategy},
+    route::{CircuitBreakerPolicy, RoutePolicy, SelectionStrategy, SelectionWeights},
 };
 
 const TRACE_CAPACITY: usize = 100;
@@ -116,8 +116,28 @@ impl From<&CircuitBreakerPolicy> for CircuitPolicyView {
 }
 
 #[derive(Clone, Serialize)]
+struct SelectionWeightsView {
+    reliability: f64,
+    latency: f64,
+    cost: f64,
+    quality: f64,
+}
+
+impl From<&SelectionWeights> for SelectionWeightsView {
+    fn from(weights: &SelectionWeights) -> Self {
+        Self {
+            reliability: weights.reliability,
+            latency: weights.latency,
+            cost: weights.cost,
+            quality: weights.quality,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
 struct PolicyView {
     selection: String,
+    weights: SelectionWeightsView,
     header_timeout_ms: u64,
     fallback_on: Vec<u16>,
     max_attempts: usize,
@@ -129,6 +149,7 @@ impl From<&RoutePolicy> for PolicyView {
     fn from(policy: &RoutePolicy) -> Self {
         Self {
             selection: selection_name(&policy.selection).to_string(),
+            weights: SelectionWeightsView::from(&policy.weights),
             header_timeout_ms: policy.header_timeout_ms,
             fallback_on: policy.fallback_on.clone(),
             max_attempts: policy.max_attempts,
@@ -153,6 +174,8 @@ struct ModelView {
     name: String,
     model_id: String,
     provider: String,
+    cost_weight: f64,
+    quality_weight: f64,
 }
 
 #[derive(Serialize)]
@@ -246,6 +269,8 @@ async fn control_models() -> impl IntoResponse {
                     name: name.clone(),
                     model_id: model.model_id.clone(),
                     provider: model.provider.clone(),
+                    cost_weight: model.routing.cost_weight,
+                    quality_weight: model.routing.quality_weight,
                 })
                 .collect::<Vec<_>>();
             Json(models).into_response()
@@ -391,7 +416,14 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
     let configured_candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
-    let candidates = select_candidates(&state, configured_candidates, &route.policy.selection).await;
+    let candidates = select_candidates(
+        &state,
+        &config,
+        configured_candidates,
+        &route.policy.selection,
+        &route.policy.weights,
+    )
+    .await;
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -541,8 +573,10 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
 
 async fn select_candidates(
     state: &ProxyState,
+    config: &AppConfig,
     mut candidates: Vec<String>,
     selection: &SelectionStrategy,
+    weights: &SelectionWeights,
 ) -> Vec<String> {
     match selection {
         SelectionStrategy::Ordered => candidates,
@@ -563,6 +597,25 @@ async fn select_candidates(
             candidates.sort_by(|left, right| compare_latency(metrics.get(left), metrics.get(right)));
             candidates
         }
+        SelectionStrategy::LowestCost => {
+            candidates.sort_by(|left, right| {
+                model_cost(config, left)
+                    .partial_cmp(&model_cost(config, right))
+                    .unwrap_or(Ordering::Equal)
+            });
+            candidates
+        }
+        SelectionStrategy::Weighted => {
+            let metrics = state.metrics.read().await;
+            candidates.sort_by(|left, right| {
+                let left_score = weighted_score(config, metrics.get(left), left, weights);
+                let right_score = weighted_score(config, metrics.get(right), right, weights);
+                right_score
+                    .partial_cmp(&left_score)
+                    .unwrap_or(Ordering::Equal)
+            });
+            candidates
+        }
     }
 }
 
@@ -571,6 +624,52 @@ fn candidate_health_rank(metrics: Option<&ModelMetrics>) -> f64 {
         Some(metrics) if metrics.attempts >= HEALTH_MIN_SAMPLES => success_rate(metrics),
         _ => 1.0,
     }
+}
+
+fn weighted_score(
+    config: &AppConfig,
+    metrics: Option<&ModelMetrics>,
+    model: &str,
+    weights: &SelectionWeights,
+) -> f64 {
+    let reliability = candidate_health_rank(metrics);
+    let latency = latency_score(metrics);
+    let cost = 1.0 / (1.0 + model_cost(config, model).max(0.0));
+    let quality = model_quality(config, model).clamp(0.0, 1.0);
+    let total = weights.reliability + weights.latency + weights.cost + weights.quality;
+
+    if total <= 0.0 {
+        return 0.0;
+    }
+
+    (weights.reliability * reliability
+        + weights.latency * latency
+        + weights.cost * cost
+        + weights.quality * quality)
+        / total
+}
+
+fn latency_score(metrics: Option<&ModelMetrics>) -> f64 {
+    match metrics.and_then(|metrics| metrics.latency_ewma_ms) {
+        Some(latency_ms) => 1.0 / (1.0 + latency_ms.max(0.0) / 1000.0),
+        None => 0.5,
+    }
+}
+
+fn model_cost(config: &AppConfig, model: &str) -> f64 {
+    config
+        .models
+        .get(model)
+        .map(|model| model.routing.cost_weight)
+        .unwrap_or(1.0)
+}
+
+fn model_quality(config: &AppConfig, model: &str) -> f64 {
+    config
+        .models
+        .get(model)
+        .map(|model| model.routing.quality_weight)
+        .unwrap_or(1.0)
 }
 
 fn compare_latency(left: Option<&ModelMetrics>, right: Option<&ModelMetrics>) -> Ordering {
@@ -728,6 +827,8 @@ fn selection_name(selection: &SelectionStrategy) -> &'static str {
         SelectionStrategy::Ordered => "ordered",
         SelectionStrategy::Healthiest => "healthiest",
         SelectionStrategy::LowestLatency => "lowest-latency",
+        SelectionStrategy::LowestCost => "lowest-cost",
+        SelectionStrategy::Weighted => "weighted",
     }
 }
 
@@ -861,6 +962,7 @@ mod tests {
         assert_eq!(status.fallback, vec!["glm"]);
         assert_eq!(status.policy.header_timeout_ms, 30_000);
         assert_eq!(status.policy.selection, "ordered");
+        assert_eq!(status.policy.weights.reliability, 0.4);
         assert!(status.policy.circuit_breaker.enabled);
     }
 
@@ -901,6 +1003,15 @@ mod tests {
         };
         assert_eq!(success_rate(&metrics), 0.75);
         assert_eq!(health_score(&metrics), Some(75.0));
+    }
+
+    #[test]
+    fn weighted_score_uses_model_metadata() {
+        let config = AppConfig::starter();
+        let weights = SelectionWeights::default();
+        let score = weighted_score(&config, None, "glm", &weights);
+        assert!(score > 0.0);
+        assert!(score < 1.0);
     }
 
     #[test]
