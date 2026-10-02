@@ -445,6 +445,32 @@ Which model finally produced the returned upstream response?
 
 Decision traces are intentionally in-memory for v0.3. Persistence and replay storage are deferred until after the stabilization release.
 
+## Mock Provider integration coverage
+
+CCM includes an in-process integration-style test backed by real localhost TCP mock providers. It exercises the routing core through real `reqwest` upstream calls and covers:
+
+```text
+200 SSE-style streaming response
+x-api-key authentication
+bearer authentication
+model ID rewrite
+429 fallback
+503 fallback
+response-header timeout fallback
+Circuit Breaker OPEN skip
+HALF_OPEN recovery
+weighted candidate selection
+Routing Decision Trace
+```
+
+The test isolates configuration with `CCM_HOME` and credentials with `CCM_<PROVIDER>_API_KEY`, so it does not depend on a developer's real `~/.ccm` files or OS keyring.
+
+Run it with:
+
+```bash
+cargo test mock_provider_integration_covers_v03_routing_contract -- --nocapture
+```
+
 ## v0.3 stabilization boundary
 
 Routing Decision Trace closes feature development for v0.3. No additional selection strategies are planned before the stabilization release.
@@ -452,7 +478,6 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-mock-provider integration tests
 Windows / Linux / macOS validation
 re-enable CI and make all checks green
 release packaging and documentation cleanup
@@ -528,6 +553,8 @@ GitHub Actions CI is currently disabled.
 - automatic migration from legacy config current
 - explicit x-api-key / bearer provider authentication
 - single-header upstream credential injection
+- environment credential fallback for headless/CI use
+- isolated CCM_HOME for deterministic test environments
 - Claude Code gateway environment compatibility verified against current Anthropic docs
 - modern Claude Code personal Skill integration for /switch
 - fallback policy and retry budget
@@ -538,6 +565,7 @@ GitHub Actions CI is currently disabled.
 - transparent weighted scoring
 - explainable candidate score control API
 - complete per-request Routing Decision Trace
+- localhost Mock Provider integration coverage for the v0.3 routing contract
 - in-memory traces, metrics, decisions, and circuit-state control APIs
 - no mid-stream failover
 - no OpenAI protocol translation yet
