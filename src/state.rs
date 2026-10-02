@@ -13,6 +13,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn path() -> Result<PathBuf> {
+        if let Some(root) = std::env::var_os("CCM_HOME") {
+            return Ok(PathBuf::from(root).join("state.toml"));
+        }
         let home = dirs::home_dir().context("cannot determine home directory")?;
         Ok(home.join(".ccm").join("state.toml"))
     }
