@@ -44,6 +44,8 @@ pub enum AddCommand {
         base_url: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        #[arg(long, default_value = "x-api-key")]
+        auth: String,
     },
     Model {
         name: String,
