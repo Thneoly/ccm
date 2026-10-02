@@ -478,7 +478,7 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-Windows / Linux / macOS validation
+run release verification on Windows / Linux / macOS
 re-enable CI and make all checks green
 release packaging and documentation cleanup
 ```
@@ -532,6 +532,66 @@ ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>
 ```
+
+## Release verification
+
+The v0.3 release gate uses the same four Rust checks on every supported platform:
+
+```text
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+Convenience scripts:
+
+```bash
+# Linux / macOS
+./scripts/verify.sh
+./scripts/smoke.sh
+```
+
+```powershell
+# Windows PowerShell
+./scripts/verify.ps1
+./scripts/smoke.ps1
+```
+
+The smoke test uses an isolated temporary `CCM_HOME` and verifies:
+
+```text
+ccm init
+config.toml creation
+state.toml creation
+ccm current
+ccm list
+Mock Provider routing integration
+```
+
+The repository pins the stable Rust channel and installs `rustfmt` and `clippy` through `rust-toolchain.toml`.
+
+### Supported release platforms
+
+The v0.3 release target is:
+
+```text
+Windows  x86_64-pc-windows-msvc
+Linux    x86_64-unknown-linux-gnu
+macOS    aarch64-apple-darwin / x86_64-apple-darwin
+```
+
+Credential storage is configured per target:
+
+```text
+Windows → Windows Credential Manager
+macOS   → Apple Keychain
+Linux   → Linux keyutils + synchronous Secret Service
+```
+
+Headless environments can bypass the native keyring with `CCM_<PROVIDER>_API_KEY`.
+
+The cross-platform scripts and platform-specific dependency configuration are in place. A release is not considered verified until these scripts have actually passed on Windows, Linux, and macOS.
 
 ## Development
 
