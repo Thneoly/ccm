@@ -32,6 +32,10 @@ async fn main() -> Result<()> {
         }
         Command::Add { command } => {
             let mut config = load_config()?;
+            // Run the legacy `current` migration first: saving the config strips
+            // that field, so without migrating up front an unmigrated legacy value
+            // would be destroyed instead of moved into state.toml.
+            load_state(&config)?;
             manage::handle(&mut config, command)?;
         }
         Command::Integrate { command } => {
