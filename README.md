@@ -309,10 +309,89 @@ GET  /_ccm/traces
 GET  /_ccm/circuits
 GET  /_ccm/metrics
 GET  /_ccm/scores
+GET  /_ccm/decisions
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's candidate ranking by returning each reliability, latency, cost, and quality sub-score plus the final weighted score.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions.
+
+## Routing Decision Trace
+
+Routing Decision Trace is the final major v0.3 routing feature. CCM keeps the most recent 100 decisions in proxy memory.
+
+Inspect them with:
+
+```bash
+curl http://127.0.0.1:13521/_ccm/decisions
+```
+
+A decision records the state used at request time rather than reconstructing it later:
+
+```json
+{
+  "id": 42,
+  "timestamp_ms": 1790820000000,
+  "target": "balanced",
+  "selection": "weighted",
+  "configured_candidates": ["claude", "glm", "kimi"],
+  "ranked_candidates": [
+    {
+      "rank": 1,
+      "model": "glm",
+      "reliability_score": 0.96,
+      "latency_score": 0.71,
+      "cost_score": 0.80,
+      "quality_score": 0.85,
+      "weighted_score": 0.864
+    }
+  ],
+  "attempts": [
+    {
+      "attempt": 1,
+      "model": "glm",
+      "circuit": "CLOSED",
+      "result": "HTTP 429 Too Many Requests",
+      "fallback": true
+    },
+    {
+      "attempt": 2,
+      "model": "claude",
+      "circuit": "CLOSED",
+      "result": "HTTP 200 OK",
+      "fallback": false
+    }
+  ],
+  "selected": "claude",
+  "outcome": "HTTP 200 OK"
+}
+```
+
+This makes one routing request answer four questions directly:
+
+```text
+Why was this candidate ranked first?
+Was any candidate skipped by the circuit breaker?
+Why did CCM fallback?
+Which model finally produced the returned upstream response?
+```
+
+Decision traces are intentionally in-memory for v0.3. Persistence and replay storage are deferred until after the stabilization release.
+
+## v0.3 stabilization boundary
+
+Routing Decision Trace closes feature development for v0.3. No additional selection strategies are planned before the stabilization release.
+
+The remaining v0.3 work is reliability-focused:
+
+```text
+state.toml / runtime-state persistence
+provider authentication strategy cleanup
+official Claude Code compatibility verification
+mock-provider integration tests
+Windows / Linux / macOS validation
+re-enable CI and make all checks green
+release packaging and documentation cleanup
+```
 
 ## In-session switching from Claude Code
 
@@ -387,7 +466,8 @@ GitHub Actions CI is currently disabled.
 - `ordered`, `healthiest`, `lowest-latency`, `lowest-cost`, and `weighted` selection
 - transparent weighted scoring
 - explainable candidate score control API
-- in-memory traces, metrics, and circuit-state control APIs
+- complete per-request Routing Decision Trace
+- in-memory traces, metrics, decisions, and circuit-state control APIs
 - no mid-stream failover
 - no OpenAI protocol translation yet
 
