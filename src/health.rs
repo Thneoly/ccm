@@ -16,16 +16,16 @@ pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
 
     let url = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let response = client
+    let builder = client
         .post(url)
-        .header("x-api-key", &token)
-        .header("authorization", format!("Bearer {token}"))
         .header("anthropic-version", "2023-06-01")
         .json(&serde_json::json!({
             "model": model.model_id,
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "ping"}]
-        }))
+        }));
+    let response = provider
+        .apply_auth(builder, &token)
         .send()
         .await
         .context("provider request failed")?;
