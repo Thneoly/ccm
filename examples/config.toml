@@ -12,9 +12,17 @@ base_url = "https://api.z.ai/api/anthropic"
 provider = "anthropic"
 model_id = "claude-sonnet-4-5"
 
+[models.claude.routing]
+cost_weight = 1.0
+quality_weight = 1.0
+
 [models.glm]
 provider = "zai"
 model_id = "glm-5"
+
+[models.glm.routing]
+cost_weight = 0.25
+quality_weight = 0.85
 
 [profiles.coding]
 model = "claude"
@@ -27,11 +35,17 @@ primary = "claude"
 fallback = ["glm"]
 
 [routes.coding-route.policy]
-selection = "healthiest"
+selection = "weighted"
 header_timeout_ms = 30000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 3
 backoff_ms = 200
+
+[routes.coding-route.policy.weights]
+reliability = 0.4
+latency = 0.2
+cost = 0.2
+quality = 0.2
 
 [routes.coding-route.policy.circuit_breaker]
 enabled = true
@@ -43,7 +57,7 @@ primary = "glm"
 fallback = []
 
 [routes.fast-route.policy]
-selection = "lowest-latency"
+selection = "lowest-cost"
 header_timeout_ms = 15000
 fallback_on = [429, 502, 503, 504]
 max_attempts = 1
