@@ -11,11 +11,13 @@ mod model;
 mod provider;
 mod proxy;
 mod route;
+mod state;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use config::AppConfig;
+use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,8 +25,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init { force } => {
-            let path = AppConfig::init(force)?;
-            println!("Initialized {}", path.display());
+            let config_path = AppConfig::init(force)?;
+            let state_path = AppState::init(force)?;
+            println!("Initialized {}", config_path.display());
+            println!("Initialized {}", state_path.display());
         }
         Command::Add { command } => {
             let mut config = load_config()?;
@@ -46,8 +50,9 @@ async fn main() -> Result<()> {
         }
         Command::List => {
             let config = load_config()?;
+            let state = load_state(&config)?;
             for (name, model) in &config.models {
-                let marker = if config.current.as_deref() == Some(name.as_str()) {
+                let marker = if state.current.as_deref() == Some(name.as_str()) {
                     "*"
                 } else {
                     " "
@@ -75,16 +80,18 @@ async fn main() -> Result<()> {
         }
         Command::Current => {
             let config = load_config()?;
-            match &config.current {
+            let state = load_state(&config)?;
+            match &state.current {
                 Some(name) => println!("{}", name),
                 None => println!("No target selected"),
             }
         }
         Command::Use { target } => {
-            let mut config = load_config()?;
+            let config = load_config()?;
             config.resolve_route(&target)?;
-            config.current = Some(target.clone());
-            config.save()?;
+            let mut state = load_state(&config)?;
+            state.current = Some(target.clone());
+            state.save()?;
             println!("Selected {} as persisted default", target);
         }
         Command::Switch { target, proxy_url } => {
@@ -96,6 +103,7 @@ async fn main() -> Result<()> {
             proxy_url,
         } => {
             let config = load_config()?;
+            let state = load_state(&config)?;
             if proxy {
                 if let Some(target) = target {
                     control::switch(&proxy_url, &target).await?;
@@ -105,7 +113,7 @@ async fn main() -> Result<()> {
                 let name = match target {
                     Some(target) => config.resolve_target(&target)?,
                     None => {
-                        let target = config.current.clone().context(
+                        let target = state.current.clone().context(
                             "no current model selected; run `ccm use <name>` first",
                         )?;
                         config.resolve_target(&target)?
@@ -126,4 +134,8 @@ async fn main() -> Result<()> {
 
 fn load_config() -> Result<AppConfig> {
     AppConfig::load().context("failed to load CCM config")
+}
+
+fn load_state(config: &AppConfig) -> Result<AppState> {
+    AppState::load_or_migrate(config).context("failed to load CCM state")
 }
