@@ -6,6 +6,15 @@ $ErrorActionPreference = "Stop"
 
 $Destination = $Destination.TrimEnd('\')
 
+$running = Get-Process ccm -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path.StartsWith($Destination, [System.StringComparison]::OrdinalIgnoreCase)
+}
+if ($running) {
+    Write-Host "ccm is currently running from $Destination (PID: $($running.Id -join ', '))."
+    Write-Host "Stop it first (close ccm proxy / ccm run terminals), then re-run this script."
+    exit 1
+}
+
 cargo build --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
