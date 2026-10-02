@@ -1,32 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-fn default_header_timeout_ms() -> u64 {
-    30_000
-}
-
-fn default_fallback_on() -> Vec<u16> {
-    vec![429, 502, 503, 504]
-}
-
-fn default_max_attempts() -> usize {
-    3
-}
-
-fn default_backoff_ms() -> u64 {
-    200
-}
-
-fn default_circuit_enabled() -> bool {
-    true
-}
-
-fn default_failure_threshold() -> usize {
-    3
-}
-
-fn default_open_ms() -> u64 {
-    30_000
-}
+fn default_header_timeout_ms() -> u64 { 30_000 }
+fn default_fallback_on() -> Vec<u16> { vec![429, 502, 503, 504] }
+fn default_max_attempts() -> usize { 3 }
+fn default_backoff_ms() -> u64 { 200 }
+fn default_circuit_enabled() -> bool { true }
+fn default_failure_threshold() -> usize { 3 }
+fn default_open_ms() -> u64 { 30_000 }
+fn default_reliability_weight() -> f64 { 0.4 }
+fn default_latency_weight() -> f64 { 0.2 }
+fn default_cost_weight() -> f64 { 0.2 }
+fn default_quality_weight() -> f64 { 0.2 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -34,11 +18,34 @@ pub enum SelectionStrategy {
     Ordered,
     Healthiest,
     LowestLatency,
+    LowestCost,
+    Weighted,
 }
 
 impl Default for SelectionStrategy {
+    fn default() -> Self { Self::Ordered }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionWeights {
+    #[serde(default = "default_reliability_weight")]
+    pub reliability: f64,
+    #[serde(default = "default_latency_weight")]
+    pub latency: f64,
+    #[serde(default = "default_cost_weight")]
+    pub cost: f64,
+    #[serde(default = "default_quality_weight")]
+    pub quality: f64,
+}
+
+impl Default for SelectionWeights {
     fn default() -> Self {
-        Self::Ordered
+        Self {
+            reliability: default_reliability_weight(),
+            latency: default_latency_weight(),
+            cost: default_cost_weight(),
+            quality: default_quality_weight(),
+        }
     }
 }
 
@@ -66,6 +73,8 @@ impl Default for CircuitBreakerPolicy {
 pub struct RoutePolicy {
     #[serde(default)]
     pub selection: SelectionStrategy,
+    #[serde(default)]
+    pub weights: SelectionWeights,
     #[serde(default = "default_header_timeout_ms")]
     pub header_timeout_ms: u64,
     #[serde(default = "default_fallback_on")]
@@ -82,6 +91,7 @@ impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
             selection: SelectionStrategy::default(),
+            weights: SelectionWeights::default(),
             header_timeout_ms: default_header_timeout_ms(),
             fallback_on: default_fallback_on(),
             max_attempts: default_max_attempts(),
