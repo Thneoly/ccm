@@ -19,8 +19,8 @@ pub struct AppConfig {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub routes: BTreeMap<String, Route>,
-    #[serde(default)]
-    pub current: Option<String>,
+    #[serde(default, rename = "current", skip_serializing)]
+    pub legacy_current: Option<String>,
 }
 
 impl AppConfig {
@@ -107,7 +107,7 @@ impl AppConfig {
             models,
             profiles,
             routes,
-            current: Some("claude".to_string()),
+            legacy_current: None,
         }
     }
 
