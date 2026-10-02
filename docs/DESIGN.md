@@ -497,7 +497,7 @@ Binding Proxy to a non-loopback address would expose:
 - upstream proxy capability
 - access to credentials resolved by CCM
 
-Before v0.3 release, maintainers should decide whether to enforce loopback-only binding. Remote control authentication is explicitly out of scope for v0.3.
+v0.3 enforces loopback-only binding: `ccm proxy` refuses non-loopback bind addresses before loading configuration or opening the listener. Remote/LAN binding requires an authentication design first and is deferred to post-v0.3.
 
 ## 14. Main Source Modules
 
@@ -653,3 +653,4 @@ Do not change these without an explicit design decision:
 8. `ccm switch` is runtime-only.
 9. `ccm use` is persisted state.
 10. v0.3 routing feature set is frozen.
+11. The proxy refuses non-loopback bind addresses in v0.3.

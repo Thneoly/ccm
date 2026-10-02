@@ -262,6 +262,7 @@ pub async fn serve(bind: &str) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address `{bind}`"))?;
+    ensure_loopback(addr)?;
 
     let config = AppConfig::load().context("failed to load CCM config")?;
     let persisted = AppState::load_or_migrate(&config).context("failed to load CCM state")?;
@@ -306,6 +307,16 @@ pub async fn serve(bind: &str) -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("proxy server failed")
+}
+
+// The control API and the credential-injecting proxy are unauthenticated, so
+// v0.3 refuses to expose them beyond the local machine. Remote/LAN binding
+// needs an authentication design first (post-v0.3).
+fn ensure_loopback(addr: SocketAddr) -> Result<()> {
+    if !addr.ip().is_loopback() {
+        bail!("refusing to bind non-loopback address {addr}: the CCM control API is unauthenticated, remote binding is not supported in v0.3");
+    }
+    Ok(())
 }
 
 async fn health() -> &'static str {
@@ -1233,6 +1244,25 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY,
             &policy
         ));
+    }
+
+    #[test]
+    fn rejects_non_loopback_bind_addresses() {
+        for bind in ["127.0.0.1:13521", "127.8.8.4:0", "[::1]:13521"] {
+            let addr: SocketAddr = bind.parse().unwrap();
+            ensure_loopback(addr).unwrap();
+        }
+        for bind in ["0.0.0.0:13521", "192.168.1.10:13521", "[::]:13521"] {
+            let addr: SocketAddr = bind.parse().unwrap();
+            let error = ensure_loopback(addr).unwrap_err();
+            assert!(error.to_string().contains("loopback"));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_non_loopback_before_loading_config() {
+        let error = serve("0.0.0.0:13521").await.unwrap_err();
+        assert!(error.to_string().contains("loopback"));
     }
 
     #[test]

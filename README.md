@@ -398,6 +398,8 @@ POST /_ccm/switch/{model-or-profile-or-route}
 
 `/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions.
 
+The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
+
 ## Routing Decision Trace
 
 Routing Decision Trace is the final major v0.3 routing feature. CCM keeps the most recent 100 decisions in proxy memory.
