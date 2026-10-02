@@ -589,16 +589,41 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         let has_attempt_budget = actual_attempts < route.policy.max_attempts;
         let can_fallback = has_next_candidate && has_attempt_budget;
 
-        let model = config
-            .models
-            .get(candidate)
-            .with_context(|| format!("route candidate model `{candidate}` is not configured"))?;
-        let provider = config
-            .providers
-            .get(&model.provider)
-            .with_context(|| format!("provider `{}` is not configured", model.provider))?;
-        let token = credential::get(&model.provider)?;
-        let body = rewrite_model(bytes.clone(), &model.model_id)?;
+        let resolved = (|| {
+            let model = config.models.get(candidate).with_context(|| {
+                format!("route candidate model `{candidate}` is not configured")
+            })?;
+            let provider = config
+                .providers
+                .get(&model.provider)
+                .with_context(|| format!("provider `{}` is not configured", model.provider))?;
+            let token = credential::get(&model.provider)?;
+            let body = rewrite_model(bytes.clone(), &model.model_id)?;
+            Ok((provider, token, body))
+        })();
+        let (provider, token, body) = match resolved {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                // Resolve failures happen before any upstream attempt: release the
+                // HALF_OPEN probe slot instead of wedging it, and record the routing
+                // decision so the request is still explainable.
+                if matches!(circuit_decision, CircuitDecision::HalfOpen) {
+                    release_half_open_probe(&state, candidate).await;
+                }
+                let result = format!("resolve error: {err:#}");
+                trace_attempt(&state, &target, attempt, candidate, &result, false).await;
+                decision.attempts.push(DecisionAttempt {
+                    attempt,
+                    model: candidate.clone(),
+                    circuit: circuit_decision_name(circuit_decision),
+                    result: result.clone(),
+                    fallback: false,
+                });
+                decision.outcome = result;
+                store_decision(&state, decision).await;
+                return Err(err);
+            }
+        };
         let upstream = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
 
         let mut builder = state.client.post(upstream).body(body);
@@ -961,6 +986,13 @@ async fn circuit_success(state: &ProxyState, model: &str, policy: &CircuitBreake
     circuit.consecutive_failures = 0;
     circuit.open_until_ms = None;
     circuit.half_open_probe_in_flight = false;
+}
+
+async fn release_half_open_probe(state: &ProxyState, model: &str) {
+    let mut circuits = state.circuits.write().await;
+    if let Some(circuit) = circuits.get_mut(model) {
+        circuit.half_open_probe_in_flight = false;
+    }
 }
 
 async fn record_attempt_started(state: &ProxyState, model: &str) {
@@ -1518,6 +1550,38 @@ open_ms = {open_ms}
             let primary_circuit = circuits.get("primary").unwrap();
             assert!(primary_circuit.open_until_ms.is_none());
             assert_eq!(primary_circuit.consecutive_failures, 0);
+        }
+
+        // A resolve failure during HALF_OPEN must release the probe slot instead of
+        // wedging the model out of routing until restart.
+        state.circuits.write().await.clear();
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::SERVICE_UNAVAILABLE);
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 250, 1, 30);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        sleep(Duration::from_millis(40)).await;
+        *primary.behavior.write().await = MockBehavior::OkStream;
+        let malformed = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        assert!(forward(state.clone(), malformed).await.is_err());
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert!(decision.outcome.contains("resolve error"));
+        }
+
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.attempts[0].circuit, "HALF_OPEN");
+            assert_eq!(decision.selected.as_deref(), Some("primary"));
         }
 
         // Weighted routing uses static cost/quality metadata and selects fallback first.
