@@ -2,7 +2,10 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +33,7 @@ use crate::{
 };
 
 const TRACE_CAPACITY: usize = 100;
+const DECISION_CAPACITY: usize = 100;
 const LATENCY_EWMA_ALPHA: f64 = 0.2;
 const HEALTH_MIN_SAMPLES: u64 = 3;
 
@@ -40,6 +44,8 @@ struct ProxyState {
     traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
     circuits: Arc<RwLock<HashMap<String, CircuitState>>>,
     metrics: Arc<RwLock<HashMap<String, ModelMetrics>>>,
+    decisions: Arc<RwLock<VecDeque<RoutingDecision>>>,
+    decision_seq: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Default)]
@@ -86,6 +92,39 @@ struct ModelMetricsView {
     latency_ewma_ms: Option<f64>,
     last_success_ms: Option<u64>,
     last_failure_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct DecisionCandidate {
+    rank: usize,
+    model: String,
+    reliability_score: f64,
+    latency_score: f64,
+    cost_score: f64,
+    quality_score: f64,
+    weighted_score: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct DecisionAttempt {
+    attempt: usize,
+    model: String,
+    circuit: String,
+    result: String,
+    fallback: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct RoutingDecision {
+    id: u64,
+    timestamp_ms: u64,
+    target: String,
+    selection: String,
+    configured_candidates: Vec<String>,
+    ranked_candidates: Vec<DecisionCandidate>,
+    attempts: Vec<DecisionAttempt>,
+    selected: Option<String>,
+    outcome: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -236,6 +275,8 @@ pub async fn serve(bind: &str) -> Result<()> {
         traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
         circuits: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(RwLock::new(HashMap::new())),
+        decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
+        decision_seq: Arc::new(AtomicU64::new(1)),
     };
 
     let app = Router::new()
@@ -247,6 +288,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         .route("/_ccm/circuits", get(control_circuits))
         .route("/_ccm/metrics", get(control_metrics))
         .route("/_ccm/scores", get(control_scores))
+        .route("/_ccm/decisions", get(control_decisions))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -392,6 +434,11 @@ async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {
     Json(views).into_response()
 }
 
+async fn control_decisions(State(state): State<ProxyState>) -> Json<Vec<RoutingDecision>> {
+    let decisions = state.decisions.read().await.iter().cloned().collect();
+    Json(decisions)
+}
+
 async fn control_switch(
     State(state): State<ProxyState>,
     Path(target): Path<String>,
@@ -463,6 +510,15 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         &route.policy.weights,
     )
     .await;
+    let mut decision = build_routing_decision(
+        &state,
+        &config,
+        &route.policy,
+        &target,
+        &configured_candidates,
+        &candidates,
+    )
+    .await;
 
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
@@ -477,7 +533,9 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             break;
         }
 
-        match circuit_admit(&state, candidate, &route.policy.circuit_breaker).await {
+        let circuit_decision =
+            circuit_admit(&state, candidate, &route.policy.circuit_breaker).await;
+        match circuit_decision {
             CircuitDecision::SkipOpen(until) => {
                 let result = format!("skipped: circuit OPEN until {until}");
                 trace_attempt(
@@ -489,6 +547,13 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                     index + 1 < candidates.len(),
                 )
                 .await;
+                decision.attempts.push(DecisionAttempt {
+                    attempt: actual_attempts + 1,
+                    model: candidate.clone(),
+                    circuit: circuit_decision_name(circuit_decision),
+                    result: result.clone(),
+                    fallback: index + 1 < candidates.len(),
+                });
                 failures.push(format!("{candidate}: {result}"));
                 continue;
             }
@@ -503,6 +568,13 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                     index + 1 < candidates.len(),
                 )
                 .await;
+                decision.attempts.push(DecisionAttempt {
+                    attempt: actual_attempts + 1,
+                    model: candidate.clone(),
+                    circuit: circuit_decision_name(circuit_decision),
+                    result: result.clone(),
+                    fallback: index + 1 < candidates.len(),
+                });
                 failures.push(format!("{candidate}: {result}"));
                 continue;
             }
@@ -544,6 +616,13 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 record_timeout(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
                 trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+                decision.attempts.push(DecisionAttempt {
+                    attempt,
+                    model: candidate.clone(),
+                    circuit: circuit_decision_name(circuit_decision),
+                    result: result.clone(),
+                    fallback: can_fallback,
+                });
                 failures.push(format!("{candidate}: {result}"));
                 if can_fallback {
                     apply_backoff(route.policy.backoff_ms).await;
@@ -557,6 +636,13 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 record_request_error(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
                 trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+                decision.attempts.push(DecisionAttempt {
+                    attempt,
+                    model: candidate.clone(),
+                    circuit: circuit_decision_name(circuit_decision),
+                    result: result.clone(),
+                    fallback: can_fallback,
+                });
                 failures.push(format!("{candidate}: {result}"));
                 if can_fallback {
                     apply_backoff(route.policy.backoff_ms).await;
@@ -583,31 +669,112 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
             let result = format!("HTTP {status}");
             trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+            decision.attempts.push(DecisionAttempt {
+                attempt,
+                model: candidate.clone(),
+                circuit: circuit_decision_name(circuit_decision),
+                result: result.clone(),
+                fallback: can_fallback,
+            });
             failures.push(format!("{candidate}: {result}"));
             if can_fallback {
                 apply_backoff(route.policy.backoff_ms).await;
                 continue;
             }
+            decision.selected = Some(candidate.clone());
+            decision.outcome = result;
+            store_decision(&state, decision).await;
             return proxy_response(upstream_response);
         }
 
         circuit_success(&state, candidate, &route.policy.circuit_breaker).await;
+        let result = format!("HTTP {status}");
         trace_attempt(
             &state,
             &target,
             attempt,
             candidate,
-            &format!("HTTP {status}"),
+            &result,
             false,
         )
         .await;
+        decision.attempts.push(DecisionAttempt {
+            attempt,
+            model: candidate.clone(),
+            circuit: circuit_decision_name(circuit_decision),
+            result: result.clone(),
+            fallback: false,
+        });
+        decision.selected = Some(candidate.clone());
+        decision.outcome = result;
+        store_decision(&state, decision).await;
         return proxy_response(upstream_response);
     }
+
+    decision.outcome = if failures.is_empty() {
+        "no candidate admitted or attempt budget exhausted".to_string()
+    } else {
+        format!("failed: {}", failures.join("; "))
+    };
+    store_decision(&state, decision).await;
 
     bail!(
         "all available route candidates failed for `{target}`: {}",
         failures.join("; ")
     )
+}
+
+async fn build_routing_decision(
+    state: &ProxyState,
+    config: &AppConfig,
+    policy: &RoutePolicy,
+    target: &str,
+    configured_candidates: &[String],
+    ranked_candidates: &[String],
+) -> RoutingDecision {
+    let metrics = state.metrics.read().await;
+    let ranked_candidates = ranked_candidates
+        .iter()
+        .enumerate()
+        .map(|(index, model)| DecisionCandidate {
+            rank: index + 1,
+            model: model.clone(),
+            reliability_score: candidate_health_rank(metrics.get(model)),
+            latency_score: latency_score(metrics.get(model)),
+            cost_score: cost_score(config, model),
+            quality_score: quality_score(config, model),
+            weighted_score: weighted_score(config, metrics.get(model), model, &policy.weights),
+        })
+        .collect();
+
+    RoutingDecision {
+        id: state.decision_seq.fetch_add(1, AtomicOrdering::Relaxed),
+        timestamp_ms: now_ms(),
+        target: target.to_string(),
+        selection: selection_name(&policy.selection).to_string(),
+        configured_candidates: configured_candidates.to_vec(),
+        ranked_candidates,
+        attempts: Vec::new(),
+        selected: None,
+        outcome: "in-progress".to_string(),
+    }
+}
+
+async fn store_decision(state: &ProxyState, decision: RoutingDecision) {
+    let mut decisions = state.decisions.write().await;
+    if decisions.len() == DECISION_CAPACITY {
+        decisions.pop_front();
+    }
+    decisions.push_back(decision);
+}
+
+fn circuit_decision_name(decision: CircuitDecision) -> String {
+    match decision {
+        CircuitDecision::Closed => "CLOSED".to_string(),
+        CircuitDecision::HalfOpen => "HALF_OPEN".to_string(),
+        CircuitDecision::SkipOpen(until) => format!("OPEN until {until}"),
+        CircuitDecision::SkipHalfOpen => "HALF_OPEN probe in flight".to_string(),
+    }
 }
 
 async fn select_candidates(
