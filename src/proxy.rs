@@ -204,6 +204,20 @@ struct CircuitView {
     open_until_ms: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct CandidateScoreView {
+    model: String,
+    reliability_score: f64,
+    latency_score: f64,
+    cost_score: f64,
+    quality_score: f64,
+    weighted_score: f64,
+    attempts: u64,
+    latency_ewma_ms: Option<f64>,
+    cost_weight: f64,
+    quality_weight: f64,
+}
+
 pub async fn serve(bind: &str) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
@@ -232,6 +246,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         .route("/_ccm/traces", get(control_traces))
         .route("/_ccm/circuits", get(control_circuits))
         .route("/_ccm/metrics", get(control_metrics))
+        .route("/_ccm/scores", get(control_scores))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state);
@@ -351,6 +366,30 @@ async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetri
         .collect::<Vec<_>>();
     views.sort_by(|left, right| left.model.cmp(&right.model));
     Json(views)
+}
+
+async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {
+    let target = state.target.read().await.clone();
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(err) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let route = match config.resolve_route(&target) {
+        Ok(route) => route,
+        Err(err) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let metrics = state.metrics.read().await;
+    let mut views = route
+        .candidates()
+        .map(|model| candidate_score_view(&config, metrics.get(model), model, &route.policy.weights))
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| {
+        right
+            .weighted_score
+            .partial_cmp(&left.weighted_score)
+            .unwrap_or(Ordering::Equal)
+    });
+    Json(views).into_response()
 }
 
 async fn control_switch(
@@ -634,8 +673,8 @@ fn weighted_score(
 ) -> f64 {
     let reliability = candidate_health_rank(metrics);
     let latency = latency_score(metrics);
-    let cost = 1.0 / (1.0 + model_cost(config, model).max(0.0));
-    let quality = model_quality(config, model).clamp(0.0, 1.0);
+    let cost = cost_score(config, model);
+    let quality = quality_score(config, model);
     let total = weights.reliability + weights.latency + weights.cost + weights.quality;
 
     if total <= 0.0 {
@@ -647,6 +686,34 @@ fn weighted_score(
         + weights.cost * cost
         + weights.quality * quality)
         / total
+}
+
+fn candidate_score_view(
+    config: &AppConfig,
+    metrics: Option<&ModelMetrics>,
+    model: &str,
+    weights: &SelectionWeights,
+) -> CandidateScoreView {
+    CandidateScoreView {
+        model: model.to_string(),
+        reliability_score: candidate_health_rank(metrics),
+        latency_score: latency_score(metrics),
+        cost_score: cost_score(config, model),
+        quality_score: quality_score(config, model),
+        weighted_score: weighted_score(config, metrics, model, weights),
+        attempts: metrics.map(|metrics| metrics.attempts).unwrap_or(0),
+        latency_ewma_ms: metrics.and_then(|metrics| metrics.latency_ewma_ms),
+        cost_weight: model_cost(config, model),
+        quality_weight: model_quality(config, model),
+    }
+}
+
+fn cost_score(config: &AppConfig, model: &str) -> f64 {
+    1.0 / (1.0 + model_cost(config, model).max(0.0))
+}
+
+fn quality_score(config: &AppConfig, model: &str) -> f64 {
+    model_quality(config, model).clamp(0.0, 1.0)
 }
 
 fn latency_score(metrics: Option<&ModelMetrics>) -> f64 {
