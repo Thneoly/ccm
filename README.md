@@ -92,7 +92,7 @@ Models can declare static metadata used by cost-aware and weighted routing:
 ```toml
 [models.claude]
 provider = "anthropic"
-model_id = "claude-sonnet-4-5"
+model_id = "claude-sonnet-5-5"
 
 [models.claude.routing]
 cost_weight = 1.0
@@ -100,7 +100,7 @@ quality_weight = 1.0
 
 [models.glm]
 provider = "zai"
-model_id = "glm-5"
+model_id = "glm-5.3"
 
 [models.glm.routing]
 cost_weight = 0.25
@@ -114,7 +114,7 @@ Create models from CLI with:
 ```bash
 ccm add model glm \
   --provider zai \
-  --model-id glm-5 \
+  --model-id glm-5.3 \
   --cost-weight 0.25 \
   --quality-weight 0.85
 ```
@@ -452,7 +452,6 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-official Claude Code compatibility verification
 mock-provider integration tests
 Windows / Linux / macOS validation
 re-enable CI and make all checks green
@@ -529,6 +528,8 @@ GitHub Actions CI is currently disabled.
 - automatic migration from legacy config current
 - explicit x-api-key / bearer provider authentication
 - single-header upstream credential injection
+- Claude Code gateway environment compatibility verified against current Anthropic docs
+- modern Claude Code personal Skill integration for /switch
 - fallback policy and retry budget
 - model-level circuit breaker
 - runtime reliability and latency metrics
