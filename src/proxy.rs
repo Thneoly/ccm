@@ -30,6 +30,7 @@ use crate::{
     config::AppConfig,
     credential,
     route::{CircuitBreakerPolicy, RoutePolicy, SelectionStrategy, SelectionWeights},
+    state::AppState,
 };
 
 const TRACE_CAPACITY: usize = 100;
@@ -263,7 +264,8 @@ pub async fn serve(bind: &str) -> Result<()> {
         .with_context(|| format!("invalid bind address `{bind}`"))?;
 
     let config = AppConfig::load().context("failed to load CCM config")?;
-    let target = config
+    let persisted = AppState::load_or_migrate(&config).context("failed to load CCM state")?;
+    let target = persisted
         .current
         .clone()
         .context("no current target selected; run `ccm use <name>` first")?;
