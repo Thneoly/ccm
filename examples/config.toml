@@ -1,10 +1,12 @@
 [providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
+auth = "x-api-key"
 
 [providers.zai]
 kind = "anthropic-compatible"
 base_url = "https://api.z.ai/api/anthropic"
+auth = "x-api-key"
 
 [models.claude]
 provider = "anthropic"
