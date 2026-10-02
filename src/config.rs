@@ -25,6 +25,9 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn path() -> Result<PathBuf> {
+        if let Some(root) = std::env::var_os("CCM_HOME") {
+            return Ok(PathBuf::from(root).join("config.toml"));
+        }
         let home = dirs::home_dir().context("cannot determine home directory")?;
         Ok(home.join(".ccm").join("config.toml"))
     }
