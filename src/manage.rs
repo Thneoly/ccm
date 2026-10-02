@@ -5,9 +5,11 @@ use anyhow::{bail, Context, Result};
 use crate::{
     cli::AddCommand,
     config::AppConfig,
-    model::Model,
+    model::{Model, ModelRouting},
     provider::{Provider, ProviderKind},
-    route::{CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy},
+    route::{
+        CircuitBreakerPolicy, Route, RoutePolicy, SelectionStrategy, SelectionWeights,
+    },
 };
 
 pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
@@ -28,10 +30,22 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             name,
             provider,
             model_id,
+            cost_weight,
+            quality_weight,
         } => {
             let provider = required(provider, "Provider")?;
             let model_id = required(model_id, "Model ID")?;
-            config.add_model(name.clone(), Model { provider, model_id })?;
+            config.add_model(
+                name.clone(),
+                Model {
+                    provider,
+                    model_id,
+                    routing: ModelRouting {
+                        cost_weight,
+                        quality_weight,
+                    },
+                },
+            )?;
             config.save()?;
             println!("Saved model {name}");
         }
@@ -40,6 +54,10 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             primary,
             fallback,
             selection,
+            reliability_weight,
+            latency_weight,
+            cost_weight,
+            quality_weight,
             header_timeout_ms,
             fallback_on,
             max_attempts,
@@ -54,6 +72,12 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             let selection = parse_selection(&selection)?;
             let policy = RoutePolicy {
                 selection,
+                weights: SelectionWeights {
+                    reliability: reliability_weight,
+                    latency: latency_weight,
+                    cost: cost_weight,
+                    quality: quality_weight,
+                },
                 header_timeout_ms,
                 fallback_on,
                 max_attempts,
@@ -123,9 +147,13 @@ fn parse_selection(value: &str) -> Result<SelectionStrategy> {
     match value.trim().to_ascii_lowercase().as_str() {
         "ordered" => Ok(SelectionStrategy::Ordered),
         "healthiest" => Ok(SelectionStrategy::Healthiest),
-        "lowest-latency" | "lowest_latency" | "latency" => Ok(SelectionStrategy::LowestLatency),
+        "lowest-latency" | "lowest_latency" | "latency" => {
+            Ok(SelectionStrategy::LowestLatency)
+        }
+        "lowest-cost" | "lowest_cost" | "cost" => Ok(SelectionStrategy::LowestCost),
+        "weighted" => Ok(SelectionStrategy::Weighted),
         other => bail!(
-            "unsupported selection strategy `{other}`; expected ordered, healthiest, or lowest-latency"
+            "unsupported selection strategy `{other}`; expected ordered, healthiest, lowest-latency, lowest-cost, or weighted"
         ),
     }
 }
