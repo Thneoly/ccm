@@ -65,8 +65,14 @@ async fn main() -> Result<()> {
             if !config.routes.is_empty() {
                 println!("\nRoutes:");
                 for (name, route) in &config.routes {
+                    let marker = if state.current.as_deref() == Some(name.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
                     println!(
-                        "  {:16} primary={} fallback={}",
+                        "{} {:16} primary={} fallback={}",
+                        marker,
                         name,
                         route.primary,
                         if route.fallback.is_empty() {
