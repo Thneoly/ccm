@@ -7,16 +7,16 @@ use crate::cli::IntegrateCommand;
 const CLAUDE_SWITCH_SKILL: &str = r#"---
 name: switch
 description: Switch the active CCM model, profile, or route for the current Claude Code session when the user invokes /switch.
-argument-hint: \"<model-or-profile-or-route>\"
+argument-hint: "<model-or-profile-or-route>"
 disable-model-invocation: true
-allowed-tools: [\"Bash(ccm switch:*)\"]
+allowed-tools: ["Bash(ccm switch:*)"]
 ---
 
 ## Arguments
 
 `$0` is the CCM model, profile, or route to activate.
 
-Run `ccm switch \"$0\"` using Bash. If it succeeds, report the active target concisely. Do not change CCM's persisted default.
+Run `ccm switch "$0"` using Bash. If it succeeds, report the active target concisely. Do not change CCM's persisted default.
 "#;
 
 pub fn handle(command: IntegrateCommand) -> Result<()> {
@@ -94,7 +94,8 @@ mod tests {
     #[test]
     fn skill_contains_runtime_switch_invocation() {
         assert!(CLAUDE_SWITCH_SKILL.contains("name: switch"));
-        assert!(CLAUDE_SWITCH_SKILL.contains("ccm switch"));
-        assert!(CLAUDE_SWITCH_SKILL.contains("$0"));
+        assert!(CLAUDE_SWITCH_SKILL.contains("ccm switch \"$0\""));
+        assert!(CLAUDE_SWITCH_SKILL.contains("argument-hint: \"<model-or-profile-or-route>\""));
+        assert!(!CLAUDE_SWITCH_SKILL.contains("\\\""));
     }
 }
