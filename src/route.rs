@@ -34,20 +34,15 @@ fn default_quality_weight() -> f64 {
     0.2
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SelectionStrategy {
+    #[default]
     Ordered,
     Healthiest,
     LowestLatency,
     LowestCost,
     Weighted,
-}
-
-impl Default for SelectionStrategy {
-    fn default() -> Self {
-        Self::Ordered
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

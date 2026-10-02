@@ -18,17 +18,12 @@ impl Provider {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderAuth {
+    #[default]
     XApiKey,
     Bearer,
-}
-
-impl Default for ProviderAuth {
-    fn default() -> Self {
-        Self::XApiKey
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
