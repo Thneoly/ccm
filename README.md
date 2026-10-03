@@ -11,14 +11,15 @@ User guide (中文): `docs/USAGE.md`.
 For implementation continuation and release stabilization, read:
 
 - `docs/DESIGN.md` — architecture, routing semantics, invariants, module responsibilities, known design debt.
-- `docs/V0.3_PLAN.md` — current verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
+- `docs/V0.4_PLAN.md` — v0.4 scope, milestones, risks, and owner decisions (current work).
+- `docs/V0.3_PLAN.md` — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
 - `docs/USAGE.md` — task-oriented user guide (Chinese).
 
 Current status:
 
-> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
+> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 planning complete, no v0.4 code yet.
 
-New feature work goes to the v0.4 backlog in `docs/V0.3_PLAN.md` section 16; keep the CI release gate green on every push to main.
+New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
 
 ## Install
 
