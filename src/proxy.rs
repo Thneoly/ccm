@@ -199,11 +199,11 @@ pub async fn serve(bind: &str) -> Result<()> {
 }
 
 // The control API and the credential-injecting proxy are unauthenticated, so
-// v0.3 refuses to expose them beyond the local machine. Remote/LAN binding
-// needs an authentication design first (post-v0.3).
+// CCM refuses to expose them beyond the local machine. Remote/LAN binding
+// needs an authentication design first (still an open backlog item).
 fn ensure_loopback(addr: SocketAddr) -> Result<()> {
     if !addr.ip().is_loopback() {
-        bail!("refusing to bind non-loopback address {addr}: the CCM control API is unauthenticated, remote binding is not supported in v0.3");
+        bail!("refusing to bind non-loopback address {addr}: the CCM control API is unauthenticated, remote binding is not supported");
     }
     Ok(())
 }
