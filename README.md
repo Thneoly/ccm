@@ -437,13 +437,13 @@ GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the full persisted history from disk instead of the in-memory ring (v0.4 M5; a 400 names the cause when no history store is running).
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
 ## Routing Decision Trace
 
-Routing Decision Trace is the final major v0.3 routing feature. CCM keeps the most recent 100 decisions in proxy memory.
+Routing Decision Trace is the final major v0.3 routing feature. CCM keeps the most recent 100 decisions in proxy memory. Since v0.4 M5 every decision also persists to append-only JSONL under `$CCM_HOME/history/` (rotation + 14-day retention, single-writer lock per `CCM_HOME`) alongside periodic metric snapshots and circuit transitions — `ccm history decisions|metrics|circuit` reads them offline, and persisted lines are whitelist serde structs that never contain credential material. Runtime metrics still restart from zero on purpose: stale history must not distort healthiest/weighted ordering.
 
 Inspect them with:
 
@@ -501,7 +501,7 @@ Why did CCM fallback?
 Which model finally produced the returned upstream response?
 ```
 
-Decision traces are intentionally in-memory for v0.3. Persistence and replay storage are deferred until after the stabilization release.
+Attempt traces stay intentionally in-memory (last 100, proxy lifetime). Routing decisions persist to JSONL history since v0.4 M5 (see the Control API section).
 
 ## Mock Provider integration coverage
 
@@ -533,7 +533,7 @@ committed-stream failure -> error event, zero requests to the fallback (no mid-s
 HALF_OPEN probe release on translate failure
 ```
 
-All four integration tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring.
+All five integration tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring. The disk-query test for `/_ccm/decisions` uses an explicit history directory and needs no env lock.
 
 Run them with:
 
@@ -604,6 +604,9 @@ ccm use <model-or-profile-or-route>
 ccm switch <model-or-profile-or-route> [--proxy-url URL]
   [--client <id>] [--global]
 ccm clients [--proxy-url URL]
+ccm history decisions [--since MS] [--until MS] [--model M] [--client ID] [--limit N]
+ccm history metrics [--limit N]
+ccm history circuit [--model M] [--limit N]
 ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
 ccm auth set <provider>
 ccm auth delete <provider>
@@ -712,6 +715,10 @@ GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-late
   non-streaming responses, error bodies), including mixed-protocol routes
   (anthropic and openai-compatible candidates in one fallback chain)
 - in-memory traces, metrics, decisions, and circuit-state control APIs
+- JSONL observability history (v0.4): decisions, metric snapshots, and
+  circuit transitions persist under `$CCM_HOME/history/` with rotation,
+  14-day retention, and a single-writer lock; offline `ccm history` reads
+  and disk-backed `/_ccm/decisions?since=&until=&model=` queries
 - no mid-stream failover
 
 ## License

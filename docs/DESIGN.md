@@ -517,6 +517,13 @@ only that client's in-memory target (invalid id charset → 400; charset
 entries (sorted by client id), and `GET /_ccm/status|/_ccm/traces|/_ccm/decisions`
 accept `?client=<id>` to filter to one client.
 
+History queries (v0.4 M5): `GET /_ccm/decisions?since=&until=&model=`
+(unix-ms, inclusive) switches the endpoint from the in-memory ring to a
+disk read over the full persisted history (oldest first); `?client=` still
+applies on that branch, and a history filter with no running history store
+is a 400 naming the likely causes. Without any of the three parameters the
+endpoint is byte-identical to the v0.3 in-memory behavior.
+
 Control API is currently unauthenticated and intended for localhost use.
 
 ### Security note
@@ -544,6 +551,8 @@ src/credential.rs  env/keyring credential resolution
 src/launcher.rs    Claude Code process environment
 src/integrate.rs   Claude Skill installation
 src/health.rs      authenticated provider check
+src/history.rs     JSONL observability history engine (writer + readers)
+src/history_cli.rs `ccm history` offline presentation
 src/doctor.rs      local environment diagnosis
 src/translate.rs   pure anthropic<->openai translation engine (no IO)
 src/proxy.rs       forward() + HTTP path + mock integration tests
@@ -671,9 +680,14 @@ Validation should eventually enforce legal HTTP ranges and possibly deduplicate 
 
 ### 18.4 Runtime observability persistence
 
-Metrics, traces, circuits, and decisions reset with Proxy restart.
-
-This is intentional for v0.3.
+Partially resolved in v0.4 M5: routing decisions, periodic metric
+snapshots, and circuit transitions persist to append-only JSONL under
+`$CCM_HOME/history/` (rotation + 14-day retention, single-writer OS lock;
+query via `/_ccm/decisions?since=&until=&model=` or `ccm history`, both
+offline-capable for the CLI). Runtime metrics and circuit state still
+restart from zero — deliberate, so stale history never distorts
+healthiest/weighted ordering — and the attempt-trace ring stays
+in-memory-only (last 100) by design.
 
 ### 18.5 Query strings
 

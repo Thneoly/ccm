@@ -182,6 +182,7 @@ CCM doctor
 
 ✓ Claude Code: installed (2.1.261)
 ✓ settings.json: no ANTHROPIC_* env overrides
+✓ history: 3 file(s) at C:\Users\you\.ccm\history
 ✓ current target: glm
 ✓ primary model: glm
 ✓ model id: glm-5.3
@@ -197,6 +198,7 @@ For a full authenticated model check, run `ccm health glm`.
 - `Claude Code` 一行解析 `claude --version` 输出并带版本号；低于 2.1.227 时追加一行警告——该版本起才支持 `ANTHROPIC_CUSTOM_HEADERS`（ccm 注入的客户端身份头），更早的版本客户端身份只能走 `ccm-local-<id>` token 通道。
 - 当前目标属于 openai-compatible provider 时，会多一行 `! current target: openai-compatible models are proxy-only (...)`——该目标只能走代理模式（见 4.2 / 5.5）。
 - `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键（含 `ANTHROPIC_CUSTOM_HEADERS`，会顶掉 ccm 注入的客户端身份头）会覆盖 ccm 的注入（见 FAQ）。
+- `history` 一行显示持久化历史目录状态（v0.4，见 6.3）：文件数；目录还空着或 `[observability] history_enabled = false` 时是 `!` 提示（非致命，不影响后面各项）。
 - 链路中途失败会提前结束（例如 `✗ target `...`: ...`），后面的检查不再打印。
 - 刚 `init` 完（current 还是 `claude` 且没存 anthropic key）时，凭据行会是：
   `✗ credential: missing (set CCM_ANTHROPIC_API_KEY or run `ccm auth set anthropic`)`
@@ -509,6 +511,7 @@ fallback = ["glm"]
 |---|---|
 | `ccm doctor` | 本地体检：PATH、目标解析、配置链、凭据在不在、端点通不通（见 3.4） |
 | `ccm health <model-or-profile>` | 发真实请求验证"鉴权 + 模型名"是否可用 |
+| `ccm history decisions\|metrics\|circuit` | 离线查看持久化的决策 / 指标快照 / 熔断转换（见 6.3，代理停着也能查） |
 | `/_ccm/*` 控制接口 | 代理运行时的实时观测与切换（本节） |
 
 ### 6.1 控制接口一览（默认 `http://127.0.0.1:13521`）
@@ -523,7 +526,7 @@ fallback = ["glm"]
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
 | `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
-| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端 |
+| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的完整历史（见 6.3），无运行中的 history 存储时该组合返回 400 |
 | `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
@@ -538,7 +541,7 @@ Invoke-RestMethod http://127.0.0.1:13521/_ccm/metrics
 curl -s http://127.0.0.1:13521/_ccm/decisions
 ```
 
-traces 和 decisions 是进程内环形缓冲，各保留**最近 100 条**，重启代理即清零；metrics/circuits 同样只活在进程内。
+traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清零；metrics/circuits 同样只活在进程内。decisions 的无参数视图同样在内存里，但 v0.4 起每条决策同时持久化到磁盘（见 6.3），带时间/模型过滤的查询走磁盘全量历史。
 
 ### 6.2 怎么读 `/_ccm/decisions`
 
@@ -580,6 +583,51 @@ traces 和 decisions 是进程内环形缓冲，各保留**最近 100 条**，�
 ```
 
 读法：glm 熔断中，被跳过（没打上游、不占尝试预算）→ 立刻落到 minimax → 成功。配合 stderr 的 `ccm route=... attempt=... result=...` 日志可以实时看到同样的信息。
+
+### 6.3 历史持久化（v0.4）
+
+代理运行时把三类记录追加写入 `$CCM_HOME/history/`（默认 `~/.ccm/history/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `decisions.jsonl` | 每条路由决策（与 `/_ccm/decisions` 记录同结构；计费用的 `usage.jsonl` 在 M6 加入） |
+| `metrics.jsonl` | 全模型指标快照，默认每 30 秒一条（原始计数，比率在读取时计算） |
+| `circuit.jsonl` | 熔断状态转换（CLOSED / OPEN / HALF_OPEN + 原因） |
+
+行为要点：
+
+- **轮转与保留**：单文件满 5 万条或 8 MiB 即轮转成 `<kind>-<unix_ms>.jsonl`，已轮转文件默认保留 14 天（按修改时间清理；活跃文件与 `.lock` 永不清理）。
+- **绝不阻塞请求**：写入走有界队列，队列满就丢弃并计数（stderr 提示一次）；磁盘 IO 失败也只是停写历史，路由不受影响。
+- **单写者规则**：同一 `CCM_HOME` 只允许一个代理写历史（目录里的 OS 文件锁）。第二个代理照常路由，只是历史禁用并打印一条警告。
+- **重启语义**：decision id 跨重启连续（启动时从磁盘尾部恢复）；运行时指标/熔断状态从零开始——过期数据不参与 healthiest/weighted 排序，历史查询读磁盘。
+- **无凭据保证**：记录是白名单 serde 结构，测试断言落盘内容不含任何凭据子串。
+- 崩溃残留的半行（torn tail）读取时自动跳过。
+
+查询方式（两者都支持 `--model` / `--client` / 时间过滤；CLI 无参数查询不受影响）：
+
+```powershell
+# CLI 离线查询（代理停着也能用）
+ccm history decisions --model glm --limit 20
+ccm history decisions --since 1759300000000 --until 1759399999999 --client term1
+ccm history metrics            # 最新一次快照（--limit 5 看最近 5 次）
+ccm history circuit --model glm
+
+# 控制接口（代理运行中；unix-ms 含边界；与 ?client= 可组合）
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1759300000000&model=glm"
+```
+
+`[observability]` 配置节（全部有默认值，v0.4 之前的配置文件不用改；任一阈值填 0 会在加载时报错）：
+
+```toml
+[observability]
+history_enabled = true            # 关掉后代理不写历史，带过滤参数的查询返回 400
+retention_days = 14
+max_records_per_file = 50000
+max_bytes_per_file = 8388608      # 8 MiB
+metrics_snapshot_interval_secs = 30
+```
+
+`ccm doctor` 增加一行历史目录状态：`✓ history: N file(s) at <dir>`，目录为空或已禁用时是 `!` 提示（非致命）。
 
 ---
 
@@ -698,6 +746,9 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm use <target>` | 设持久默认（写 state.toml） | — |
 | `ccm switch <target>` | 运行时切换代理目标（全局或某客户端） | `--proxy-url`（`CCM_PROXY_URL` > `http://127.0.0.1:13521`）、`--client <id>`（`CCM_CLIENT_ID` > 全局）、`--global`（强制全局，与 `--client` 互斥） |
 | `ccm clients` | 列出代理各客户端的运行时目标与请求计数 | `--proxy-url`（同 `switch`） |
+| `ccm history decisions` | 离线查看持久化决策（JSONL，旧→新） | `--since`、`--until`（unix-ms，含边界）、`--model`、`--client`、`--limit`（保留最新 N） |
+| `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit` |
+| `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit` |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
 | `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |
 | `ccm list` | 列出模型与路由（`*` = 当前） | — |
@@ -716,6 +767,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | 文件 / 端点 | 说明 |
 |---|---|
 | `~/.ccm/config.toml`、`~/.ccm/state.toml` | 声明式配置 / 持久默认（可用 `CCM_HOME` 重定位） |
+| `~/.ccm/history/` | 观测历史 JSONL：decisions / metrics / circuit（见 6.3；`CCM_HOME` 同样生效） |
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
 | `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |
 | `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST；`?client=<id>` 只切该客户端） |
