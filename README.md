@@ -419,7 +419,7 @@ ccm switch balanced
 
 `ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/state.toml`.
 
-Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run --proxy` session carries a client id, and `ccm switch <target> --client <id>` switches only that client. `--global` (or a bare `ccm switch`) moves the global target that un-switched clients follow; `ccm clients` lists the per-client targets.
+Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run --proxy` session carries a client id, and `ccm switch <target> --client <id>` switches only that client. `--global` moves the global target that un-switched clients follow; a bare `ccm switch` is global only outside a `ccm run --proxy` session — inside one it inherits the session's `CCM_CLIENT_ID` and stays client-scoped. `ccm clients` lists the per-client targets.
 
 ## Control API
 
