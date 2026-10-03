@@ -74,6 +74,7 @@ enum DropCategory {
     TopK,
     ParallelToolUse,
     StopSequences,
+    UnmappableMessage,
 }
 
 impl DropCategory {
@@ -92,11 +93,15 @@ impl DropCategory {
             DropCategory::StopSequences => {
                 "truncating stop_sequences to 4 entries; OpenAI accepts at most 4 stop sequences"
             }
+            DropCategory::UnmappableMessage => {
+                "degrading a message with no translatable blocks to a placeholder; non-base64 images and other unmappable blocks are dropped"
+            }
         }
     }
 
     fn flag(self) -> &'static AtomicBool {
-        static FLAGS: [AtomicBool; 5] = [
+        static FLAGS: [AtomicBool; 6] = [
+            AtomicBool::new(false),
             AtomicBool::new(false),
             AtomicBool::new(false),
             AtomicBool::new(false),
@@ -137,6 +142,12 @@ pub fn request_wants_stream(anthropic: &Value) -> bool {
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
+
+/// Placeholder pushed in place of a message whose every content block was
+/// unmappable (e.g. URL-source images): keeps the turn present and the
+/// messages array non-empty instead of silently dropping it.
+const UNMAPPABLE_MESSAGE_PLACEHOLDER: &str =
+    "[ccm: unmappable message content dropped (no translatable blocks)]";
 
 /// Translate an Anthropic `/v1/messages` request body into an OpenAI
 /// `chat/completions` request body for upstream model `model_id`.
@@ -191,6 +202,7 @@ pub fn translate_request(
         let mut tool_messages: Vec<Value> = Vec::new();
         let mut saw_thinking = false;
         let mut content_was_string = false;
+        let mut saw_non_thinking_block = false;
 
         match m.get("content") {
             None => {}
@@ -201,7 +213,14 @@ pub fn translate_request(
             Some(Value::Array(blocks)) => {
                 for block in blocks {
                     let Some(b) = block.as_object() else { continue };
-                    match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    let block_type = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    // Thinking blocks are an intentional documented drop; any
+                    // other block that maps to nothing still represents real
+                    // content and must not vanish with the message.
+                    if block_type != "thinking" && block_type != "redacted_thinking" {
+                        saw_non_thinking_block = true;
+                    }
+                    match block_type {
                         "text" => {
                             if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                                 text_parts.push(t.to_string());
@@ -253,6 +272,7 @@ pub fn translate_request(
 
         // tool_result responses precede any remaining user text so the tool
         // answers directly follow the assistant tool_calls message.
+        let had_tool_messages = !tool_messages.is_empty();
         messages.extend(tool_messages);
 
         let text = text_parts.join("\n");
@@ -269,6 +289,19 @@ pub fn translate_request(
         } else if content_was_string || !text_parts.is_empty() {
             // pure-text message collapses to a plain string
             messages.push(json!({"role": role, "content": text}));
+        } else if saw_non_thinking_block && !had_tool_messages {
+            // Every block in this message was unmappable (e.g. URL-source
+            // images). Dropping the message entirely could empty the
+            // messages array (gateways 400 on that) or silently skip a
+            // turn, so degrade to an explicit placeholder instead. A
+            // thinking-only message stays dropped (documented degradation),
+            // and tool_result-only messages already produced their role:tool
+            // outputs above.
+            warn_dropped(DropCategory::UnmappableMessage);
+            messages.push(json!({
+                "role": role,
+                "content": UNMAPPABLE_MESSAGE_PLACEHOLDER,
+            }));
         }
     }
 
@@ -2055,5 +2088,63 @@ mod tests {
         let events = t.feed(format!("data: {hybrid}\n\n").as_bytes()).unwrap();
         assert_eq!(event_names(&events).last().copied(), Some("error"));
         assert!(!events.iter().any(|e| e.event == "message_stop"));
+    }
+
+    // 29. a message whose every block is unmappable (URL-source image)
+    //     degrades to a placeholder instead of vanishing — the turn stays
+    //     present and the messages array never ends up empty
+    #[test]
+    fn fully_unmappable_message_degrades_to_placeholder() {
+        let req = translate_request(
+            &json!({
+                "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "image", "source": {"type": "url",
+                         "url": "https://example.com/cat.png"}}
+                    ]}
+                ]
+            }),
+            "m",
+        )
+        .unwrap();
+        let msgs = req.body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "the turn must not vanish");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(
+            msgs[0]["content"],
+            Value::String(UNMAPPABLE_MESSAGE_PLACEHOLDER.to_string())
+        );
+    }
+
+    // 30. placeholder only when NOTHING mapped: an empty block array and a
+    //     thinking-only message stay dropped (documented degradations), and
+    //     a mixed message keeps its mapped text
+    #[test]
+    fn placeholder_only_when_nothing_mapped() {
+        let req = translate_request(
+            &json!({
+                "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": []},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "internal"}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image", "source": {"type": "url",
+                         "url": "https://example.com/y.png"}}
+                    ]}
+                ]
+            }),
+            "m",
+        )
+        .unwrap();
+        let msgs = req.body["messages"].as_array().unwrap();
+        // empty-array and thinking-only messages stay dropped; the mixed
+        // one maps its text
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "look");
     }
 }

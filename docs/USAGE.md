@@ -495,6 +495,7 @@ fallback = ["glm"]
 | prompt cache | `cache_control` 被丢弃，无 prompt-cache 收益（详见 FAQ"为什么经 openai 网关没有缓存折扣"） |
 | extended thinking | `thinking` 字段整体丢弃，无扩展思考；`thinking` 内容块也不回传 |
 | 长度/预算参数 | 只透传 `max_tokens`（`budget_tokens` 随 thinking 丢弃）；`temperature` / `top_p` 照常透传，`top_k` 丢弃，`stop_sequences` 截断为 4 条（OpenAI 上限） |
+| 图像 / 不可映射内容块 | 仅 base64 source 的 `image` 块映射为 `image_url`；URL source 等其他形式丢弃。若整条消息没有任何可映射块，降级为一条占位文本消息（`[ccm: unmappable message content dropped ...]`），不会整条消失 |
 | 推理内容 | 上游 `reasoning_content`（DeepSeek R 系风格）被丢弃，不会回传给客户端 |
 | usage / 计费 | 上报的缓存命中 tokens（`cached_tokens` / `prompt_cache_hit_tokens`）翻译为 `cache_read_input_tokens` 并从 `input_tokens` 中扣除；`cache_creation_input_tokens` 无 OpenAI 对应物，不回填 |
 
