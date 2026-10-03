@@ -821,8 +821,10 @@ impl SseTranslator {
     }
 
     /// Translate one OpenAI stream chunk. A final frame carrying usage but
-    /// no choices is captured, not forwarded. Valid frames without choices
-    /// or usage are ignored.
+    /// no choices is captured, not forwarded. A frame carrying an `error`
+    /// object terminates the stream (gateways report mid-stream failures
+    /// this way on a still-200 response). Other valid frames without
+    /// choices or usage are ignored.
     fn process_chunk(&mut self, chunk: &Value) -> Vec<SseEvent> {
         let mut events = Vec::new();
         // capture usage from any chunk carrying it; the canonical source is
@@ -831,6 +833,16 @@ impl SseTranslator {
             if usage.is_object() {
                 self.final_usage = Some(usage.clone());
             }
+        }
+        // Some gateways (OpenAI under load, Azure content filters,
+        // OneAPI-class aggregators) report failure mid-stream as a
+        // valid-JSON frame carrying an `error` object on the still-200 SSE
+        // response. Dropping it as a choices-less frame would synthesize a
+        // clean close over an upstream failure; instead map it through the
+        // same envelope translation as non-200 bodies and terminate.
+        if chunk.get("error").is_some_and(Value::is_object) {
+            self.errored = true;
+            return vec![sse("error", translate_error_body(chunk))];
         }
         let choice = chunk
             .get("choices")
@@ -1995,5 +2007,53 @@ mod tests {
             .unwrap();
         assert!(events.iter().any(|e| e.event == "message_stop"));
         assert!(events.iter().any(|e| e.data.contains("\"name\":\"fine\"")));
+    }
+
+    // 27. a mid-stream error frame (valid JSON, no choices) terminates the
+    //     stream with the translated upstream error — never a faked clean close
+    #[test]
+    fn sse_error_frame_is_terminal_and_maps_the_envelope() {
+        let good = format!(
+            "data: {}\n\n",
+            json!({"id": "g", "choices": [{"index": 0, "delta": {"content": "partial"}}]})
+        );
+        let err_frame = json!({"error": {"message": "The server had an error",
+                                         "type": "server_error"}});
+        let mut t = SseTranslator::new("up");
+        let mut events = t.feed(good.as_bytes()).unwrap();
+        events.extend(t.feed(format!("data: {err_frame}\n\n").as_bytes()).unwrap());
+        // the gateway just closes after the error frame — no [DONE]
+        events.extend(t.finish().unwrap());
+
+        let names = event_names(&events);
+        assert_eq!(names.last().copied(), Some("error"));
+        assert!(!names.contains(&"message_stop"));
+        let err: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["error"]["type"], "api_error"); // server_error -> api_error
+        assert_eq!(err["error"]["message"], "The server had an error");
+        // terminal: nothing more from feed or finish
+        assert!(t.feed(b"data: [DONE]\n\n").unwrap().is_empty());
+        assert!(t.finish().unwrap().is_empty());
+    }
+
+    // 28. error frames keep the Anthropic type mapping (rate_limit), and an
+    //     error object wins even when the frame also carries choices
+    #[test]
+    fn sse_error_frame_type_mapping_and_choices_coexistence() {
+        let rl = json!({"error": {"message": "Rate limit reached",
+                                  "type": "rate_limit_error"}});
+        let mut t = SseTranslator::new("up");
+        let events = t.feed(format!("data: {rl}\n\n").as_bytes()).unwrap();
+        let err: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+        assert_eq!(err["error"]["type"], "rate_limit_error");
+        assert_eq!(err["error"]["message"], "Rate limit reached");
+
+        let hybrid = json!({"error": {"message": "boom", "type": "server_error"},
+                            "choices": [{"index": 0, "delta": {"content": "x"}}]});
+        let mut t = SseTranslator::new("up");
+        let events = t.feed(format!("data: {hybrid}\n\n").as_bytes()).unwrap();
+        assert_eq!(event_names(&events).last().copied(), Some("error"));
+        assert!(!events.iter().any(|e| e.event == "message_stop"));
     }
 }

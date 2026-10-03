@@ -498,7 +498,7 @@ fallback = ["glm"]
 | 推理内容 | 上游 `reasoning_content`（DeepSeek R 系风格）被丢弃，不会回传给客户端 |
 | usage / 计费 | 上报的缓存命中 tokens（`cached_tokens` / `prompt_cache_hit_tokens`）翻译为 `cache_read_input_tokens` 并从 `input_tokens` 中扣除；`cache_creation_input_tokens` 无 OpenAI 对应物，不回填 |
 
-错误与流式的语义与 anthropic 类一致：上游错误体翻译成 Anthropic 错误信封（状态码保留）；已开始流式返回后翻译失败（如上游断流、坏帧），在已提交的流上发一个 `error` 事件然后结束响应体——**不会中途换模型**（v0.3 的"不中途切换"不变量继续生效）。
+错误与流式的语义与 anthropic 类一致：上游错误体翻译成 Anthropic 错误信封（状态码保留）；上游也可能在 200 流式响应**中途**发一个 error 帧（OpenAI 过载、Azure 内容过滤、OneAPI 类聚合器常见）——ccm 同样把它翻译成 Anthropic `error` 事件终止流，绝不伪装成正常完成。已开始流式返回后翻译失败（如上游断流、坏帧），同样在已提交的流上发一个 `error` 事件然后结束响应体——**不会中途换模型**（v0.3 的"不中途切换"不变量继续生效）。
 
 ---
 
