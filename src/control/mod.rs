@@ -1,3 +1,8 @@
+//! Runtime control plane. `api` hosts the proxy's `/_ccm` HTTP handlers;
+//! this module's `switch` is the CLI-side client for `ccm switch`.
+
+pub(crate) mod api;
+
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 

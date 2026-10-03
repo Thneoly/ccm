@@ -11,6 +11,7 @@ mod model;
 mod provider;
 mod proxy;
 mod route;
+mod routing;
 mod state;
 
 use anyhow::{Context, Result};
