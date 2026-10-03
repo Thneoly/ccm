@@ -180,7 +180,7 @@ Selected glm as persisted default
 ```text
 CCM doctor
 
-✓ Claude Code: installed
+✓ Claude Code: installed (2.1.261)
 ✓ settings.json: no ANTHROPIC_* env overrides
 ✓ current target: glm
 ✓ primary model: glm
@@ -194,7 +194,9 @@ For a full authenticated model check, run `ccm health glm`.
 ```
 
 - `endpoint` 一行是对 base_url 发起普通 GET 的状态码，因网关而异。
-- `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键会覆盖 ccm 的注入（见 FAQ）。
+- `Claude Code` 一行解析 `claude --version` 输出并带版本号；低于 2.1.227 时追加一行警告——该版本起才支持 `ANTHROPIC_CUSTOM_HEADERS`（ccm 注入的客户端身份头），更早的版本客户端身份只能走 `ccm-local-<id>` token 通道。
+- 当前目标属于 openai-compatible provider 时，会多一行 `! current target: openai-compatible models are proxy-only (...)`——该目标只能走代理模式（见 4.2 / 5.5）。
+- `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键（含 `ANTHROPIC_CUSTOM_HEADERS`，会顶掉 ccm 注入的客户端身份头）会覆盖 ccm 的注入（见 FAQ）。
 - 链路中途失败会提前结束（例如 `✗ target `...`: ...`），后面的检查不再打印。
 - 刚 `init` 完（current 还是 `claude` 且没存 anthropic key）时，凭据行会是：
   `✗ credential: missing (set CCM_ANTHROPIC_API_KEY or run `ccm auth set anthropic`)`
@@ -266,11 +268,14 @@ Runtime switch: `ccm switch <model-or-profile-or-route>`.
 终端 B 启动 claude：
 
 ```powershell
-ccm run --proxy                # 用代理当前的目标
-ccm run --proxy coding-route   # 先切到 coding-route 再启动
+ccm run --proxy                # 用代理当前的目标（自动生成随机 client id，见 4.6）
+ccm run --proxy coding-route   # 把本会话切到 coding-route 再启动（只作用于本会话，见 4.6）
+ccm run --proxy --client dev1  # 显式指定 client id
 ```
 
-claude 拿到的是占位配置：`ANTHROPIC_BASE_URL=<代理地址>`、`ANTHROPIC_MODEL=ccm`、`ANTHROPIC_AUTH_TOKEN=ccm-local`、`CCM_PROXY_URL=<代理地址>`——真实路由与鉴权全部由运行中的代理完成。
+claude 拿到的是占位配置：`ANTHROPIC_BASE_URL=<代理地址>`、`ANTHROPIC_MODEL=ccm`、`ANTHROPIC_AUTH_TOKEN=ccm-local-<client-id>`、`CCM_PROXY_URL=<代理地址>`，外加客户端标识 `CCM_CLIENT_ID=<client-id>` 和 `ANTHROPIC_CUSTOM_HEADERS`（内容为一行 `x-ccm-client: <client-id>`；父环境已有该变量时，ccm 保留其余行、只把 `x-ccm-client` 行替换成自己的）——真实路由与鉴权全部由运行中的代理完成。
+
+client id 默认每次启动随机生成（8 位十六进制短 id），`--client` 或 `CCM_CLIENT_ID` 环境变量可显式指定。代理识别身份有两条等价通道：优先读 `x-ccm-client` 请求头（需要 claude ≥ 2.1.227），否则从 `ccm-local-<id>` 占位 token 里解析。
 
 代理运行期间，每次路由尝试都会向 stderr 打一行日志（fallback 时追加 ` action=fallback`）：
 
@@ -290,9 +295,12 @@ ccm route=coding-route attempt=2 model=minimax result=HTTP 200
 | 改什么 | state.toml 的 `current`（持久默认） | 运行中代理的内存目标 |
 | 是否要求代理在运行 | 否 | 是（否则 `failed to contact CCM proxy control API`） |
 | 生效范围 | 之后的 `ccm run`、下次 `ccm proxy` 启动、`ccm doctor` 等 | 仅当前代理进程 |
-| 输出 | `Selected {target} as persisted default` | `Runtime target switched to {target}` |
+| 客户端作用域 | — | 默认全局；`--client <id>` 只切该客户端的运行时目标 |
+| 输出 | `Selected {target} as persisted default` | 全局：`Runtime target switched to {target}`；客户端：`Runtime target for client {id} switched to {target}` |
 
 两者都接受模型 / profile / 路由名（解析顺序：路由 → 模型 → profile）。`switch` 的代理地址解析顺序：`--proxy-url` flag > `CCM_PROXY_URL` 环境变量 > `http://127.0.0.1:13521`。
+
+`switch` 的客户端作用域（v0.4）：id 解析顺序 `--client` > `CCM_CLIENT_ID` 环境变量 > 全局；`--global` 强制切全局（即使设了 `CCM_CLIENT_ID`）。ccm 代理模式启动的 claude 会话继承 `CCM_CLIENT_ID`，所以会话内 `/switch` 自动只切本会话（见 4.5 / 4.6）。从未被 scoped switch 过的客户端跟随全局目标；客户端条目只在内存里，代理重启即回全局（runtime-only，不碰 state.toml）。client id 字符集 `[A-Za-z0-9._-]{1,64}`，非法值在发出请求前就报 `invalid client id ...: must be 1-64 characters of [A-Za-z0-9._-]`（与代理侧校验同一条消息）。
 
 ### 4.5 集成 Claude Code 的 `/switch`
 
@@ -315,41 +323,49 @@ The skill switches CCM's in-memory runtime target.
 Claude 会执行 `ccm switch "fast-route"` 并回报当前目标。要点：
 
 - 只切换当前代理的运行时目标，**不改持久默认**。
+- 会话由 `ccm run --proxy` 启动时，skill 继承 `CCM_CLIENT_ID`，`/switch` 只切本会话的客户端目标，**不影响其他会话**（v0.4，见 4.6）。
 - 需要代理在运行，否则报 `failed to contact CCM proxy control API`。
 - skill 带 `disable-model-invocation: true` 和 `allowed-tools: ["Bash(ccm switch:*)"]`——只有你手动 `/switch` 才会触发，且只允许执行 `ccm switch` 命令。
 - 安装时会顺带删除旧版命令文件 `~/.claude/commands/switch.md`（如果存在）。
 - 卸载：`ccm integrate claude --remove` → `Removed Claude Code /switch integration`（文件已不存在也不报错）。
 
-### 4.6 多个终端用不同模型
+### 4.6 多个终端用不同模型（单代理多客户端）
 
-一个代理只有一个全局运行时目标——两个终端挂同一个代理时，任何一端 `/switch`，**两端同时切**。要各用各的模型，两条路：
+v0.4 起一个代理就能按客户端分流：每个 `ccm run --proxy` 会话带一个 client id（默认每次启动随机生成 8 位十六进制短 id；`--client <id>` 或 `CCM_CLIENT_ID` 显式指定），代理为每个**被 scoped switch 过**的客户端维护独立的运行时目标，其余请求走全局目标。两个终端挂同一个代理、各用各的模型，互不干扰。
 
-**方案 A：直连模式（最简单）**
-
-```powershell
-ccm run claude      # 终端 1
-ccm run glm         # 终端 2
-```
-
-各自独立进程、独立环境变量直连上游，互不影响。代价：没有 fallback / 熔断 / 观测（这些只在代理模式下存在）。
-
-**方案 B：双代理（保留路由能力）**
-
-两个代理、两个端口，各自独立的内存目标 / 熔断 / 指标：
+**标准用法**：
 
 ```powershell
-# ── 终端组 1：代理 A 跑 glm ──
-ccm proxy --bind 127.0.0.1:13521
-ccm switch glm      --proxy-url http://127.0.0.1:13521
-ccm run --proxy --proxy-url http://127.0.0.1:13521
+# ── 终端 A：唯一的一个代理 ──
+ccm proxy
 
-# ── 终端组 2：代理 B 跑 minimax ──
-ccm proxy --bind 127.0.0.1:13522
-ccm switch minimax --proxy-url http://127.0.0.1:13522
-ccm run --proxy --proxy-url http://127.0.0.1:13522
+# ── 终端 1：固定 id，先切到 glm 再启动 ──
+ccm run --proxy glm --client term1
+
+# ── 终端 2：不指定 id（自动随机）、自动切到 minimax，只作用于这个会话 ──
+ccm run --proxy minimax
+
+# ── 任意终端：运行中改 term1 的目标，不影响终端 2 和全局 ──
+ccm switch fast-route --client term1
+
+# ── 任意终端：切全局默认（未单独切过的客户端都跟着它） ──
+ccm switch glm --global
 ```
 
-`ccm switch` 是 runtime-only（只改指定代理的内存目标，不写 state.toml），两个代理互不影响；会话内 `/switch` 也不会串——每个 claude 拿到的是自己代理的 `CCM_PROXY_URL`。按客户端 / 会话自动分流（如按 header 路由）目前不支持，已在 v0.4 规划中（多客户端主题，见 `docs/V0.4_PLAN.md` §3.1）。
+要点：
+
+- **id 解析顺序**：`ccm switch` 为 `--client` > `CCM_CLIENT_ID` 环境变量 > 全局，`--global` 强制全局；`ccm run --proxy` 为 `--client` > `CCM_CLIENT_ID` > 随机短 id。id 字符集 `[A-Za-z0-9._-]{1,64}`，非法值直接报错。
+- **`ccm run --proxy <target>` 的预切换严格只作用于本会话的 client id**，永不改全局目标。
+- **`/switch` 自动按会话隔离**：skill 里执行的就是 `ccm switch`，它继承该会话的 `CCM_CLIENT_ID`，所以只切本会话。
+- 从未被 scoped switch 过的客户端跟随全局目标（不报错、不产生条目）；客户端条目只在内存里，代理重启后全部回到全局（switch 是 runtime-only，state.toml 不受影响）。
+- **查看**：`ccm clients`（或 `GET /_ccm/clients`）列出各客户端的 target / 请求计数；`/_ccm/status`、`/_ccm/traces`、`/_ccm/decisions` 支持 `?client=<id>` 过滤。
+- 熔断 / 指标 / decisions 仍是**模型级共享**的：某个上游模型挂了，对所有客户端一起生效（同一上游、同一凭据）。
+- **client id 不是认证**：本地任何进程都能伪造任意 id（或裸用别人的 id），它与未鉴权的控制 API 同属回环信任域，不能当安全边界用。
+- claude < 2.1.227 不支持 `ANTHROPIC_CUSTOM_HEADERS`，客户端身份走 `ccm-local-<id>` token 通道，效果等价（`ccm doctor` 会提示版本）。
+
+**仍然可用：双代理双端口**（v0.3 的老办法，现在一般不再需要）——两个 `ccm proxy --bind 127.0.0.1:135xx` 各自独立的内存目标 / 熔断 / 指标，用 `--proxy-url` 区分。缺点依旧：电路、指标、decisions 全部割裂，还要占两个端口。
+
+**备选：直连模式**——两个终端各跑 `ccm run claude` / `ccm run glm`，独立进程独立环境变量。代价是没有 fallback / 熔断 / 观测，且 openai-compatible 模型不可直连（见 4.2）。
 
 ---
 
@@ -499,15 +515,16 @@ fallback = ["glm"]
 | 端点 | 用途 / 返回要点 |
 |---|---|
 | `GET /health` | 存活检查，返回字面量 `ok` |
-| `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、`kind`（与 provider 平级的顶层字段）、fallback 列表、完整 policy |
+| `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、`kind`（与 provider 平级的顶层字段）、fallback 列表、完整 policy；`?client=<id>` 查询该客户端的生效目标（未切过的客户端会标注跟随全局） |
 | `GET /_ccm/models` | 模型清单：model_id、provider、`kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`；模型引用了未配置的 provider 时为 `unknown`）、cost_weight、quality_weight |
 | `GET /_ccm/routes` | 路由清单 + `active` 标记（哪条是当前内存目标） |
-| `GET /_ccm/traces` | 最近 100 条请求尝试记录 |
+| `GET /_ccm/traces` | 最近 100 条请求尝试记录；`?client=<id>` 只看该客户端 |
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
 | `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
-| `GET /_ccm/decisions` | 最近 100 条路由决策（见下） |
-| `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400） |
+| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端 |
+| `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
+| `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
 
 ```powershell
@@ -596,6 +613,7 @@ keyring 条目：service 名固定为 `ccm`，条目名 = provider 名。Windows
 |---|---|
 | `CCM_HOME` | 重定位 `config.toml` 和 `state.toml`（默认 `~/.ccm`） |
 | `CCM_PROXY_URL` | `ccm switch` / `ccm run --proxy` 的默认代理地址（`--proxy-url` flag 可覆盖；最终默认 `http://127.0.0.1:13521`）；代理模式下会传给 claude 子进程 |
+| `CCM_CLIENT_ID` | `ccm switch` / `ccm run --proxy` 的默认 client id（`--client` flag 可覆盖；`switch` 里 `--global` 优先于它）；代理模式下会传给 claude 子进程，会话内 `/switch` 靠它保持本会话作用域（见 4.6） |
 
 ### 7.4 无头场景（CI / 容器）
 
@@ -623,7 +641,10 @@ export CCM_ZAI_API_KEY="sk-..."
 Windows 上 ccm（包括 doctor 的检测）通过 `cmd /c claude` 调用 claude，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容——前提是同一终端里 `claude --version` 真的能跑。启动失败时的报错是 `failed to launch `claude`; make sure Claude Code is installed and available on PATH`。
 
 **启动 claude 时警告 `Both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set`，或流量路由到了错误的网关？**
-Claude Code 的 `~/.claude/settings.json`（和 `settings.local.json`）里的 `env` 块会在 ccm 注入的环境变量**之后**叠加、优先级更高。其中 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会静默覆盖 ccm 的注入——ccm 只能清理进程环境变量（`launcher.rs` 启动时 `env_remove`），管不到 claude 自己的配置层。症状就是上述警告，更隐蔽的症状是 `ccm run <目标>` 实际连的仍是 settings.json 里配置的网关。`ccm doctor` 会检出并提示。修法：把这几个键从 settings.json 的 `env` 块移到**系统用户级环境变量**——裸用 `claude` 照常继承，而 ccm 启动子进程时能正确清除它们。
+Claude Code 的 `~/.claude/settings.json`（和 `settings.local.json`）里的 `env` 块会在 ccm 注入的环境变量**之后**叠加、优先级更高。其中 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_CUSTOM_HEADERS` 会静默覆盖 ccm 的注入——ccm 只能清理进程环境变量（`launcher.rs` 启动时 `env_remove`），管不到 claude 自己的配置层。症状就是上述警告，更隐蔽的症状是 `ccm run <目标>` 实际连的仍是 settings.json 里配置的网关；`ANTHROPIC_CUSTOM_HEADERS` 被覆盖时则会顶掉 ccm 注入的客户端身份头（多客户端分流失效）。`ccm doctor` 会检出并提示。修法：把这几个键从 settings.json 的 `env` 块移到**系统用户级环境变量**——裸用 `claude` 照常继承，而 ccm 启动子进程时能正确清除它们。
+
+**两个终端还会互相切来切去吗（v0.3 的老问题）？**
+不会了（v0.4）。每个 `ccm run --proxy` 会话带自己的 client id（默认随机，可 `--client` / `CCM_CLIENT_ID` 指定），会话内 `/switch` 继承 `CCM_CLIENT_ID` 只切本会话，`ccm run --proxy <target>` 的预切换也只作用于本会话。只有不带 id 的 `ccm switch`（或显式 `--global`）才动全局默认。没单独切过的客户端跟随全局。详见 4.6。client id 不是认证——别指望它隔离不可信的本地进程。
 
 **`ccm proxy --bind 0.0.0.0`（或局域网 IP）被拒？**
 v0.3 只允许回环地址（`127.x.x.x`、`[::1]`），完整报错：
@@ -674,9 +695,10 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm auth set <provider>` | 交互式存 key 进 keyring | — |
 | `ccm auth delete <provider>` | 删除 keyring 条目 | — |
 | `ccm use <target>` | 设持久默认（写 state.toml） | — |
-| `ccm switch <target>` | 运行时切换当前代理目标 | `--proxy-url`（`CCM_PROXY_URL` > `http://127.0.0.1:13521`） |
+| `ccm switch <target>` | 运行时切换代理目标（全局或某客户端） | `--proxy-url`（`CCM_PROXY_URL` > `http://127.0.0.1:13521`）、`--client <id>`（`CCM_CLIENT_ID` > 全局）、`--global`（强制全局，与 `--client` 互斥） |
+| `ccm clients` | 列出代理各客户端的运行时目标与请求计数 | `--proxy-url`（同 `switch`） |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
-| `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`） |
+| `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |
 | `ccm list` | 列出模型与路由（`*` = 当前） | — |
 | `ccm current` | 显示持久默认目标 | — |
 | `ccm doctor` | 本地体检 | — |
@@ -687,12 +709,13 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 |---|---|
 | `CCM_HOME` | 重定位 config.toml / state.toml |
 | `CCM_PROXY_URL` | switch / run --proxy 的默认代理地址；代理模式下传给 claude |
+| `CCM_CLIENT_ID` | switch / run --proxy 的默认 client id；代理模式下传给 claude（`/switch` 靠它保持会话作用域） |
 | `CCM_<PROVIDER>_API_KEY` | provider 凭据（优先于 keyring），如 `CCM_ZAI_API_KEY` |
 
 | 文件 / 端点 | 说明 |
 |---|---|
 | `~/.ccm/config.toml`、`~/.ccm/state.toml` | 声明式配置 / 持久默认（可用 `CCM_HOME` 重定位） |
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
-| `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions}` | 观测接口（GET） |
-| `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST） |
+| `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |
+| `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST；`?client=<id>` 只切该客户端） |
 | `http://127.0.0.1:13521/v1/messages` | 反向代理入口（仅此端点被转发） |

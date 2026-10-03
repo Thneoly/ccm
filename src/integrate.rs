@@ -17,6 +17,8 @@ allowed-tools: ["Bash(ccm switch:*)"]
 `$0` is the CCM model, profile, or route to activate.
 
 Run `ccm switch "$0"` using Bash. If it succeeds, report the active target concisely. Do not change CCM's persisted default.
+
+When this session was launched through ccm's proxy, the environment carries `CCM_CLIENT_ID`; `ccm switch` inherits it, so the switch stays scoped to this session's client and never disturbs other sessions.
 "#;
 
 pub fn handle(command: IntegrateCommand) -> Result<()> {
@@ -95,5 +97,11 @@ mod tests {
         assert!(CLAUDE_SWITCH_SKILL.contains("ccm switch \"$0\""));
         assert!(CLAUDE_SWITCH_SKILL.contains("argument-hint: \"<model-or-profile-or-route>\""));
         assert!(!CLAUDE_SWITCH_SKILL.contains("\\\""));
+    }
+
+    #[test]
+    fn skill_documents_client_scoped_switching() {
+        assert!(CLAUDE_SWITCH_SKILL.contains("CCM_CLIENT_ID"));
+        assert!(CLAUDE_SWITCH_SKILL.contains("never disturbs other sessions"));
     }
 }

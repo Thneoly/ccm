@@ -35,6 +35,16 @@ pub enum Command {
         target: String,
         #[arg(long)]
         proxy_url: Option<String>,
+        /// Scope the switch to one client id instead of the global target.
+        #[arg(long)]
+        client: Option<String>,
+        /// Force a global switch even when CCM_CLIENT_ID is set.
+        #[arg(long, conflicts_with = "client")]
+        global: bool,
+    },
+    Clients {
+        #[arg(long)]
+        proxy_url: Option<String>,
     },
     Run {
         target: Option<String>,
@@ -42,6 +52,10 @@ pub enum Command {
         proxy: bool,
         #[arg(long, default_value = "http://127.0.0.1:13521")]
         proxy_url: String,
+        /// Client id for this session (default: CCM_CLIENT_ID env, else a
+        /// short random id). In proxy mode the pre-switch stays scoped to it.
+        #[arg(long)]
+        client: Option<String>,
     },
     Auth {
         #[command(subcommand)]

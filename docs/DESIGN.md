@@ -458,13 +458,26 @@ Direct mode launches `claude` with:
   - `ANTHROPIC_API_KEY`
   - `ANTHROPIC_AUTH_TOKEN`
 
-Proxy mode launches Claude against CCM and also exports:
+Proxy mode launches Claude against CCM with the placeholder credential
+`ANTHROPIC_AUTH_TOKEN=ccm-local-<client-id>` and also exports:
 
 ```text
 CCM_PROXY_URL
+CCM_CLIENT_ID
+ANTHROPIC_CUSTOM_HEADERS
 ```
 
-This allows the in-session `/switch` Skill to target the same Proxy URL, including non-default ports.
+`CCM_PROXY_URL` allows the in-session `/switch` Skill to target the same
+Proxy URL, including non-default ports. The client id identifies the session
+to the proxy through two equivalent launcher-injected channels (v0.4): the
+`x-ccm-client` line in `ANTHROPIC_CUSTOM_HEADERS` (primary; requires
+Claude Code ≥ 2.1.227) and the `ccm-local-<id>` placeholder token (fallback,
+version-independent). `CCM_CLIENT_ID` makes `ccm switch` inside the session
+default to that client, so `/switch` stays session-scoped. If the parent
+environment already sets `ANTHROPIC_CUSTOM_HEADERS`, every existing line is
+preserved except `x-ccm-client` lines, which are replaced by exactly one
+line for this launch (the proxy reads the first header value; duplicate ids
+would resolve unpredictably).
 
 Personal Skill installation path:
 
@@ -494,8 +507,15 @@ GET  /_ccm/circuits
 GET  /_ccm/metrics
 GET  /_ccm/scores
 GET  /_ccm/decisions
+GET  /_ccm/clients
 POST /_ccm/switch/{target}
 ```
+
+Client scoping (v0.4): `POST /_ccm/switch/{target}?client=<id>` switches
+only that client's in-memory target (invalid id charset → 400; charset
+`[A-Za-z0-9._-]{1,64}`), `GET /_ccm/clients` lists the per-client runtime
+entries (sorted by client id), and `GET /_ccm/status|/_ccm/traces|/_ccm/decisions`
+accept `?client=<id>` to filter to one client.
 
 Control API is currently unauthenticated and intended for localhost use.
 
@@ -528,7 +548,7 @@ src/doctor.rs      local environment diagnosis
 src/translate.rs   pure anthropic<->openai translation engine (no IO)
 src/proxy.rs       forward() + HTTP path + mock integration tests
 src/routing/       mod.rs + select.rs / circuit.rs / metrics.rs / decision.rs
-src/control/       mod.rs (runtime switch client) + api.rs (control-plane Router + handlers)
+src/control/       mod.rs (runtime switch/clients client) + api.rs (control-plane Router + handlers)
 ```
 
 The v0.4 M0 split moved routing, metrics, circuit breaking, decisions, and
@@ -694,3 +714,11 @@ event and body end, never a mid-stream failover (5). The SSE translator
 transforms chunk-by-chunk with a 1 MiB per-frame cap and never buffers the
 whole stream (6). Exactly one credential header — resolved per kind — is
 injected upstream (7).
+
+Note on multi-client routing (v0.4): the client id is identity, not
+authentication. Any local process can forge `x-ccm-client` or the
+`ccm-local-<id>` token; it shares the trust domain of the loopback-only,
+unauthenticated control API (§13 security note). Scoped switches stay
+runtime-only (8): per-client entries live in proxy memory only, proxy
+restart falls back to the global target, and `ccm use` / `state.toml` are
+untouched (9).
