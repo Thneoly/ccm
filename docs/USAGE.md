@@ -79,7 +79,7 @@ cp target/release/ccm ~/.local/bin/
 ccm --version
 ```
 
-当前 Cargo.toml 声明版本为 `0.2.0`（部分报错信息按行内注释口径提到 v0.3 行为，见 FAQ）。
+输出 `ccm 0.3.0`。
 
 ---
 
@@ -609,9 +609,6 @@ refusing to bind non-loopback address 0.0.0.0: the CCM control API is unauthenti
 
 **`ccm health` 报 `unknown model`？**
 health 只接受模型名 / profile 名，不接受路由名。传 `coding-route` 这类名字会当模型名去找。
-
-**报错里说 v0.3，但 `ccm --version` 是 0.2.0？**
-Cargo.toml 当前声明 `0.2.0`；部分信息（如拒绝非回环绑定的报错）按行内注释口径写的是 v0.3 行为，属正常现象。
 
 **怎么删除模型 / provider / 路由？**
 命令树里没有删除子命令（`add` 是 upsert）。手工编辑 `~/.ccm/config.toml` 即可；代理模式下每请求重载，改完即时生效。
