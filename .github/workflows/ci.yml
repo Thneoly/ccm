@@ -1,0 +1,46 @@
+name: CI
+
+# Dispatch-only until the release owner approves CI as the final verification
+# matrix (docs/V0.3_PLAN.md section 4). Adding push/pull_request triggers
+# below is the enabling step.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: release gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the stable channel with rustfmt + clippy;
+      # rustup resolves it on the first cargo invocation.
+      - name: Verify (fmt / check / test / clippy)
+        if: runner.os == 'Linux'
+        run: ./scripts/verify.sh
+
+      - name: Smoke
+        if: runner.os == 'Linux'
+        run: ./scripts/smoke.sh
+
+      - name: Verify (fmt / check / test / clippy)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify.ps1
+
+      - name: Smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke.ps1

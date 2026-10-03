@@ -26,4 +26,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# `vendored` compiles a bundled dbus so clean environments (CI runners, slim
+# containers) build without libdbus-1-dev/pkg-config. Removing it makes the
+# build probe the system dbus and fail where those packages are absent.
 keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust", "vendored"] }
