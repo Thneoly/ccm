@@ -14,6 +14,7 @@ pub async fn run(config: &AppConfig) -> Result<()> {
 
     check_claude();
     check_claude_settings_overrides();
+    check_history(config);
 
     let state = AppState::load_or_migrate(config)?;
     let Some(current) = state.current.as_deref() else {
@@ -75,6 +76,41 @@ pub async fn run(config: &AppConfig) -> Result<()> {
         route.primary
     );
     Ok(())
+}
+
+// v0.4 M5: an informative look at the observability history store. Non-fatal
+// by design — a missing or empty directory is normal on a fresh install or
+// before the proxy's first start; a disabled store is a deliberate config.
+fn check_history(config: &AppConfig) {
+    if !config.observability.history_enabled {
+        println!("! history: disabled ([observability] history_enabled = false)");
+        return;
+    }
+    match AppConfig::history_dir() {
+        Ok(dir) => {
+            let files = count_jsonl_files(&dir);
+            if files == 0 {
+                println!(
+                    "! history: no files yet at {} (the proxy writes them while it runs)",
+                    dir.display()
+                );
+            } else {
+                println!("✓ history: {files} file(s) at {}", dir.display());
+            }
+        }
+        Err(err) => println!("! history: cannot resolve the history directory: {err:#}"),
+    }
+}
+
+fn count_jsonl_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn check_claude() {
@@ -241,5 +277,24 @@ mod tests {
         assert!(!version_below((2, 1, 227)));
         assert!(!version_below((2, 1, 261)));
         assert!(!version_below((3, 0, 0)));
+    }
+
+    #[test]
+    fn counts_jsonl_files_and_ignores_others() {
+        let dir = std::env::temp_dir().join(format!("ccm-doctor-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("decisions.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join("circuit-123.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join(".lock"), "1\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert_eq!(count_jsonl_files(&dir), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_history_directory_counts_zero() {
+        let dir = std::env::temp_dir().join("ccm-doctor-history-missing-dir");
+        assert_eq!(count_jsonl_files(&dir), 0);
     }
 }
