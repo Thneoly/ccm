@@ -277,9 +277,12 @@ pub fn translate_request(
         );
     }
 
-    let wants_stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    if let Some(v) = obj.get("stream") {
-        out.insert("stream".into(), v.clone());
+    // Non-boolean `stream` values are dropped entirely (by-construction
+    // policy); wants_stream is only true for an explicit boolean.
+    let stream_flag = obj.get("stream").and_then(|v| v.as_bool());
+    let wants_stream = stream_flag.unwrap_or(false);
+    if let Some(v) = stream_flag {
+        out.insert("stream".into(), json!(v));
     }
     if wants_stream {
         out.insert("stream_options".into(), json!({"include_usage": true}));
@@ -296,10 +299,8 @@ pub fn translate_request(
                 if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
                     function.insert("description".into(), json!(desc));
                 }
-                function.insert(
-                    "parameters".into(),
-                    t.get("input_schema").cloned().unwrap_or_else(|| json!({})),
-                );
+                let parameters = t.get("input_schema").cloned().unwrap_or_else(|| json!({}));
+                function.insert("parameters".into(), strip_schema_cache_control(parameters));
                 Some(json!({"type": "function", "function": Value::Object(function)}))
             })
             .collect();
@@ -338,6 +339,19 @@ pub fn translate_request(
         body: Value::Object(out),
         wants_stream,
     })
+}
+
+/// Strip a top-level `cache_control` from a cloned `input_schema`. The
+/// schema is the only raw clone in the tools mapping (everything else is
+/// rebuilt field-by-field), so a schema-level `cache_control` would
+/// otherwise be the one leak past the drop-by-construction policy.
+fn strip_schema_cache_control(mut schema: Value) -> Value {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.remove("cache_control").is_some() {
+            warn_dropped(DropCategory::CacheControl);
+        }
+    }
+    schema
 }
 
 /// Merge adjacent messages that ended up with the same role and plain string
@@ -683,20 +697,37 @@ impl SseTranslator {
         self.drain_frames()
     }
 
-    /// Close the stream. A clean EOF (empty or line-endings-only buffer)
-    /// produces the closing event sequence; a torn half-frame produces the
-    /// `error` event instead of a fake clean close.
+    /// Close the stream. WHATWG SSE dispatches a complete final line at
+    /// EOF: a buffer whose lines are all terminated is a complete frame
+    /// that merely lacked the blank separator (e.g. `data: [DONE]\n`).
+    /// Only an unterminated partial line is a torn stream, which produces
+    /// the `error` event instead of a fake clean close.
     pub fn finish(&mut self) -> Result<Vec<SseEvent>, TranslateError> {
         if self.errored || self.closed {
             return Ok(Vec::new());
         }
-        let torn = self.buf.iter().any(|b| !matches!(b, b'\n' | b'\r'));
-        self.buf.clear();
-        if torn {
+        let ends_with_newline = self.buf.ends_with(b"\n");
+        let frame: Vec<u8> = std::mem::take(&mut self.buf);
+        let mut events = Vec::new();
+        if ends_with_newline {
+            // dispatch the complete trailing frame (strip its line endings)
+            let mut end = frame.len();
+            while end > 0 && matches!(frame[end - 1], b'\n' | b'\r') {
+                end -= 1;
+            }
+            if end > 0 {
+                events = self.process_frame(&frame[..end]);
+            }
+        } else if frame.iter().any(|b| !matches!(b, b'\n' | b'\r')) {
+            // unterminated partial line: the stream was cut mid-frame
             self.errored = true;
             return Ok(vec![error_event("stream ended mid-frame")]);
         }
-        Ok(self.close_stream())
+        if self.errored || self.closed {
+            return Ok(events);
+        }
+        events.extend(self.close_stream());
+        Ok(events)
     }
 
     /// Split the buffer on empty lines and process each complete frame.
@@ -1717,5 +1748,172 @@ mod tests {
             .find(|v| v["type"] == "message_delta")
             .unwrap();
         assert_eq!(delta["usage"]["input_tokens"], 999);
+    }
+
+    // 21. cache_control nested inside a tool input_schema is stripped (the
+    //     one raw-clone path in the tools mapping)
+    #[test]
+    fn nested_cache_control_in_input_schema_is_stripped() {
+        let req = translate_request(
+            &json!({
+                "max_tokens": 10,
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "w",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                }],
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "m",
+        )
+        .unwrap();
+        assert!(!req.body.to_string().contains("cache_control"));
+        assert_eq!(req.body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            req.body["tools"][0]["function"]["parameters"]["properties"]["city"],
+            json!({"type": "string"})
+        );
+    }
+
+    // 22. non-boolean stream values are dropped entirely
+    #[test]
+    fn non_bool_stream_value_is_dropped() {
+        let req = translate_request(
+            &json!({
+                "max_tokens": 10, "stream": "true",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "m",
+        )
+        .unwrap();
+        assert!(!req.wants_stream);
+        assert!(req.body.get("stream").is_none());
+        assert!(req.body.get("stream_options").is_none());
+    }
+
+    // 23. reasoning_content deltas (DeepSeek-style) produce no events, leak
+    //     nothing, and do not disturb the sequence
+    #[test]
+    fn reasoning_content_deltas_are_ignored() {
+        let f1 = json!({"id": "r1", "choices": [{"index": 0,
+                        "delta": {"role": "assistant", "reasoning_content": "thinking hard"}}]});
+        let f2 = json!({"id": "r1", "choices": [{"index": 0,
+                        "delta": {"content": "answer", "reasoning_content": "more"}}]});
+        let f3 = json!({"id": "r1",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+        let mut t = SseTranslator::new("up");
+        let mut events = t
+            .feed(format!("data: {f1}\n\ndata: {f2}\n\ndata: {f3}\n\n").as_bytes())
+            .unwrap();
+        events.extend(t.feed(b"data: [DONE]\n\n").unwrap());
+        assert_eq!(
+            event_names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(text_concat(&events), "answer");
+        assert!(!events.iter().any(|e| e.data.contains("reasoning")));
+    }
+
+    // 24. text deltas arriving AFTER tool_call deltas still yield legal
+    //     ordering: the text block opens/closes first, tool blocks follow
+    #[test]
+    fn text_after_tool_call_deltas_keeps_block_order() {
+        let f1 = json!({"id": "m1", "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "type": "function",
+             "function": {"name": "alpha", "arguments": "{\"a\":1}"}}
+        ]}}]});
+        let f2 = json!({"id": "m1",
+                        "choices": [{"index": 0, "delta": {"content": "working"}}]});
+        let f3 = json!({"id": "m1",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]});
+        let mut t = SseTranslator::new("up");
+        let mut events = t
+            .feed(format!("data: {f1}\n\ndata: {f2}\n\ndata: {f3}\n\n").as_bytes())
+            .unwrap();
+        // tool block is not streamed live; the text block opens when text arrives
+        assert_eq!(
+            event_names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        events.extend(t.feed(b"data: [DONE]\n\n").unwrap());
+        assert_eq!(
+            event_names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let parsed = parse_all(&events);
+        assert_eq!(parsed[1]["index"], 0);
+        assert_eq!(parsed[1]["content_block"]["type"], "text");
+        assert_eq!(parsed[4]["index"], 1);
+        assert_eq!(parsed[4]["content_block"]["type"], "tool_use");
+        assert_eq!(parsed[7]["delta"]["stop_reason"], "tool_use");
+    }
+
+    // 25. WHATWG EOF dispatch: a complete trailing data line without the
+    //     blank separator still dispatches; an unterminated partial line is
+    //     torn and produces the error event
+    #[test]
+    fn trailing_complete_line_dispatches_at_eof() {
+        let f1 = json!({"id": "chatcmpl-e1", "choices": [{"index": 0,
+                        "delta": {"content": "hi"}, "finish_reason": "stop"}]});
+        // the stream ends right after "data: [DONE]\n" - no trailing blank line
+        let mut t = SseTranslator::new("up");
+        let mut events = t
+            .feed(format!("data: {f1}\n\ndata: [DONE]\n").as_bytes())
+            .unwrap();
+        // the first frame was dispatched by its separator; [DONE] is buffered
+        assert_eq!(
+            event_names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        events.extend(t.finish().unwrap());
+        assert_eq!(
+            event_names(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+
+        // torn: the final line was cut mid-frame with no terminator
+        let mut torn = SseTranslator::new("up");
+        let events = torn
+            .feed(b"data: {\"id\": \"x\", \"choices\": [{\"inde")
+            .unwrap();
+        let events = [events, torn.finish().unwrap()].concat();
+        assert_eq!(event_names(&events), ["error"]);
+        assert!(torn.finish().unwrap().is_empty());
     }
 }
