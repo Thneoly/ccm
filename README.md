@@ -44,6 +44,8 @@ macOS    ~/.local/bin
 
 Override the destination with `-Destination <dir>` (PowerShell) or `CCM_INSTALL_DIR=<dir>` (sh). Re-running the script upgrades an existing installation in place.
 
+macOS is unverified for v0.3 — there is no macOS host to run the release gate on. See [Supported release platforms](#supported-release-platforms).
+
 ## Quick start
 
 ```bash
@@ -522,7 +524,7 @@ Routing Decision Trace closes feature development for v0.3. No additional select
 The remaining v0.3 work is reliability-focused:
 
 ```text
-run release verification on Windows / Linux / macOS
+run release verification on Windows / Linux
 re-enable CI and make all checks green
 release packaging and documentation cleanup
 ```
@@ -620,22 +622,25 @@ The repository pins the stable Rust channel and installs `rustfmt` and `clippy` 
 The v0.3 release target is:
 
 ```text
-Windows  x86_64-pc-windows-msvc
-Linux    x86_64-unknown-linux-gnu
-macOS    aarch64-apple-darwin / x86_64-apple-darwin
+Windows  x86_64-pc-windows-msvc     verified 2026-10-02
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
 ```
+
+macOS is not claimed as supported for v0.3: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
 
 Credential storage is configured per target:
 
 ```text
 Windows → Windows Credential Manager
-macOS   → Apple Keychain
 Linux   → Linux keyutils + synchronous Secret Service
+macOS   → Apple Keychain (untested; macOS is not a verified v0.3 platform)
 ```
+
+The Linux keyring backends compile and the credential resolution path is tested with environment credentials; interactive `ccm auth set` against a desktop Secret Service has not been exercised.
 
 Headless environments can bypass the native keyring with `CCM_<PROVIDER>_API_KEY`.
 
-The cross-platform scripts and platform-specific dependency configuration are in place. A release is not considered verified until these scripts have actually passed on Windows, Linux, and macOS.
+The cross-platform scripts and platform-specific dependency configuration are in place. A release is not considered verified until these scripts have actually passed on Windows and Linux.
 
 ## Development
 

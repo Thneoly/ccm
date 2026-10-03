@@ -59,6 +59,8 @@ CCM_INSTALL_DIR=/usr/local/bin ./scripts/install.sh
 
 默认装到 `~/.local/bin`（请确认该目录在你的 PATH 中），同样先构建、后用 `ccm --version` 验证。
 
+**注意：v0.3 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
+
 ### 手动构建
 
 ```powershell
@@ -555,7 +557,7 @@ keyring 条目：service 名固定为 `ccm`，条目名 = provider 名。Windows
 
 ### 7.4 无头场景（CI / 容器）
 
-`ccm auth set` 是交互式（隐藏输入），且 keyring 依赖系统凭据服务（无头 Linux 上的可用性待确认）。无头环境建议直接用环境变量：
+`ccm auth set` 是交互式（隐藏输入），且 keyring 依赖系统凭据服务——Linux 的 keyring 路径只验证了编译（WSL2 无 Secret Service，存储未实测），桌面 Linux 上的实际可用性未验证。无头/WSL 环境建议直接用环境变量：
 
 ```powershell
 $env:CCM_ZAI_API_KEY = "sk-..."

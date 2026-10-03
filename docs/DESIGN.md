@@ -547,14 +547,16 @@ Coverage includes:
 
 ## 16. Cross-platform Release Target
 
-Target platforms:
+Target platforms and v0.3 claim status:
 
 ```text
-Windows  x86_64-pc-windows-msvc
-Linux    x86_64-unknown-linux-gnu
-macOS    aarch64-apple-darwin
-macOS    x86_64-apple-darwin
+Windows  x86_64-pc-windows-msvc     verified 2026-10-02
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
+macOS    aarch64-apple-darwin       not claimed for v0.3 (no host to verify)
+macOS    x86_64-apple-darwin        not claimed for v0.3 (no host to verify)
 ```
+
+See `docs/V0.3_PLAN.md` §3 for the decision record and macOS re-entry criteria.
 
 Repository verification scripts:
 
