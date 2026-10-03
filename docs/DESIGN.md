@@ -112,23 +112,33 @@ A Provider describes endpoint/protocol/authentication behavior.
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
 auth = "x-api-key"
+
+[providers.deepseek]
+kind = "openai-compatible"
+base_url = "https://api.deepseek.com"
 ```
 
 Current provider kinds:
 
-- `anthropic`
-- `anthropic-compatible`
+- `anthropic` — native Anthropic `/v1/messages` upstream
+- `anthropic-compatible` — Anthropic-protocol gateway upstream
+- `openai-compatible` — OpenAI `chat/completions` upstream; CCM translates
+  the Anthropic client protocol both ways (v0.4 M2)
 
 Current authentication styles:
 
 - `x-api-key`
 - `bearer`
 
+`auth` may be omitted; the default resolves by kind: `x-api-key` for
+`anthropic` and `anthropic-compatible`, `bearer` for `openai-compatible`.
+An explicit `auth` always wins.
+
 Important invariant:
 
 > Exactly one upstream credential header is injected by CCM.
 
-CCM strips inbound `x-api-key` and `Authorization` before forwarding and then injects the configured provider credential.
+CCM strips inbound `x-api-key` and `Authorization` before forwarding and then injects the configured provider credential. For `openai-compatible` providers, the inbound `anthropic-version` header is also stripped (it is meaningless upstream).
 
 ### Model
 
@@ -545,6 +555,18 @@ Coverage includes:
 - weighted routing
 - Routing Decision Trace
 
+The openai-compatible translation contract has its own Mock Provider
+integration test (v0.4):
+
+```text
+mock_openai_provider_integration_covers_translation_contract
+```
+
+Coverage includes the translated upstream body and headers, streaming
+translation end to end, mixed-protocol 429 fallback, terminal error body
+translation, committed-stream failure (error event, no mid-stream
+failover), and HALF_OPEN probe release on translate failure.
+
 ## 16. Cross-platform Release Target
 
 Target platforms and v0.3 claim status:
@@ -577,21 +599,24 @@ clippy
 
 ## 17. v0.3 Non-goals
 
-Do not add these before v0.3 release:
+v0.3 shipped without these; the list records what was intentionally out of
+scope then and where each item now stands:
 
-- additional selection strategies
-- OpenAI protocol translation
-- Codex/Aider/OpenCode native integrations
-- persistent metrics database
-- persistent decision trace/replay store
-- Prometheus exporter
-- Web UI
-- distributed CCM
-- remote CCM control plane
-- adaptive/self-learning routing
-- real-time token billing
-- provider discovery
-- mid-stream failover
+- additional selection strategies (still out of scope)
+- ~~OpenAI protocol translation~~ — delivered in v0.4 as the
+  `openai-compatible` provider kind (`src/translate.rs` + proxy wiring);
+  see §4 and the v0.4 plan
+- Codex/Aider/OpenCode native integrations (v0.4+ scope)
+- persistent metrics database (still out of scope)
+- persistent decision trace/replay store (still out of scope)
+- Prometheus exporter (still out of scope)
+- Web UI (still out of scope)
+- distributed CCM (still out of scope)
+- remote CCM control plane (still out of scope)
+- adaptive/self-learning routing (still out of scope)
+- real-time token billing (still out of scope)
+- provider discovery (still out of scope)
+- mid-stream failover (permanent non-goal, invariant 5)
 
 ## 18. Known Design Debt
 
@@ -656,3 +681,12 @@ Do not change these without an explicit design decision:
 9. `ccm use` is persisted state.
 10. v0.3 routing feature set is frozen.
 11. The proxy refuses non-loopback bind addresses in v0.3.
+
+Note on the openai-compatible translation (v0.4): translation is an
+upstream-protocol concern only and does not loosen invariants 5, 6, or 7.
+The commit point remains the upstream response headers; after that a
+streaming translation failure produces the terminal Anthropic `error`
+event and body end, never a mid-stream failover (5). The SSE translator
+transforms chunk-by-chunk with a 1 MiB per-frame cap and never buffers the
+whole stream (6). Exactly one credential header — resolved per kind — is
+injected upstream (7).

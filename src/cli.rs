@@ -60,8 +60,10 @@ pub enum AddCommand {
         base_url: Option<String>,
         #[arg(long)]
         kind: Option<String>,
-        #[arg(long, default_value = "x-api-key")]
-        auth: String,
+        // No CLI default: omitting --auth stores None so the per-kind default
+        // applies (x-api-key for anthropic kinds, bearer for openai-compatible).
+        #[arg(long)]
+        auth: Option<String>,
     },
     Model {
         name: String,

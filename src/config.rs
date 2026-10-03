@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -39,7 +44,7 @@ impl AppConfig {
             Provider {
                 kind: ProviderKind::Anthropic,
                 base_url: "https://api.anthropic.com".to_string(),
-                auth: ProviderAuth::XApiKey,
+                auth: Some(ProviderAuth::XApiKey),
             },
         );
         providers.insert(
@@ -47,7 +52,7 @@ impl AppConfig {
             Provider {
                 kind: ProviderKind::AnthropicCompatible,
                 base_url: "https://api.z.ai/api/anthropic".to_string(),
-                auth: ProviderAuth::XApiKey,
+                auth: Some(ProviderAuth::XApiKey),
             },
         );
 
@@ -172,12 +177,12 @@ impl AppConfig {
     }
 
     pub fn add_route(&mut self, name: String, route: Route) -> Result<()> {
-        self.validate_route(&route)?;
+        self.validate_route(&name, &route)?;
         self.routes.insert(name, route);
         Ok(())
     }
 
-    fn validate_route(&self, route: &Route) -> Result<()> {
+    fn validate_route(&self, name: &str, route: &Route) -> Result<()> {
         if !self.models.contains_key(&route.primary) {
             bail!("unknown primary model `{}`", route.primary);
         }
@@ -215,7 +220,55 @@ impl AppConfig {
                 bail!("circuit breaker open_ms must be greater than 0");
             }
         }
+
+        self.warn_if_mixed_protocol(name, route);
         Ok(())
+    }
+
+    /// Non-blocking warning for routes whose candidates span both
+    /// anthropic-protocol and openai-compatible providers. Such routes work
+    /// (fallback is status-code based), but prompt caching and extended
+    /// thinking are lost on the openai-compatible candidates. Printed once
+    /// per route name per process because `resolve_route` revalidates every
+    /// proxied request.
+    fn warn_if_mixed_protocol(&self, name: &str, route: &Route) {
+        let candidates = std::iter::once(&route.primary)
+            .chain(route.fallback.iter())
+            .filter_map(|model_name| self.candidate_kind(model_name))
+            .collect::<Vec<_>>();
+        let has_openai = candidates
+            .iter()
+            .any(|(_, kind)| matches!(kind, ProviderKind::OpenAICompatible));
+        let has_anthropic = candidates
+            .iter()
+            .any(|(_, kind)| !matches!(kind, ProviderKind::OpenAICompatible));
+        if !has_openai || !has_anthropic {
+            return;
+        }
+        let openai_models = candidates
+            .iter()
+            .filter(|(_, kind)| matches!(kind, ProviderKind::OpenAICompatible))
+            .map(|(model, _)| *model)
+            .collect::<Vec<_>>()
+            .join(", ");
+        static WARNED_ROUTES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let warned = WARNED_ROUTES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut warned = warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.insert(name.to_string()) {
+            eprintln!(
+                "ccm: warning: route `{name}` mixes anthropic-protocol and openai-compatible providers; prompt caching and extended thinking are lost on the openai-compatible candidates ({openai_models})"
+            );
+        }
+    }
+
+    /// (model alias, provider kind) for a route candidate.
+    fn candidate_kind<'a>(&self, model_name: &'a str) -> Option<(&'a str, ProviderKind)> {
+        self.models
+            .get(model_name)
+            .and_then(|model| self.providers.get(&model.provider))
+            .map(|provider| (model_name, provider.kind))
     }
 
     pub fn resolve_target(&self, target: &str) -> Result<String> {
@@ -239,7 +292,7 @@ impl AppConfig {
 
     pub fn resolve_route(&self, target: &str) -> Result<ResolvedRoute> {
         if let Some(route) = self.routes.get(target) {
-            self.validate_route(route)?;
+            self.validate_route(target, route)?;
             return Ok(ResolvedRoute {
                 target: target.to_string(),
                 primary: route.primary.clone(),
@@ -330,5 +383,41 @@ base_url = "https://api.anthropic.com"
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mixed_protocol_route_validates_with_non_blocking_warning() {
+        let mut config = AppConfig::starter();
+        config.add_provider(
+            "deepseek".to_string(),
+            Provider {
+                kind: ProviderKind::OpenAICompatible,
+                base_url: "https://api.deepseek.com".to_string(),
+                auth: None,
+            },
+        );
+        config
+            .add_model(
+                "deepseek-chat".to_string(),
+                Model {
+                    provider: "deepseek".to_string(),
+                    model_id: "deepseek-chat".to_string(),
+                    routing: ModelRouting::default(),
+                },
+            )
+            .unwrap();
+        // Mixed-protocol routes are legal: the warning is non-blocking and
+        // prints once per process (stderr is not asserted here).
+        config
+            .add_route(
+                "mixed".to_string(),
+                Route {
+                    primary: "claude".to_string(),
+                    fallback: vec!["deepseek-chat".to_string()],
+                    policy: RoutePolicy::default(),
+                },
+            )
+            .unwrap();
+        assert!(config.routes.contains_key("mixed"));
     }
 }

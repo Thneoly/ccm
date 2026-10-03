@@ -19,7 +19,7 @@ pub fn run_claude(config: &AppConfig, model_name: &str) -> Result<()> {
         provider.base_url.trim_end_matches('/'),
         &token,
         &model.model_id,
-        provider.auth,
+        provider.resolved_auth(),
     )
 }
 

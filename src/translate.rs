@@ -3,14 +3,12 @@
 //! Pure functions plus an explicit SSE state machine translating an OpenAI
 //! `chat/completions` chunk stream into an Anthropic `/v1/messages` event
 //! stream. No async, no IO, no tokio, and zero dependencies on the rest of
-//! the crate: `serde_json` and `std` only. The module is not wired into the
-//! proxy until M2, so it is exercised only by tests for now.
+//! the crate: `serde_json` and `std` only. The proxy wiring lives in
+//! `src/proxy.rs`; this module stays pure and IO-free.
 //!
 //! Construction policy (honest default): translated requests are built
 //! field-by-field into a new object. Anything not explicitly listed in
 //! [`translate_request`] is dropped by construction, not passed through.
-
-#![allow(dead_code)] // wired into the proxy in M2; until then tests are the only caller
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,7 +113,21 @@ fn warn_dropped(category: DropCategory) {
 /// inbound Anthropic request.
 pub struct PreparedRequest {
     pub body: Value,
+    // Consumed by the module's tests and external callers of the engine; the
+    // proxy wiring parses the request-level flag once per request via
+    // [`request_wants_stream`] instead of per candidate.
+    #[allow(dead_code)]
     pub wants_stream: bool,
+}
+
+/// Request-level stream flag of an Anthropic request body: true only for an
+/// explicit boolean `"stream": true`. The proxy parses this once per request,
+/// before candidate iteration.
+pub fn request_wants_stream(anthropic: &Value) -> bool {
+    anthropic
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Translate an Anthropic `/v1/messages` request body into an OpenAI
@@ -279,9 +291,8 @@ pub fn translate_request(
 
     // Non-boolean `stream` values are dropped entirely (by-construction
     // policy); wants_stream is only true for an explicit boolean.
-    let stream_flag = obj.get("stream").and_then(|v| v.as_bool());
-    let wants_stream = stream_flag.unwrap_or(false);
-    if let Some(v) = stream_flag {
+    let wants_stream = request_wants_stream(anthropic);
+    if let Some(v) = obj.get("stream").and_then(|v| v.as_bool()) {
         out.insert("stream".into(), json!(v));
     }
     if wants_stream {
@@ -639,6 +650,13 @@ fn raw_fragment(value: &Value) -> String {
 pub struct SseEvent {
     pub event: String,
     pub data: String,
+}
+
+impl SseEvent {
+    /// Wire format of this event: `event: <name>\ndata: <json>\n\n`.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        format!("event: {}\ndata: {}\n\n", self.event, self.data).into_bytes()
+    }
 }
 
 /// An accumulated tool_call: id/name from first sighting, argument fragments
@@ -1036,8 +1054,9 @@ fn sse(event: &str, data: Value) -> SseEvent {
 }
 
 /// Terminal `error` event for mid-stream translation failures. The message
-/// continues with the failure detail.
-fn error_event(detail: &str) -> SseEvent {
+/// continues with the failure detail. Public so the proxy wiring can emit the
+/// same envelope for stream wrapper failures (e.g. the frame cap).
+pub fn error_event(detail: &str) -> SseEvent {
     sse(
         "error",
         json!({

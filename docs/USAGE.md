@@ -155,8 +155,8 @@ ccm add model glm --provider zai --model-id glm-5.3 --cost-weight 0.25 --quality
 | Flag | 取值 | 省略时 |
 |---|---|---|
 | `--base-url` | 网关地址 | 进入交互提示 `Base URL:`（空输入报错） |
-| `--kind` | `anthropic` / `anthropic-compatible` / `compatible`（不分大小写） | 交互提示 `Kind (anthropic / anthropic-compatible):` |
-| `--auth` | `x-api-key`（别名 `x_api_key` / `apikey` / `api-key`）或 `bearer`（别名 `authorization`） | 默认 `x-api-key` |
+| `--kind` | `anthropic` / `anthropic-compatible` / `compatible` / `openai-compatible` / `openai`（不分大小写） | 交互提示 `Kind (anthropic / anthropic-compatible / openai-compatible):` |
+| `--auth` | `x-api-key`（别名 `x_api_key` / `apikey` / `api-key`）或 `bearer`（别名 `authorization`） | 按 kind 决定：anthropic 类默认 `x-api-key`，openai-compatible 默认 `bearer` |
 
 `ccm add model` 参数：`--provider`（必须指向已存在的 provider）、`--model-id`（省略则交互提示）；`--cost-weight` / `--quality-weight` 默认各 `1.0`（语义见 5.3）。
 
@@ -199,7 +199,7 @@ For a full authenticated model check, run `ccm health glm`.
 - 刚 `init` 完（current 还是 `claude` 且没存 anthropic key）时，凭据行会是：
   `✗ credential: missing (set CCM_ANTHROPIC_API_KEY or run `ccm auth set anthropic`)`
 
-`ccm health <target>` 发一条真实的 `/v1/messages` 请求（`max_tokens: 1`、内容 `ping`），验证鉴权和模型名：
+`ccm health <target>` 发一条真实的最小请求（`max_tokens: 1`、内容 `ping`；anthropic 类走 `/v1/messages`，openai-compatible 类走 `/v1/chat/completions`），验证鉴权和模型名：
 
 ```text
 healthy: zai / glm-5.3
@@ -442,6 +442,45 @@ fallback 还要求同时满足"还有下一个候选 **且** 还有剩余尝试�
 
 **陷阱**：不在 `fallback_on` 里的状态码（包括 500）按"终态成功"处理——响应透传给客户端，且会**重置熔断计数**。metrics 里仍计为 http_errors（非 2xx），429 另计 rate_limited，但熔断视角它是"成功"。想让 500 也触发 fallback，加进 `--fallback-on` 即可。
 
+### 5.5 OpenAI 兼容网关（openai-compatible）
+
+v0.4 起 provider 有第三种 kind：`openai-compatible`，面向只提供 OpenAI `chat/completions` 协议的上游（DeepSeek 及各类 OpenAI 兼容网关）。客户端侧（Claude Code）仍然是 Anthropic `/v1/messages` 协议——ccm 在代理内部做双向协议翻译，对 Claude Code 完全透明。
+
+以 DeepSeek 为例：
+
+```powershell
+ccm auth set deepseek
+ccm add provider deepseek --base-url https://api.deepseek.com --kind openai-compatible
+ccm add model deepseek-chat --provider deepseek --model-id deepseek-chat --cost-weight 0.1 --quality-weight 0.8
+ccm use deepseek-chat
+```
+
+- `--kind` 也接受别名 `openai`；
+- 省略 `--auth` 时按 kind 取默认：openai-compatible → `bearer`（`Authorization: Bearer ...`）；anthropic 类仍是 `x-api-key`（显式传 `--auth` 永远优先）；
+- 上游地址固定是 `base_url + /v1/chat/completions`，所以 `base_url` 填网关根地址即可（末尾 `/` 会被去掉）。
+
+**混合协议路由**是合法的：一条 fallback 链里同时有 anthropic 类和 openai 类候选，fallback 按状态码判断，与协议无关。例：
+
+```toml
+[routes.budget-route]
+primary = "deepseek-chat"
+fallback = ["glm"]
+```
+
+校验到混合协议路由时 ccm 会打一条**非阻断**警告（每条路由每进程一次），提醒 openai 候选上会丢 prompt cache 和 extended thinking。
+
+**明确的降级清单**（只影响 openai-compatible 候选；anthropic 类候选不受影响）：
+
+| 项 | 行为 |
+|---|---|
+| prompt cache | `cache_control` 被丢弃，无 prompt-cache 收益（详见 FAQ"为什么经 openai 网关没有缓存折扣"） |
+| extended thinking | `thinking` 字段整体丢弃，无扩展思考；`thinking` 内容块也不回传 |
+| 长度/预算参数 | 只透传 `max_tokens`（`budget_tokens` 随 thinking 丢弃）；`temperature` / `top_p` 照常透传，`top_k` 丢弃，`stop_sequences` 截断为 4 条（OpenAI 上限） |
+| 推理内容 | 上游 `reasoning_content`（DeepSeek R 系风格）被丢弃，不会回传给客户端 |
+| usage / 计费 | 上报的缓存命中 tokens（`cached_tokens` / `prompt_cache_hit_tokens`）翻译为 `cache_read_input_tokens` 并从 `input_tokens` 中扣除；`cache_creation_input_tokens` 无 OpenAI 对应物，不回填 |
+
+错误与流为语义与 anthropic 类一致：上游错误体翻译成 Anthropic 错误信封（状态码保留）；已开始流式返回后翻译失败（如上游断流、坏帧），在已提交的流上发一个 `error` 事件然后结束响应体——**不会中途换模型**（v0.3 的"不中途切换"不变量继续生效）。
+
 ---
 
 ## 6. 观察与诊断
@@ -595,6 +634,9 @@ refusing to bind non-loopback address 0.0.0.0: the CCM control API is unauthenti
 **遇到 429 / 超时后，去哪确认有没有降级？**
 三处：代理 stderr 的 `ccm route=... result=... action=fallback` 日志；`GET /_ccm/decisions`（每次请求的尝试序列）；`GET /_ccm/circuits` + `GET /_ccm/metrics`（谁被熔断、成功率如何）。
 
+**为什么经 openai 网关（openai-compatible）没有缓存折扣？**
+Anthropic 的 prompt cache 靠请求里的 `cache_control` 标记，OpenAI `chat/completions` 协议没有这个字段——翻译时只能丢弃（ccm 会警告一次），所以上游永远不会为你建立 prompt cache，每次都是全价 input。DeepSeek 这类上游自建的隐式缓存命中会在 usage 里报 `cached_tokens` / `prompt_cache_hit_tokens`，ccm 把它翻译成 Anthropic 的 `cache_read_input_tokens` 并从 `input_tokens` 里扣除——账单上那部分通常按缓存读取价计，但折扣幅度由上游决定，和 Anthropic 的 5 分钟/1 小时 cache 写入定价是两回事。想要 Anthropic 式缓存收益，请用 anthropic 类 provider 直连或走支持 Anthropic 协议的网关。
+
 **MiniMax 模型怎么选？**
 实测 `MiniMax-M3` 可用（`ccm health minimax` → `healthy: minimax / MiniMax-M3`）。注意官方菜单里 `MiniMax-M3.1-Flash-Preview` **强制开启 thinking**——请求 `thinking.type=disabled` 会返回 400，而 Claude Code 常会尝试关 thinking，所以不建议配成主力；M2 系（M2.1/M2.5/M2.7 等）同样无法关闭 thinking，且 `top_k`、`stop_sequences` 会被忽略（M2 上下文 204k）。
 
@@ -623,7 +665,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | 命令 | 作用 | 关键 flag（默认值） |
 |---|---|---|
 | `ccm init` | 初始化 config.toml + state.toml | `--force` |
-| `ccm add provider <name>` | 添加/覆盖 provider | `--base-url`、`--kind`、`--auth`（`x-api-key`） |
+| `ccm add provider <name>` | 添加/覆盖 provider | `--base-url`、`--kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`）、`--auth`（按 kind 默认：anthropic 类 `x-api-key`，openai 类 `bearer`） |
 | `ccm add model <name>` | 添加模型 | `--provider`、`--model-id`、`--cost-weight`（1.0）、`--quality-weight`（1.0） |
 | `ccm add route <name>` | 添加路由 | `--primary`、`--fallback`、`--selection`（`ordered`）、四个权重（0.4/0.2/0.2/0.2）、`--header-timeout-ms`（30000）、`--fallback-on`（429,502,503,504）、`--max-attempts`（3）、`--backoff-ms`（200）、`--circuit-enabled`（true，需显式传值）、`--failure-threshold`（3）、`--circuit-open-ms`（30000） |
 | `ccm auth set <provider>` | 交互式存 key 进 keyring | — |

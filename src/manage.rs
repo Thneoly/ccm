@@ -19,9 +19,15 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             auth,
         } => {
             let base_url = required(base_url, "Base URL")?;
-            let kind = required(kind, "Kind (anthropic / anthropic-compatible)")?;
+            let kind = required(
+                kind,
+                "Kind (anthropic / anthropic-compatible / openai-compatible)",
+            )?;
             let kind = parse_kind(&kind)?;
-            let auth = parse_auth(&auth)?;
+            let auth = match auth {
+                Some(value) => Some(parse_auth(&value)?),
+                None => None,
+            };
             config.add_provider(
                 name.clone(),
                 Provider {
@@ -177,6 +183,7 @@ fn parse_kind(value: &str) -> Result<ProviderKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "anthropic" => Ok(ProviderKind::Anthropic),
         "anthropic-compatible" | "compatible" => Ok(ProviderKind::AnthropicCompatible),
+        "openai-compatible" | "openai" => Ok(ProviderKind::OpenAICompatible),
         other => bail!("unsupported provider kind `{other}`"),
     }
 }

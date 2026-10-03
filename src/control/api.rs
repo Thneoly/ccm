@@ -107,6 +107,7 @@ pub(crate) struct StatusView {
     pub(crate) primary: String,
     pub(crate) model_id: String,
     pub(crate) provider: String,
+    pub(crate) kind: String,
     pub(crate) fallback: Vec<String>,
     pub(crate) policy: PolicyView,
 }
@@ -116,6 +117,7 @@ struct ModelView {
     name: String,
     model_id: String,
     provider: String,
+    kind: String,
     cost_weight: f64,
     quality_weight: f64,
 }
@@ -184,6 +186,7 @@ async fn control_models() -> impl IntoResponse {
                     name: name.clone(),
                     model_id: model.model_id.clone(),
                     provider: model.provider.clone(),
+                    kind: provider_kind_name(&config, &model.provider),
                     cost_weight: model.routing.cost_weight,
                     quality_weight: model.routing.quality_weight,
                 })
@@ -334,7 +337,18 @@ pub(crate) fn status_view(config: &AppConfig, target: &str) -> Result<StatusView
         primary: route.primary,
         model_id: model.model_id.clone(),
         provider: model.provider.clone(),
+        kind: provider_kind_name(config, &model.provider),
         fallback: route.fallback,
         policy: PolicyView::from(&route.policy),
     })
+}
+
+/// Provider kind name for the JSON views; `unknown` keeps the view additive
+/// when a model references a provider that is not configured.
+fn provider_kind_name(config: &AppConfig, provider_name: &str) -> String {
+    config
+        .providers
+        .get(provider_name)
+        .map(|provider| provider.kind.as_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }

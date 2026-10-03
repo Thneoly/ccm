@@ -17,7 +17,7 @@ For implementation continuation and release stabilization, read:
 
 Current status:
 
-> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 planning complete, no v0.4 code yet.
+> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 in progress: the openai-compatible provider kind with upstream protocol translation is implemented.
 
 New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
 
@@ -106,6 +106,10 @@ auth = "x-api-key"
 kind = "anthropic-compatible"
 base_url = "https://gateway.example.com"
 auth = "bearer"
+
+[providers.deepseek]
+kind = "openai-compatible"
+base_url = "https://api.deepseek.com"
 ```
 
 Supported values:
@@ -115,7 +119,7 @@ x-api-key
 bearer
 ```
 
-If an older provider entry omits `auth`, CCM defaults to `x-api-key`.
+If a provider entry omits `auth`, the default is resolved by kind: `x-api-key` for `anthropic` and `anthropic-compatible` (unchanged), `bearer` for `openai-compatible`. An explicit `auth` always wins.
 
 For direct Claude Code launches, CCM also isolates the environment: `x-api-key` sets only `ANTHROPIC_API_KEY`, while `bearer` sets only `ANTHROPIC_AUTH_TOKEN`. This avoids accidentally inheriting both authentication variables from the parent shell.
 
@@ -126,6 +130,10 @@ ccm add provider gateway \
   --kind anthropic-compatible \
   --base-url https://gateway.example.com \
   --auth bearer
+
+ccm add provider deepseek \
+  --kind openai-compatible \
+  --base-url https://api.deepseek.com
 ```
 
 ## Model routing metadata
@@ -510,12 +518,25 @@ weighted candidate selection
 Routing Decision Trace
 ```
 
-The test isolates configuration with `CCM_HOME` and credentials with `CCM_<PROVIDER>_API_KEY`, so it does not depend on a developer's real `~/.ccm` files or OS keyring.
+A second mock-provider test, `mock_openai_provider_integration_covers_translation_contract`, covers the openai-compatible translation contract:
 
-Run it with:
+```text
+translated upstream body (system message, tool mapping, no cache_control/thinking, stream_options)
+Authorization: Bearer on /v1/chat/completions
+Anthropic SSE translation end to end (message_start ... message_stop)
+mixed-protocol 429 fallback (openai primary -> anthropic fallback)
+terminal error body translation (status preserved)
+committed-stream failure -> error event, zero requests to the fallback (no mid-stream failover)
+HALF_OPEN probe release on translate failure
+```
+
+Both tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring.
+
+Run them with:
 
 ```bash
 cargo test mock_provider_integration_covers_v03_routing_contract -- --nocapture
+cargo test mock_openai_provider_integration_covers_translation_contract -- --nocapture
 ```
 
 ## v0.3 stabilization boundary
@@ -548,7 +569,9 @@ Then inside a Claude Code session started with `ccm run --proxy`:
 
 ```text
 ccm init [--force]
-ccm add provider <name> [--base-url URL] [--kind KIND] [--auth x-api-key|bearer]
+ccm add provider <name> [--base-url URL]
+  [--kind anthropic|anthropic-compatible|openai-compatible]
+  [--auth x-api-key|bearer]  (default resolves by kind)
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
   [--cost-weight N]
   [--quality-weight N]
@@ -674,9 +697,13 @@ GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-late
 - explainable candidate score control API
 - complete per-request Routing Decision Trace
 - localhost Mock Provider integration coverage for the v0.3 routing contract
+- `openai-compatible` provider kind: full upstream translation between the
+  Anthropic `/v1/messages` client protocol and the OpenAI
+  `chat/completions` upstream protocol (requests, streaming and
+  non-streaming responses, error bodies), including mixed-protocol routes
+  (anthropic and openai-compatible candidates in one fallback chain)
 - in-memory traces, metrics, decisions, and circuit-state control APIs
 - no mid-stream failover
-- no OpenAI protocol translation yet
 
 ## License
 
