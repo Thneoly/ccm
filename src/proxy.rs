@@ -70,6 +70,10 @@ pub(crate) struct ProxyState {
     /// inside `poll_next`/`Drop` on the response body, where awaiting is
     /// impossible.
     pub(crate) usage: Arc<Mutex<VecDeque<UsageRecord>>>,
+    /// Prometheus exporter state (v0.4 M7). `None` = `prometheus_enabled =
+    /// false` — the `/metrics` route is then not registered and every hook
+    /// above is a no-op, mirroring how a disabled `History` works.
+    pub(crate) prom: Option<Arc<crate::prometheus::PromState>>,
 }
 
 /// One client's runtime switch state. `requests` / `last_seen_ms` are usage
@@ -133,6 +137,12 @@ pub async fn serve(bind: &str) -> Result<()> {
         (History::disabled(), 1)
     };
 
+    // Pin the process-start gauge before the listener exists (v0.4 M7).
+    crate::prometheus::note_process_start();
+    let prom = observability
+        .prometheus_enabled
+        .then(|| Arc::new(crate::prometheus::PromState::new()));
+
     let state = ProxyState {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
@@ -146,6 +156,7 @@ pub async fn serve(bind: &str) -> Result<()> {
         usage: Arc::new(Mutex::new(VecDeque::with_capacity(
             crate::usage::USAGE_CAPACITY,
         ))),
+        prom,
     };
 
     // Periodic whole-state metric snapshots (v0.4 M5). Skipped while the
@@ -649,14 +660,18 @@ struct UsageContext {
     meta: UsageMeta,
     history: History,
     ring: Arc<Mutex<VecDeque<UsageRecord>>>,
+    /// Exporter hooks for the same finalize event (v0.4 M7): token counters
+    /// and accumulated cost. `None` = exporter disabled.
+    prom: Option<Arc<crate::prometheus::PromState>>,
 }
 
 impl UsageContext {
     /// Wrap a response-body stream with the usage scanner; `sse` selects
     /// line scanning (true) vs whole-body JSON scan (false). The record is
     /// emitted on stream end, transport error, or wrapper Drop (client
-    /// disconnect) — see [`UsageStream`]. Both the ring push and the
-    /// history enqueue are synchronous and non-blocking by design.
+    /// disconnect) — see [`UsageStream`]. The ring push, the history
+    /// enqueue, and the exporter bump are all synchronous and non-blocking
+    /// by design.
     fn wrap<E: Send + 'static>(
         &self,
         inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>,
@@ -665,6 +680,7 @@ impl UsageContext {
         let meta = self.meta.clone();
         let history = self.history.clone();
         let ring = Arc::clone(&self.ring);
+        let prom = self.prom.clone();
         UsageStream::new(inner, sse, meta, move |record| {
             {
                 let mut ring = ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -674,6 +690,16 @@ impl UsageContext {
                 ring.push_back(record.clone());
             }
             history.record_usage(&record);
+            if let Some(prom) = &prom {
+                prom.record_usage(
+                    &record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_read_tokens,
+                    record.cache_write_tokens,
+                    record.cost_usd,
+                );
+            }
         })
     }
 }
@@ -706,6 +732,7 @@ fn usage_context(
         },
         history: state.history.clone(),
         ring: Arc::clone(&state.usage),
+        prom: state.prom.clone(),
     })
 }
 
@@ -1331,6 +1358,9 @@ mod tests {
             usage: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
                 crate::usage::USAGE_CAPACITY,
             ))),
+            // Exporter on in the integration harness so /metrics and the
+            // request hooks are exercised by the wire-level tests.
+            prom: Some(Arc::new(crate::prometheus::PromState::new())),
         }
     }
 
@@ -2860,6 +2890,7 @@ model_id = "upstream-y"
             usage: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
                 crate::usage::USAGE_CAPACITY,
             ))),
+            prom: Some(Arc::new(crate::prometheus::PromState::new())),
         };
 
         let (primary_addr, primary, primary_task) = spawn_mock(MockBehavior::OkStream).await;
@@ -3128,6 +3159,125 @@ model_id = "upstream-y"
         body_text(response).await; // drain; still nothing to scan
         let records = state.usage.lock().unwrap();
         assert_eq!(records.len(), 2, "error passthrough captured no usage");
+
+        primary_task.abort();
+        fallback_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PRIMARY_API_KEY");
+        std::env::remove_var("CCM_FALLBACK_API_KEY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // v0.4 M7: the /metrics exposition over real HTTP — same listener as the
+    // control API, correct content type, and the hooks fired by forward()
+    // (requests_total, attempts_total, header-latency histogram, tokens,
+    // cost, circuit gauge) all land in the rendered text. Also pins the
+    // disabled path: a state without the exporter registers no /metrics
+    // route at all (404), matching `prometheus_enabled = false`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prometheus_exposition_integration_covers_hooks_and_route() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-prom-integration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PRIMARY_API_KEY", "primary-secret");
+        std::env::set_var("CCM_FALLBACK_API_KEY", "fallback-secret");
+
+        let (primary_addr, primary, primary_task) =
+            spawn_mock(MockBehavior::OkStreamWithUsage).await;
+        let (fallback_addr, fallback, fallback_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_integration_config(
+            &root,
+            &format!("http://{primary_addr}"),
+            &format!("http://{fallback_addr}"),
+            "ordered",
+            250,
+            3, // failure threshold high enough that two 429s never open it
+            50,
+        );
+        let state = integration_proxy_state();
+        let _ = &fallback;
+
+        // 1. one accepted stream: success everywhere, tokens + cost recorded
+        //    (the mock's usage is input 100 / output 7 / cache_read 40 /
+        //    cache_write 5 at the config's prices → 435.75 µUSD → 436).
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_stop"));
+
+        // 2. terminal failure: both candidates 429 → one error request
+        //    outcome, one rate_limited attempt per model.
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
+        *fallback.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        body_text(response).await;
+
+        // Serve the real router and scrape.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router_state = state.clone();
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, control_router(router_state))
+                .await
+                .unwrap();
+        });
+        let http = Client::new();
+        let response = http.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8"),
+            "the 0.0.4 text-format content type"
+        );
+        let text = response.text().await.unwrap();
+        assert!(text.contains("\nccm_up 1\n"));
+        assert!(text
+            .contains("ccm_proxy_requests_total{target=\"test-route\",outcome=\"success\"} 1\n"));
+        assert!(
+            text.contains("ccm_proxy_requests_total{target=\"test-route\",outcome=\"error\"} 1\n")
+        );
+        assert!(text.contains("ccm_attempts_total{model=\"primary\",outcome=\"success\"} 1\n"));
+        assert!(text.contains("ccm_attempts_total{model=\"primary\",outcome=\"rate_limited\"} 1\n"));
+        assert!(
+            text.contains("ccm_attempts_total{model=\"fallback\",outcome=\"rate_limited\"} 1\n")
+        );
+        // success + 429 samples on primary; only the 429 on fallback
+        assert!(text.contains("ccm_header_latency_seconds_count{model=\"primary\"} 2\n"));
+        assert!(text.contains("ccm_header_latency_seconds_count{model=\"fallback\"} 1\n"));
+        assert!(text.contains("ccm_decision_duration_seconds_count{target=\"test-route\"} 2\n"));
+        assert!(text.contains("ccm_tokens_total{model=\"primary\",kind=\"input\"} 100\n"));
+        assert!(text.contains("ccm_tokens_total{model=\"primary\",kind=\"cache_write\"} 5\n"));
+        assert!(text.contains("ccm_cost_micro_usd_total{model=\"primary\"} 436\n"));
+        assert!(text.contains("ccm_circuit_open{model=\"primary\"} 0\n"));
+        assert!(
+            text.contains("ccm_circuit_consecutive_failures{model=\"primary\"} 1\n"),
+            "one 429 counted, threshold 3 not reached"
+        );
+        assert!(text.contains("\nccm_history_dropped_total 0\n"));
+        router_task.abort();
+
+        // 3. disabled exporter: the route is not registered — 404, the
+        //    documented off state for `prometheus_enabled = false`.
+        let mut disabled = state.clone();
+        disabled.prom = None;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, control_router(disabled))
+                .await
+                .unwrap();
+        });
+        let response = http.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        router_task.abort();
 
         primary_task.abort();
         fallback_task.abort();

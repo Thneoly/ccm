@@ -21,7 +21,7 @@ use crate::{
     },
     route::{CircuitBreakerPolicy, RoutePolicy, SelectionWeights},
     routing::decision::{now_ms, AttemptTrace, RoutingDecision},
-    routing::metrics::{health_score, success_rate},
+    routing::metrics::{health_score, success_rate, ModelMetrics},
     routing::select::{candidate_score_view, selection_name},
 };
 
@@ -213,7 +213,7 @@ struct CircuitView {
 }
 
 pub(crate) fn control_router(state: ProxyState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/_ccm/status", get(control_status))
         .route("/_ccm/models", get(control_models))
@@ -227,8 +227,16 @@ pub(crate) fn control_router(state: ProxyState) -> Router {
         .route("/_ccm/cost", get(control_cost))
         .route("/_ccm/clients", get(control_clients))
         .route("/_ccm/switch/{target}", post(control_switch))
-        .route("/v1/messages", any(forward_messages))
-        .with_state(state)
+        .route("/v1/messages", any(forward_messages));
+    // The exporter route exists only when the exporter is on (v0.4 M7):
+    // `prometheus_enabled = false` removes `/metrics` from the listener
+    // entirely. It shares the ONE guarded listener — no second port
+    // (invariant 11).
+    let router = match state.prom {
+        Some(_) => router.route("/metrics", get(control_metrics_exposition)),
+        None => router,
+    };
+    router.with_state(state)
 }
 
 async fn health() -> &'static str {
@@ -362,6 +370,68 @@ async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetri
         .collect::<Vec<_>>();
     views.sort_by(|left, right| left.model.cmp(&right.model));
     Json(views)
+}
+
+/// `GET /metrics` — the Prometheus text exposition (v0.4 M7), hand-rendered
+/// from a snapshot of the exporter counters plus the runtime views the
+/// `/_ccm` endpoints serve (attempts derive from the same per-model metrics
+/// map, so the two surfaces agree on every SETTLED attempt; an attempt
+/// still in flight exists only in `/_ccm/metrics`, as it always has).
+/// Content type per the text format 0.0.4 convention.
+async fn control_metrics_exposition(State(state): State<ProxyState>) -> Response<Body> {
+    let Some(prom) = state.prom.as_deref() else {
+        // Unreachable through the router (the route is registered only when
+        // the exporter exists); kept honest for direct calls.
+        return control_error(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("metrics export disabled"),
+        );
+    };
+    let now = now_ms();
+    let mut models: Vec<(String, ModelMetrics)> = state
+        .metrics
+        .read()
+        .await
+        .iter()
+        .map(|(model, metrics)| (model.clone(), metrics.clone()))
+        .collect();
+    models.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut circuits: Vec<(String, crate::prometheus::CircuitInput)> = state
+        .circuits
+        .read()
+        .await
+        .iter()
+        .map(|(model, circuit)| {
+            (
+                model.clone(),
+                crate::prometheus::CircuitInput {
+                    // "Open" in the skipping sense, matching the OPEN and
+                    // HALF_OPEN rows of `/_ccm/circuits`: cooldown unexpired,
+                    // or a half-open probe holding the single slot.
+                    open: circuit.open_until_ms.is_some_and(|until| until > now)
+                        || circuit.half_open_probe_in_flight,
+                    consecutive_failures: circuit.consecutive_failures,
+                },
+            )
+        })
+        .collect();
+    circuits.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let text = crate::prometheus::render(&crate::prometheus::Snapshot {
+        process_start_seconds: crate::prometheus::process_start_seconds(),
+        history_dropped: state.history.dropped_count(),
+        prom: prom.snapshot(),
+        models,
+        circuits,
+    });
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        text,
+    )
+        .into_response()
 }
 
 async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {

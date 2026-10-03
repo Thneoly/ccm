@@ -111,6 +111,23 @@ pub(crate) async fn build_routing_decision(
 }
 
 pub(crate) async fn store_decision(state: &ProxyState, decision: RoutingDecision) {
+    // The single funnel every terminal verdict passes through (all four call
+    // sites in forward()), so the exporter sees exactly one request counter
+    // and one decision-duration sample per request that got as far as
+    // building a decision. Requests rejected before that point (405, config
+    // load failure, unreadable body) never reach here — same as they never
+    // reach the decision ring. Duration is arrival (timestamp_ms) to
+    // terminal verdict — no new plumbing.
+    if let Some(prom) = &state.prom {
+        prom.record_request(
+            &decision.target,
+            crate::prometheus::decision_outcome(&decision.outcome),
+        );
+        prom.observe_decision_duration(
+            &decision.target,
+            now_ms().saturating_sub(decision.timestamp_ms) as f64,
+        );
+    }
     // Persist before the move into the ring. History recording is best-effort
     // (bounded try_send inside — full queue drops and counts, never blocks).
     state.history.record_decision(&decision);
@@ -127,6 +144,11 @@ pub(crate) async fn record_attempt_started(state: &ProxyState, model: &str) {
 }
 
 pub(crate) async fn record_timeout(state: &ProxyState, model: &str, latency_ms: f64) {
+    // Every attempt sample the EWMA sees also lands in the histogram — the
+    // exporter's cross-restart latency track (§3.3 dual-track).
+    if let Some(prom) = &state.prom {
+        prom.observe_header_latency(model, latency_ms);
+    }
     let mut metrics = state.metrics.write().await;
     let metric = metrics.entry(model.to_string()).or_default();
     metric.timeouts += 1;
@@ -135,6 +157,9 @@ pub(crate) async fn record_timeout(state: &ProxyState, model: &str, latency_ms: 
 }
 
 pub(crate) async fn record_request_error(state: &ProxyState, model: &str, latency_ms: f64) {
+    if let Some(prom) = &state.prom {
+        prom.observe_header_latency(model, latency_ms);
+    }
     let mut metrics = state.metrics.write().await;
     let metric = metrics.entry(model.to_string()).or_default();
     metric.request_errors += 1;
@@ -149,6 +174,9 @@ pub(crate) async fn record_http_response(
     latency_ms: f64,
     fallback_failure: bool,
 ) {
+    if let Some(prom) = &state.prom {
+        prom.observe_header_latency(model, latency_ms);
+    }
     let mut metrics = state.metrics.write().await;
     let metric = metrics.entry(model.to_string()).or_default();
     update_latency_ewma(metric, latency_ms);

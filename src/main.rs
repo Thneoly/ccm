@@ -11,6 +11,7 @@ mod integrate;
 mod launcher;
 mod manage;
 mod model;
+mod prometheus;
 mod provider;
 mod proxy;
 mod route;

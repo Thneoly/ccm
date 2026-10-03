@@ -218,6 +218,16 @@ impl History {
         self.inner.is_some()
     }
 
+    /// Records dropped over this store's lifetime (full writer queue or a
+    /// stopped writer) — the input of `ccm_history_dropped_total`. Zero for
+    /// a disabled store (nothing was ever enqueued to drop).
+    pub(crate) fn dropped_count(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.dropped.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Directory backing this store, for the disk-backed control-API reads.
     pub(crate) fn dir(&self) -> Option<&Path> {
         self.inner.as_ref().map(|inner| inner.dir.as_path())

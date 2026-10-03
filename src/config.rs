@@ -30,9 +30,10 @@ pub struct AppConfig {
     pub observability: ObservabilityConfig,
 }
 
-/// `[observability]` — history persistence knobs (v0.4 M5). All fields carry
-/// serde defaults, so a config.toml written before v0.4 loads unchanged with
-/// history enabled; a saved config gains the section with default values.
+/// `[observability]` — history persistence and export knobs (v0.4 M5/M7).
+/// All fields carry serde defaults, so a config.toml written before v0.4
+/// loads unchanged with history and `/metrics` enabled; a saved config gains
+/// the section with default values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
@@ -41,6 +42,11 @@ pub struct ObservabilityConfig {
     pub max_records_per_file: u64,
     pub max_bytes_per_file: u64,
     pub metrics_snapshot_interval_secs: u64,
+    /// Prometheus text exposition on the proxy's one listener (v0.4 M7).
+    /// `false` removes the `/metrics` route entirely — the loopback guard
+    /// already covers it; this knob exists for owners who want nothing
+    /// exported at all.
+    pub prometheus_enabled: bool,
 }
 
 impl Default for ObservabilityConfig {
@@ -51,6 +57,7 @@ impl Default for ObservabilityConfig {
             max_records_per_file: 50_000,
             max_bytes_per_file: 8 * 1024 * 1024,
             metrics_snapshot_interval_secs: 30,
+            prometheus_enabled: true,
         }
     }
 }
@@ -425,7 +432,7 @@ base_url = "https://api.anthropic.com"
     #[test]
     fn observability_defaults_apply_for_pre_v04_configs() {
         // a config written before v0.4 has no [observability] section: it
-        // loads with history enabled at the default thresholds
+        // loads with history and /metrics enabled at the default thresholds
         let raw = r#"
 [providers.anthropic]
 kind = "anthropic"
@@ -433,6 +440,7 @@ base_url = "https://api.anthropic.com"
 "#;
         let config: AppConfig = toml::from_str(raw).unwrap();
         assert!(config.observability.history_enabled);
+        assert!(config.observability.prometheus_enabled);
         assert_eq!(config.observability.retention_days, 14);
         assert_eq!(config.observability.max_records_per_file, 50_000);
         assert_eq!(config.observability.max_bytes_per_file, 8 * 1024 * 1024);
@@ -454,9 +462,13 @@ base_url = "https://api.anthropic.com"
         config.observability.metrics_snapshot_interval_secs = 0;
         assert!(config.validate_observability().is_err());
 
-        // and an explicit disable is a valid configuration
+        // and an explicit disable is a valid configuration — either half
         let mut config = AppConfig::starter();
         config.observability.history_enabled = false;
+        config.validate_observability().unwrap();
+
+        let mut config = AppConfig::starter();
+        config.observability.prometheus_enabled = false;
         config.validate_observability().unwrap();
     }
 
