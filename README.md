@@ -17,7 +17,7 @@ For implementation continuation and release stabilization, read:
 
 Current status:
 
-> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 in progress: the openai-compatible provider kind with upstream protocol translation is implemented.
+> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 in progress: the openai-compatible provider kind with upstream protocol translation, and per-client runtime switching (multi-client routing on one proxy), are implemented.
 
 New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
 
@@ -419,6 +419,8 @@ ccm switch balanced
 
 `ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/state.toml`.
 
+Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run --proxy` session carries a client id, and `ccm switch <target> --client <id>` switches only that client. `--global` (or a bare `ccm switch`) moves the global target that un-switched clients follow; `ccm clients` lists the per-client targets.
+
 ## Control API
 
 ```text
@@ -431,10 +433,11 @@ GET  /_ccm/circuits
 GET  /_ccm/metrics
 GET  /_ccm/scores
 GET  /_ccm/decisions
+GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter.
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
@@ -530,13 +533,15 @@ committed-stream failure -> error event, zero requests to the fallback (no mid-s
 HALF_OPEN probe release on translate failure
 ```
 
-Both tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring.
+All four integration tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring.
 
 Run them with:
 
 ```bash
 cargo test mock_provider_integration_covers_v03_routing_contract -- --nocapture
 cargo test mock_openai_provider_integration_covers_translation_contract -- --nocapture
+cargo test multi_client_integration_covers_scoped_switching_contract -- --nocapture
+cargo test control_router_serves_client_contract_over_http -- --nocapture
 ```
 
 ## v0.3 stabilization boundary
@@ -564,6 +569,8 @@ Then inside a Claude Code session started with `ccm run --proxy`:
 /switch claude
 /switch balanced
 ```
+
+The skill runs `ccm switch`, which inherits the session's `CCM_CLIENT_ID`, so a `/switch` moves only that session's target (v0.4) — never the global default other terminals follow.
 
 ## Commands
 
@@ -595,7 +602,9 @@ ccm list
 ccm current
 ccm use <model-or-profile-or-route>
 ccm switch <model-or-profile-or-route> [--proxy-url URL]
-ccm run [model-or-profile] [--proxy] [--proxy-url URL]
+  [--client <id>] [--global]
+ccm clients [--proxy-url URL]
+ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
 ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>
