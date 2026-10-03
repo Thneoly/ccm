@@ -14,7 +14,7 @@ use crate::{
 
 const HEALTH_MIN_SAMPLES: u64 = 3;
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct CandidateScoreView {
     pub(crate) model: String,
     pub(crate) reliability_score: f64,
