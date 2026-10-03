@@ -98,11 +98,32 @@ fn run_command_inner(
         command.env_remove("CCM_PROXY_URL");
     }
 
-    if let Some(client_id) = client_id {
-        command.env("CCM_CLIENT_ID", client_id).env(
-            "ANTHROPIC_CUSTOM_HEADERS",
-            merge_custom_headers(parent_custom_headers().as_deref(), client_id),
-        );
+    match client_id {
+        Some(client_id) => {
+            command.env("CCM_CLIENT_ID", client_id).env(
+                "ANTHROPIC_CUSTOM_HEADERS",
+                merge_custom_headers(parent_custom_headers().as_deref(), client_id),
+            );
+        }
+        None => {
+            // Direct mode carries no ccm identity. A stale CCM_CLIENT_ID or
+            // inherited `x-ccm-client` line (e.g. a direct launch nested in a
+            // proxy-launched session) would scope a nested `ccm switch` to
+            // the DEFAULT proxy URL and leak the identity header to the real
+            // upstream — there is no proxy to strip it. Unrelated custom
+            // headers pass through untouched.
+            command.env_remove("CCM_CLIENT_ID");
+            if let Some(parent) = parent_custom_headers() {
+                match strip_client_headers(&parent) {
+                    Some(filtered) => {
+                        command.env("ANTHROPIC_CUSTOM_HEADERS", filtered);
+                    }
+                    None => {
+                        command.env_remove("ANTHROPIC_CUSTOM_HEADERS");
+                    }
+                }
+            }
+        }
     }
 
     match auth {
@@ -165,6 +186,18 @@ pub(crate) fn merge_custom_headers(parent: Option<&str>, id: &str) -> String {
 fn is_client_header_line(line: &str) -> bool {
     line.split_once(':')
         .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("x-ccm-client"))
+}
+
+/// Direct mode drops any inherited `x-ccm-client` lines while unrelated
+/// custom headers survive. Returns `None` when nothing remains, so the
+/// variable is removed rather than set to an empty value.
+pub(crate) fn strip_client_headers(parent: &str) -> Option<String> {
+    let kept: Vec<&str> = parent
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_client_header_line(line))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
 /// Short per-launch default client id: 8 lowercase hex chars derived from a
@@ -241,6 +274,18 @@ mod tests {
             merge_custom_headers(Some(parent), "abc"),
             "x-ccm-client: abc\nX-Custom: 1"
         );
+    }
+
+    #[test]
+    fn direct_mode_strips_inherited_client_header_lines() {
+        // Unrelated lines survive; client lines (any case/spacing) drop.
+        assert_eq!(
+            strip_client_headers("X-Custom: 1\nx-ccm-client: stale\nX-CCM-CLIENT: also\r\n"),
+            Some("X-Custom: 1".to_string())
+        );
+        // Only client lines / whitespace remain -> remove the variable.
+        assert_eq!(strip_client_headers("x-ccm-client: stale\n\n"), None);
+        assert_eq!(strip_client_headers("  "), None);
     }
 
     #[test]

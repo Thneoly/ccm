@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    proxy::{forward_messages, valid_client_id, ClientEntry, ProxyState},
+    proxy::{
+        forward_messages, invalid_client_id_message, valid_client_id, ClientEntry, ProxyState,
+    },
     route::{CircuitBreakerPolicy, RoutePolicy, SelectionWeights},
     routing::decision::{now_ms, AttemptTrace, RoutingDecision},
     routing::metrics::{health_score, success_rate},
@@ -412,7 +414,7 @@ pub(crate) async fn apply_switch(
 ) -> Result<SwitchView> {
     if let Some(id) = client {
         if !valid_client_id(id) {
-            bail!("invalid client id `{id}`: must be 1-64 characters of [A-Za-z0-9._-]");
+            bail!("{}", invalid_client_id_message(id));
         }
     }
     let config = AppConfig::load()?;

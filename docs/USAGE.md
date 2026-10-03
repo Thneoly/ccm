@@ -245,9 +245,9 @@ ccm 启动 claude 时设置的环境变量：
 | `ANTHROPIC_AUTH_TOKEN` | `bearer` 类 provider 的 token |
 | `CCM_PROXY_URL` | 被主动移除（防止残留的代理地址泄漏进直连会话） |
 
-外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
+外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。直连会话也不携带 ccm 客户端标识：`CCM_CLIENT_ID` 被移除，父环境 `ANTHROPIC_CUSTOM_HEADERS` 里继承的 `x-ccm-client` 行会被剥掉（其余行保留）。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
 
-**openai-compatible 模型不支持直连**：直连模式不做协议翻译，claude 会把 Anthropic 请求原样发给 OpenAI 端点（`{base_url}/v1/messages` 打到只有 `/v1/chat/completions` 的网关），必然失败。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
+**openai-compatible 模型不支持直连**：直连模式没有翻译层，ccm 会在启动前直接拒绝并报错 `cannot launch ... directly: openai-compatible models are proxy-only ...`，不会把任何请求发给上游。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
 
 没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用——解析口径只有模型/profile，传路由名会报 `unknown model or profile `...``。
 
@@ -476,7 +476,7 @@ ccm use deepseek-chat
 - `--kind` 也接受别名 `openai`；
 - 省略 `--auth` 时按 kind 取默认：openai-compatible → `bearer`（`Authorization: Bearer ...`）；anthropic 类仍是 `x-api-key`（显式传 `--auth` 永远优先）；
 - 上游地址固定是 `base_url + /v1/chat/completions`，所以 `base_url` 填网关根地址即可（末尾 `/` 会被去掉）；
-- **仅代理模式可用**：协议翻译在代理内部完成，直连模式（`ccm run <模型>` 不带 `--proxy`）会把 Anthropic 请求原样发给 OpenAI 端点而失败——openai 类模型请配 `ccm proxy` + `ccm run --proxy`。
+- **仅代理模式可用**：协议翻译在代理内部完成，直连模式（`ccm run <模型>` 不带 `--proxy`）会被 ccm 在启动前直接拒绝（报错见 4.2）——openai 类模型请配 `ccm proxy` + `ccm run --proxy`。
 
 **混合协议路由**是合法的：一条 fallback 链里同时有 anthropic 类和 openai 类候选，fallback 按状态码判断，与协议无关。例：
 
@@ -612,7 +612,7 @@ keyring 条目：service 名固定为 `ccm`，条目名 = provider 名。Windows
 | 变量 | 作用 |
 |---|---|
 | `CCM_HOME` | 重定位 `config.toml` 和 `state.toml`（默认 `~/.ccm`） |
-| `CCM_PROXY_URL` | `ccm switch` / `ccm run --proxy` 的默认代理地址（`--proxy-url` flag 可覆盖；最终默认 `http://127.0.0.1:13521`）；代理模式下会传给 claude 子进程 |
+| `CCM_PROXY_URL` | `ccm switch` / `ccm clients` 的默认代理地址（`--proxy-url` flag 可覆盖；最终默认 `http://127.0.0.1:13521`。注意 `ccm run --proxy` 不读它，只认 `--proxy-url` flag）；代理模式下会传给 claude 子进程 |
 | `CCM_CLIENT_ID` | `ccm switch` / `ccm run --proxy` 的默认 client id（`--client` flag 可覆盖；`switch` 里 `--global` 优先于它）；代理模式下会传给 claude 子进程，会话内 `/switch` 靠它保持本会话作用域（见 4.6） |
 
 ### 7.4 无头场景（CI / 容器）
@@ -708,7 +708,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | 环境变量 | 作用 |
 |---|---|
 | `CCM_HOME` | 重定位 config.toml / state.toml |
-| `CCM_PROXY_URL` | switch / run --proxy 的默认代理地址；代理模式下传给 claude |
+| `CCM_PROXY_URL` | switch / clients 的默认代理地址（run --proxy 只认 `--proxy-url` flag）；代理模式下传给 claude |
 | `CCM_CLIENT_ID` | switch / run --proxy 的默认 client id；代理模式下传给 claude（`/switch` 靠它保持会话作用域） |
 | `CCM_<PROVIDER>_API_KEY` | provider 凭据（优先于 keyring），如 `CCM_ZAI_API_KEY` |
 

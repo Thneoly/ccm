@@ -207,13 +207,14 @@ fn resolve_switch_client<'a>(
 }
 
 /// Client-side mirror of the proxy's switch validation (`apply_switch`) so
-/// an invalid id fails before any request is sent, with the same message
-/// shape the control API uses.
+/// an invalid id fails before any request is sent. The message comes from
+/// the same helper the control API uses, so both stay identical by
+/// construction.
 fn ensure_valid_client_id(id: &str) -> Result<()> {
     if proxy::valid_client_id(id) {
         Ok(())
     } else {
-        bail!("invalid client id `{id}`: must be 1-64 characters of [A-Za-z0-9._-]")
+        bail!(proxy::invalid_client_id_message(id))
     }
 }
 
@@ -267,12 +268,12 @@ mod tests {
         assert!(ensure_valid_client_id("A.b-1_2").is_ok());
         assert!(ensure_valid_client_id(&"x".repeat(64)).is_ok());
         for id in ["", "bad id", "id/1", &"x".repeat(65)] {
-            let error = ensure_valid_client_id(id).unwrap_err().to_string();
-            assert!(
-                error.starts_with(&format!("invalid client id `{id}`")),
-                "{id}: {error}"
+            // Byte-identical to the control API's rejection text.
+            assert_eq!(
+                ensure_valid_client_id(id).unwrap_err().to_string(),
+                proxy::invalid_client_id_message(id),
+                "{id}"
             );
-            assert!(error.contains("must be 1-64 characters of [A-Za-z0-9._-]"));
         }
     }
 }

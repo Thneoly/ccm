@@ -149,6 +149,13 @@ pub(crate) fn valid_client_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// Error text for an out-of-charset client id, shared by the proxy-side
+/// switch validation and the CLI-side early check so both report identically
+/// by construction.
+pub(crate) fn invalid_client_id_message(id: &str) -> String {
+    format!("invalid client id `{id}`: must be 1-64 characters of [A-Za-z0-9._-]")
+}
+
 /// Extract the requesting client id: the `x-ccm-client` header first, then the
 /// `Authorization: Bearer ccm-local-<id>` placeholder token. The bare v0.3
 /// placeholder `ccm-local` carries no id. A real bearer credential yields no
