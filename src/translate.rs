@@ -19,6 +19,14 @@ use serde_json::{json, Map, Value};
 /// never buffered; only the current partially-received frame lives in memory.
 const SSE_FRAME_CAP: usize = 1024 * 1024;
 
+/// Slot ceiling for accumulated tool_calls, indexed by the upstream
+/// `tool_calls[].index` value. Anthropic accepts at most 128 tools per
+/// request and OpenAI at most 128 parallel function calls, so an index at
+/// or above this is malformed input; without the ceiling a crafted frame
+/// could make `index + 1` wrap (panic on the slot access) or request a
+/// giant `resize_with` (a failed allocation aborts the whole process).
+const MAX_TOOL_CALL_SLOTS: usize = 128;
+
 // ===========================================================================
 // Errors
 // ===========================================================================
@@ -908,7 +916,19 @@ impl SseTranslator {
             .and_then(|t| t.as_array())
         {
             for tc in tool_calls {
-                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let raw_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                if raw_index >= MAX_TOOL_CALL_SLOTS as u64 {
+                    // An out-of-range index degrades like any other
+                    // malformed frame instead of panicking (`index + 1`
+                    // wraps at u64::MAX) or attempting a giant resize (a
+                    // failed allocation aborts the process).
+                    self.errored = true;
+                    return vec![error_event(&format!(
+                        "tool_calls index {raw_index} exceeds the supported maximum of {}",
+                        MAX_TOOL_CALL_SLOTS - 1
+                    ))];
+                }
+                let index = raw_index as usize;
                 if self.tools.len() <= index {
                     self.tools.resize_with(index + 1, || None);
                 }
@@ -1934,5 +1954,46 @@ mod tests {
         let events = [events, torn.finish().unwrap()].concat();
         assert_eq!(event_names(&events), ["error"]);
         assert!(torn.finish().unwrap().is_empty());
+    }
+
+    // 26. an out-of-range tool_calls index is a terminal bad frame — never
+    //     a panic (u64::MAX wraps index+1 to 0) or a giant resize (an
+    //     allocation failure aborts the whole process)
+    #[test]
+    fn out_of_range_tool_call_index_is_terminal_bad_frame() {
+        for bad in [u64::MAX, 4_294_967_296, MAX_TOOL_CALL_SLOTS as u64] {
+            let frame = json!({"id": "b", "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": bad, "id": "call_x", "type": "function",
+                 "function": {"name": "boom", "arguments": ""}}
+            ]}}]});
+            let mut t = SseTranslator::new("up");
+            let events = t.feed(format!("data: {frame}\n\n").as_bytes()).unwrap();
+            let names = event_names(&events);
+            assert_eq!(names.last().copied(), Some("error"), "index {bad}");
+            assert!(!names.contains(&"message_stop"), "index {bad}");
+            let err: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tool_calls index"),
+                "index {bad}"
+            );
+            // terminal: nothing more from feed or finish
+            assert!(t.feed(b"data: [DONE]\n\n").unwrap().is_empty());
+            assert!(t.finish().unwrap().is_empty());
+        }
+
+        // the highest legal index still accumulates normally
+        let ok = json!({"id": "b", "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": MAX_TOOL_CALL_SLOTS as u64 - 1, "id": "call_ok", "type": "function",
+             "function": {"name": "fine", "arguments": "{}"}}
+        ]}}]});
+        let mut t = SseTranslator::new("up");
+        let events = t
+            .feed(format!("data: {ok}\n\ndata: [DONE]\n\n").as_bytes())
+            .unwrap();
+        assert!(events.iter().any(|e| e.event == "message_stop"));
+        assert!(events.iter().any(|e| e.data.contains("\"name\":\"fine\"")));
     }
 }
