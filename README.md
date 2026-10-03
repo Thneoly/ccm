@@ -16,9 +16,9 @@ For implementation continuation and release stabilization, read:
 
 Current status:
 
-> **v0.3 feature-complete; release stabilization in progress.**
+> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
 
-Do not add new routing strategies before v0.3 release. The next work should begin with the Rust Release Gate and platform smoke tests described in `docs/V0.3_PLAN.md`.
+New feature work goes to the v0.4 backlog in `docs/V0.3_PLAN.md` section 16; keep the CI release gate green on every push to main.
 
 ## Install
 
@@ -519,14 +519,12 @@ cargo test mock_provider_integration_covers_v03_routing_contract -- --nocapture
 
 ## v0.3 stabilization boundary
 
-Routing Decision Trace closes feature development for v0.3. No additional selection strategies are planned before the stabilization release.
-
-The remaining v0.3 work is reliability-focused:
+v0.3.0 shipped on 2026-10-03. The stabilization release work is complete:
 
 ```text
-run release verification on Windows / Linux
-re-enable CI and make all checks green
-release packaging and documentation cleanup
+release verification on Windows / Linux
+CI gate green on every push to main
+release packaging (Windows .exe + Linux binary + checksums)
 ```
 
 ## In-session switching from Claude Code
