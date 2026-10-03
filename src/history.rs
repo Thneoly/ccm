@@ -13,10 +13,11 @@
 //! queue drops the record and counts it — recording history must never block
 //! or slow `/v1/messages`. Implementation note (deviation from the V0.4 plan
 //! §3.3 sketch, which proposed tokio mpsc + a writer task): this uses
-//! `std::sync::mpsc::SyncSender` + a plain std thread so tests get a
-//! deterministic `shutdown()` join, the writer performs zero async-runtime
-//! IO, and `recv_timeout` gives the loop a poll point. Same bounded-1024,
-//! always-try_send semantics.
+//! `std::sync::mpsc::SyncSender` + a plain std thread so the writer performs
+//! zero async-runtime IO, `recv_timeout` gives the loop a poll point, and
+//! dropping the last handle drains, flushes, and joins the writer (see
+//! `Drop for HistoryInner`) — that join is the deterministic flush point for
+//! tests. Same bounded-1024, always-try_send semantics.
 //!
 //! Single-writer rule: `open_history` takes an OS file lock on
 //! `history/.lock` (held for the process lifetime, released by the kernel on
@@ -24,11 +25,12 @@
 //! `CCM_HOME` fails to open history and must run with history disabled
 //! rather than interleaving writes or duplicating decision ids.
 //!
-//! Honest boundaries: no exit-time final snapshot is claimed (the proxy has
-//! no graceful shutdown; the periodic snapshot task plus torn-tail tolerance
-//! cover the gap), and runtime metrics always restart from zero — stale
-//! snapshots would distort healthiest/weighted ordering, so history queries
-//! read disk instead.
+//! Honest boundaries: no exit-time final snapshot is claimed for a killed
+//! process (Ctrl+C skips destructors; the periodic snapshot task plus
+//! torn-tail tolerance cover the gap) — a normal exit that drops the store
+//! does drain + flush + join, so nothing in flight is lost there. Runtime
+//! metrics always restart from zero — stale snapshots would distort
+//! healthiest/weighted ordering, so history queries read disk instead.
 
 use std::{
     collections::BTreeMap,
@@ -54,8 +56,8 @@ use crate::routing::{decision::RoutingDecision, metrics::ModelMetrics};
 pub(crate) const CHANNEL_CAPACITY: usize = 1024;
 
 /// How long the writer thread parks between channel polls. Also the upper
-/// bound on how long `shutdown()` may wait for the park to notice the stop
-/// flag.
+/// bound on how long dropping the last handle may wait for the park to
+/// notice the stop flag.
 const WRITER_POLL: Duration = Duration::from_millis(500);
 
 /// Tail window read when recovering the decision id sequence: enough to hold
@@ -182,10 +184,11 @@ struct HistoryInner {
     dir: PathBuf,
     sender: SyncSender<HistoryEvent>,
     /// Records dropped because the channel was full or the writer had
-    /// already stopped. Read via [`History::dropped_records`].
+    /// already stopped. Surfaced by [`HistoryInner::dropped_records`] when
+    /// the last handle drops.
     dropped: AtomicU64,
     stop: Arc<AtomicBool>,
-    /// Joined exactly once by [`History::shutdown`].
+    /// Joined exactly once, by [`HistoryInner::stop_and_join`].
     worker: Mutex<Option<JoinHandle<()>>>,
     /// OS file lock proving single-writer ownership; held until drop.
     _lock: File,
@@ -213,13 +216,6 @@ impl History {
     /// Directory backing this store, for the disk-backed control-API reads.
     pub(crate) fn dir(&self) -> Option<&Path> {
         self.inner.as_ref().map(|inner| inner.dir.as_path())
-    }
-
-    pub(crate) fn dropped_records(&self) -> u64 {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.dropped.load(Ordering::Relaxed))
-            .unwrap_or(0)
     }
 
     /// Enqueue one record. Never blocks: a full channel (or a stopped
@@ -264,16 +260,45 @@ impl History {
             }
         }
     }
+}
 
-    /// Stop the writer thread after it drains the queue, and wait for it.
-    /// Deterministic flush for tests; the proxy itself has no graceful
-    /// shutdown and simply lets the process exit detach the writer.
-    pub(crate) fn shutdown(&self) {
-        let Some(inner) = &self.inner else { return };
-        inner.stop.store(true, Ordering::Relaxed);
-        let worker = inner.worker.lock().unwrap().take();
+impl HistoryInner {
+    /// Total records dropped over this store's lifetime (full queue or a
+    /// writer that had already stopped).
+    fn dropped_records(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Signal the writer to stop after draining the queue, then join it
+    /// exactly once. Every teardown path funnels through the last handle
+    /// going away.
+    fn stop_and_join(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some(handle) = worker {
             let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for HistoryInner {
+    /// Teardown on the last handle drop: drain + flush + join the writer, so
+    /// a normal `main` return persists everything still in flight, then
+    /// surface the lifetime drop count if any records were lost. A killed
+    /// process (Ctrl+C) skips destructors entirely — the periodic flushes
+    /// plus torn-tail tolerance cover that path, and no exit-time snapshot
+    /// is claimed for it.
+    fn drop(&mut self) {
+        self.stop_and_join();
+        let dropped = self.dropped_records();
+        if dropped > 0 {
+            eprintln!(
+                "ccm: history: {dropped} records were dropped (writer queue full or writer stopped)"
+            );
         }
     }
 }
@@ -299,19 +324,18 @@ pub(crate) fn open_history(
     sweep_retention(&dir, Duration::from_millis(limits.retention_ms));
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<HistoryEvent>(capacity);
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker = spawn_writer(dir.clone(), limits, receiver, Arc::clone(&stop));
+    let inner = Arc::new(HistoryInner {
+        dir: dir.clone(),
+        sender,
+        dropped: AtomicU64::new(0),
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: Mutex::new(None),
+        _lock: lock,
+    });
+    let worker = spawn_writer(dir, limits, receiver, Arc::clone(&inner.stop));
+    *inner.worker.lock().unwrap() = Some(worker);
 
-    Ok(History {
-        inner: Some(Arc::new(HistoryInner {
-            dir,
-            sender,
-            dropped: AtomicU64::new(0),
-            stop,
-            worker: Mutex::new(Some(worker)),
-            _lock: lock,
-        })),
-    })
+    Ok(History { inner: Some(inner) })
 }
 
 /// Take the single-writer lock: an OS lock on `history/.lock`, held for the
@@ -828,7 +852,7 @@ mod tests {
         for id in 1..=7u64 {
             history.record_decision(&decision(id, id * 1000, &["glm"], Some("glm")));
         }
-        history.shutdown();
+        drop(history);
 
         let rotated: Vec<PathBuf> = fs::read_dir(dir.path())
             .unwrap()
@@ -858,7 +882,7 @@ mod tests {
         for id in 1..=3u64 {
             history.record_decision(&decision(id, id * 1000, &["glm", "claude"], Some("claude")));
         }
-        history.shutdown();
+        drop(history);
         let rotated = fs::read_dir(dir.path())
             .unwrap()
             .flatten()
@@ -880,7 +904,7 @@ mod tests {
     fn retention_sweep_deletes_only_old_rotated_files() {
         let (dir, history) = store_with("retention", HistoryLimits::default());
         history.record_decision(&decision(1, 1, &["glm"], Some("glm")));
-        history.shutdown();
+        drop(history);
 
         // hand-write one rotated file aged 20 days past the 14-day window
         let old = dir.path().join("decisions-1000000000000.jsonl");
@@ -909,7 +933,7 @@ mod tests {
     fn torn_tail_lines_are_skipped_by_readers() {
         let (dir, history) = store_with("torn", HistoryLimits::default());
         history.record_decision(&decision(1, 100, &["glm"], Some("glm")));
-        history.shutdown();
+        drop(history);
 
         let active = dir.path().join("decisions.jsonl");
         let mut contents = fs::read_to_string(&active).unwrap();
@@ -928,7 +952,7 @@ mod tests {
         for id in 5..=7u64 {
             history.record_decision(&decision(id, id * 1000, &["glm"], Some("glm")));
         }
-        history.shutdown();
+        drop(history);
         assert_eq!(recover_decision_seq(dir.path()), 8);
 
         let empty = TempDir::new("seq-empty");
@@ -959,7 +983,7 @@ mod tests {
         for _ in 0..100 {
             history.record(HistoryEvent::Decision("x".into()));
         }
-        assert_eq!(history.dropped_records(), 100);
+        assert_eq!(history.inner.as_ref().unwrap().dropped_records(), 100);
         assert!(
             matches!(_receiver.try_recv(), Ok(HistoryEvent::Decision(ref line)) if line == "{}"),
             "the queued record was not disturbed"
@@ -976,9 +1000,8 @@ mod tests {
             err.contains("already owns the history directory"),
             "error explains the single-writer rule: {err}"
         );
-        first.shutdown();
-        drop(first);
-        // the lock died with the handle: a fresh open succeeds
+        drop(first); // drains, joins the writer, releases the lock
+                     // the lock died with the handle: a fresh open succeeds
         open_history(dir.path().to_path_buf(), HistoryLimits::default(), 4).unwrap();
     }
 
@@ -988,11 +1011,13 @@ mod tests {
         let (dir, history) = store_with("roundtrip", HistoryLimits::default());
 
         let mut models = BTreeMap::new();
-        let mut metrics = ModelMetrics::default();
-        metrics.attempts = 9;
-        metrics.successes = 7;
-        metrics.rate_limited = 2;
-        metrics.latency_ewma_ms = Some(123.5);
+        let metrics = ModelMetrics {
+            attempts: 9,
+            successes: 7,
+            rate_limited: 2,
+            latency_ewma_ms: Some(123.5),
+            ..ModelMetrics::default()
+        };
         models.insert("glm".to_string(), metrics);
         history.record_metrics_snapshot(&MetricsSnapshot {
             timestamp_ms: 1000,
@@ -1013,7 +1038,7 @@ mod tests {
             to: "HALF_OPEN".to_string(),
             reason: "cooldown elapsed; probe admitted".to_string(),
         });
-        history.shutdown();
+        drop(history);
 
         let snapshots = read_metrics_snapshots(dir.path(), None);
         assert_eq!(snapshots.len(), 1);
@@ -1044,7 +1069,7 @@ mod tests {
         for d in [&d1, &d2, &d3] {
             history.record_decision(d);
         }
-        history.shutdown();
+        drop(history);
 
         let ids = |records: &[RoutingDecision]| records.iter().map(|r| r.id).collect::<Vec<_>>();
 
@@ -1101,7 +1126,7 @@ mod tests {
         let mut record = decision(1, 42, &["glm"], Some("glm"));
         record.outcome = "HTTP 200".to_string();
         history.record_decision(&record);
-        history.shutdown();
+        drop(history);
 
         let contents = fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
         let parsed: serde_json::Value =
@@ -1146,13 +1171,12 @@ mod tests {
         };
         let (dir, history) = store_with("restart", limits);
         history.record_decision(&decision(1, 100, &["glm"], Some("glm")));
-        history.shutdown();
-        drop(history); // release the single-writer lock
+        drop(history); // drain+flush+join, and release the single-writer lock
 
         // simulate a restart: reopen and keep writing
         let history2 = open_history(dir.path().to_path_buf(), limits, CHANNEL_CAPACITY).unwrap();
         history2.record_decision(&decision(2, 200, &["glm"], Some("glm")));
-        history2.shutdown();
+        drop(history2);
 
         let records = read_decisions(dir.path(), &DecisionQuery::default()).unwrap();
         assert_eq!(

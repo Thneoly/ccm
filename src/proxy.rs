@@ -2646,7 +2646,7 @@ model_id = "upstream-y"
             history::CHANNEL_CAPACITY,
         )
         .unwrap();
-        let state = ProxyState {
+        let mut state = ProxyState {
             client: Client::new(),
             target: Arc::new(RwLock::new("test-route".to_string())),
             clients: Arc::new(RwLock::new(HashMap::new())),
@@ -2703,7 +2703,9 @@ model_id = "upstream-y"
             models: state.metrics.read().await.clone().into_iter().collect(),
         });
 
-        state.history.shutdown();
+        // Assignment drops the real store: Drop joins the writer after a
+        // final drain+flush, making the reads below deterministic.
+        state.history = History::disabled();
 
         // Persisted decisions: ids strictly increasing from 1 on an empty
         // store, client id retained, circuit-skip attempt sequence retained.
@@ -2817,7 +2819,16 @@ model_id = "upstream-y"
         store.record_decision(&record(1, 1_000, "alpha", None));
         store.record_decision(&record(2, 2_000, "beta", Some("term1")));
         store.record_decision(&record(3, 3_000, "alpha", None));
-        store.shutdown(); // deterministic flush to disk
+        // Deterministic flush: dropping the store joins the writer after a
+        // final drain. Reopen on the same directory so the disk-branch reads
+        // below still resolve a live history store (same files).
+        drop(store);
+        let store = history::open_history(
+            dir.clone(),
+            HistoryLimits::default(),
+            history::CHANNEL_CAPACITY,
+        )
+        .unwrap();
 
         let mut state = integration_proxy_state();
         state.history = store;

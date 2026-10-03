@@ -65,8 +65,8 @@ fn run_at(command: HistoryCommand, dir: &Path) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<24} {:<16} {:<22} {}",
-                "time (UTC)", "model", "transition", "reason"
+                "{:<24} {:<16} {:<22} reason",
+                "time (UTC)", "model", "transition"
             );
             for transition in &transitions {
                 println!("{}", transition_line(transition));
@@ -164,11 +164,13 @@ mod tests {
 
     #[test]
     fn metrics_row_and_transition_line_show_the_essentials() {
-        let mut metrics = ModelMetrics::default();
-        metrics.attempts = 10;
-        metrics.successes = 8;
-        metrics.http_errors = 2;
-        metrics.latency_ewma_ms = Some(250.0);
+        let metrics = ModelMetrics {
+            attempts: 10,
+            successes: 8,
+            http_errors: 2,
+            latency_ewma_ms: Some(250.0),
+            ..ModelMetrics::default()
+        };
         let row = metrics_row("glm", &metrics);
         assert!(row.contains("glm"), "{row}");
         assert!(row.contains("80.0%"), "{row}");
