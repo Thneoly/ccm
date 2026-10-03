@@ -1,6 +1,8 @@
 //! Per-model runtime metrics: counters, the latency EWMA, and derived scores.
 
-#[derive(Clone, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ModelMetrics {
     pub(crate) attempts: u64,
     pub(crate) successes: u64,

@@ -26,15 +26,52 @@ pub struct AppConfig {
     pub routes: BTreeMap<String, Route>,
     #[serde(default, rename = "current", skip_serializing)]
     pub legacy_current: Option<String>,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+/// `[observability]` — history persistence knobs (v0.4 M5). All fields carry
+/// serde defaults, so a config.toml written before v0.4 loads unchanged with
+/// history enabled; a saved config gains the section with default values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    pub history_enabled: bool,
+    pub retention_days: u64,
+    pub max_records_per_file: u64,
+    pub max_bytes_per_file: u64,
+    pub metrics_snapshot_interval_secs: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            history_enabled: true,
+            retention_days: 14,
+            max_records_per_file: 50_000,
+            max_bytes_per_file: 8 * 1024 * 1024,
+            metrics_snapshot_interval_secs: 30,
+        }
+    }
 }
 
 impl AppConfig {
     pub fn path() -> Result<PathBuf> {
+        Ok(Self::home_dir()?.join("config.toml"))
+    }
+
+    /// CCM root directory: `$CCM_HOME` when set, otherwise `~/.ccm`.
+    pub fn home_dir() -> Result<PathBuf> {
         if let Some(root) = std::env::var_os("CCM_HOME") {
-            return Ok(PathBuf::from(root).join("config.toml"));
+            return Ok(PathBuf::from(root));
         }
         let home = dirs::home_dir().context("cannot determine home directory")?;
-        Ok(home.join(".ccm").join("config.toml"))
+        Ok(home.join(".ccm"))
+    }
+
+    /// History store root: `<home>/history`.
+    pub fn history_dir() -> Result<PathBuf> {
+        Ok(Self::home_dir()?.join("history"))
     }
 
     pub fn starter() -> Self {
@@ -118,6 +155,7 @@ impl AppConfig {
             profiles,
             routes,
             legacy_current: None,
+            observability: ObservabilityConfig::default(),
         }
     }
 
@@ -144,7 +182,29 @@ impl AppConfig {
 
         let raw =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        toml::from_str(&raw).context("invalid TOML configuration")
+        let config: AppConfig = toml::from_str(&raw).context("invalid TOML configuration")?;
+        config.validate_observability()?;
+        Ok(config)
+    }
+
+    /// `[observability]` sanity: zero thresholds would disable rotation or
+    /// the snapshot loop entirely, so they are configuration errors rather
+    /// than silent no-ops.
+    pub fn validate_observability(&self) -> Result<()> {
+        let observability = &self.observability;
+        if observability.retention_days == 0 {
+            bail!("[observability] retention_days must be greater than 0");
+        }
+        if observability.max_records_per_file == 0 {
+            bail!("[observability] max_records_per_file must be greater than 0");
+        }
+        if observability.max_bytes_per_file == 0 {
+            bail!("[observability] max_bytes_per_file must be greater than 0");
+        }
+        if observability.metrics_snapshot_interval_secs == 0 {
+            bail!("[observability] metrics_snapshot_interval_secs must be greater than 0");
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -329,6 +389,44 @@ base_url = "https://api.anthropic.com"
 
         let serialized = toml::to_string(&config).unwrap();
         assert!(!serialized.contains("current ="));
+    }
+
+    #[test]
+    fn observability_defaults_apply_for_pre_v04_configs() {
+        // a config written before v0.4 has no [observability] section: it
+        // loads with history enabled at the default thresholds
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert!(config.observability.history_enabled);
+        assert_eq!(config.observability.retention_days, 14);
+        assert_eq!(config.observability.max_records_per_file, 50_000);
+        assert_eq!(config.observability.max_bytes_per_file, 8 * 1024 * 1024);
+        assert_eq!(config.observability.metrics_snapshot_interval_secs, 30);
+        config.validate_observability().unwrap();
+    }
+
+    #[test]
+    fn observability_validation_rejects_zero_thresholds() {
+        let mut config = AppConfig::starter();
+        config.observability.retention_days = 0;
+        assert!(config.validate_observability().is_err());
+
+        let mut config = AppConfig::starter();
+        config.observability.max_records_per_file = 0;
+        assert!(config.validate_observability().is_err());
+
+        let mut config = AppConfig::starter();
+        config.observability.metrics_snapshot_interval_secs = 0;
+        assert!(config.validate_observability().is_err());
+
+        // and an explicit disable is a valid configuration
+        let mut config = AppConfig::starter();
+        config.observability.history_enabled = false;
+        config.validate_observability().unwrap();
     }
 
     #[test]

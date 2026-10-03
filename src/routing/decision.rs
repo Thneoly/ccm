@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
@@ -22,7 +22,7 @@ use crate::{
 pub(crate) const TRACE_CAPACITY: usize = 100;
 pub(crate) const DECISION_CAPACITY: usize = 100;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DecisionCandidate {
     pub(crate) rank: usize,
     pub(crate) model: String,
@@ -33,7 +33,7 @@ pub(crate) struct DecisionCandidate {
     pub(crate) weighted_score: f64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DecisionAttempt {
     pub(crate) attempt: usize,
     pub(crate) model: String,
@@ -42,7 +42,7 @@ pub(crate) struct DecisionAttempt {
     pub(crate) fallback: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RoutingDecision {
     pub(crate) id: u64,
     pub(crate) timestamp_ms: u64,
@@ -111,6 +111,9 @@ pub(crate) async fn build_routing_decision(
 }
 
 pub(crate) async fn store_decision(state: &ProxyState, decision: RoutingDecision) {
+    // Persist before the move into the ring. History recording is best-effort
+    // (bounded try_send inside — full queue drops and counts, never blocks).
+    state.history.record_decision(&decision);
     let mut decisions = state.decisions.write().await;
     if decisions.len() == DECISION_CAPACITY {
         decisions.pop_front();

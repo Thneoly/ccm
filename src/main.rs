@@ -4,6 +4,7 @@ mod control;
 mod credential;
 mod doctor;
 mod health;
+mod history;
 mod integrate;
 mod launcher;
 mod manage;

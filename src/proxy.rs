@@ -27,6 +27,7 @@ use crate::{
     config::AppConfig,
     control::api::control_router,
     credential,
+    history::{self, History, HistoryLimits, MetricsSnapshot},
     provider::ProviderKind,
     route::RoutePolicy,
     routing::circuit::{
@@ -58,6 +59,10 @@ pub(crate) struct ProxyState {
     pub(crate) metrics: Arc<RwLock<HashMap<String, ModelMetrics>>>,
     pub(crate) decisions: Arc<RwLock<VecDeque<RoutingDecision>>>,
     pub(crate) decision_seq: Arc<AtomicU64>,
+    /// History persistence handle (v0.4 M5). `History::disabled()` in tests
+    /// and whenever the single-writer lock cannot be acquired — every
+    /// `record_*` is then a no-op, so no call site branches on it.
+    pub(crate) history: History,
 }
 
 /// One client's runtime switch state. `requests` / `last_seen_ms` are usage
@@ -83,6 +88,41 @@ pub async fn serve(bind: &str) -> Result<()> {
         .context("no current target selected; run `ccm use <name>` first")?;
     config.resolve_route(&target)?;
 
+    // History store (v0.4 M5): best-effort persistence. Any failure to
+    // resolve the directory or acquire the single-writer lock downgrades to
+    // a disabled store with one warning — observability must never prevent
+    // routing. Decision ids continue the persisted sequence so history stays
+    // unique across restarts sharing one CCM_HOME.
+    let observability = config.observability.clone();
+    let (history, decision_seq_start) = if observability.history_enabled {
+        match AppConfig::history_dir() {
+            Ok(dir) => match history::open_history(
+                dir.clone(),
+                HistoryLimits::from(&observability),
+                history::CHANNEL_CAPACITY,
+            ) {
+                Ok(store) => {
+                    let start = history::recover_decision_seq(&dir);
+                    println!(
+                        "History: {} (decisions, metric snapshots, circuit transitions)",
+                        dir.display()
+                    );
+                    (store, start)
+                }
+                Err(err) => {
+                    eprintln!("ccm: history disabled: {err:#}");
+                    (History::disabled(), 1)
+                }
+            },
+            Err(err) => {
+                eprintln!("ccm: history disabled: {err:#}");
+                (History::disabled(), 1)
+            }
+        }
+    } else {
+        (History::disabled(), 1)
+    };
+
     let state = ProxyState {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
@@ -91,8 +131,33 @@ pub async fn serve(bind: &str) -> Result<()> {
         circuits: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(RwLock::new(HashMap::new())),
         decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
-        decision_seq: Arc::new(AtomicU64::new(1)),
+        decision_seq: Arc::new(AtomicU64::new(decision_seq_start)),
+        history,
     };
+
+    // Periodic whole-state metric snapshots (v0.4 M5). Skipped while the
+    // metrics map is empty so an idle proxy writes nothing. No exit-time
+    // final snapshot is claimed — the proxy has no graceful shutdown; the
+    // periodic snapshots plus torn-tail tolerance cover the gap.
+    if state.history.is_enabled() {
+        let snapshot_state = state.clone();
+        let interval = Duration::from_secs(observability.metrics_snapshot_interval_secs);
+        tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let models = snapshot_state.metrics.read().await.clone();
+                if models.is_empty() {
+                    continue;
+                }
+                snapshot_state
+                    .history
+                    .record_metrics_snapshot(&MetricsSnapshot {
+                        timestamp_ms: now_ms(),
+                        models: models.into_iter().collect(),
+                    });
+            }
+        });
+    }
 
     let app = control_router(state);
 
@@ -876,7 +941,7 @@ mod tests {
     use axum::{routing::post, Router};
     use serde_json::json;
 
-    /// All four integration tests mutate process env (`CCM_HOME`,
+    /// All five integration tests mutate process env (`CCM_HOME`,
     /// `CCM_<PROVIDER>_API_KEY`); each holds this lock for its whole duration
     /// so they never race (V0.3_PLAN §11.2 discipline).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1102,6 +1167,7 @@ mod tests {
             metrics: Arc::new(RwLock::new(HashMap::new())),
             decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
             decision_seq: Arc::new(AtomicU64::new(1)),
+            history: History::disabled(),
         }
     }
 
@@ -2535,5 +2601,152 @@ model_id = "upstream-y"
         std::env::remove_var("CCM_PX_API_KEY");
         std::env::remove_var("CCM_PY_API_KEY");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // v0.4 M5: routing decisions, metric snapshots, and circuit transitions
+    // persist to $CCM_HOME/history/*.jsonl while the proxy runs, decision ids
+    // stay unique, and the persisted lines never contain credential material
+    // (V0.4_PLAN §10, invariant 1). Uses a REAL history store — single-writer
+    // lock included — against the mock routing stack.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn history_persistence_integration_covers_jsonl_contract() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-history-integration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PRIMARY_API_KEY", "primary-secret");
+        std::env::set_var("CCM_FALLBACK_API_KEY", "fallback-secret");
+
+        let history_dir = AppConfig::history_dir().unwrap();
+        let store = history::open_history(
+            history_dir.clone(),
+            HistoryLimits::default(),
+            history::CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        let state = ProxyState {
+            client: Client::new(),
+            target: Arc::new(RwLock::new("test-route".to_string())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
+            circuits: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(RwLock::new(HashMap::new())),
+            decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
+            decision_seq: Arc::new(AtomicU64::new(history::recover_decision_seq(&history_dir))),
+            history: store,
+        };
+
+        let (primary_addr, primary, primary_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (fallback_addr, fallback, fallback_task) = spawn_mock(MockBehavior::OkStream).await;
+        let primary_url = format!("http://{primary_addr}");
+        let fallback_url = format!("http://{fallback_addr}");
+        let _ = &fallback; // captured requests are not needed here; files are
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 250, 1, 30);
+        let mut request = integration_request();
+        request.headers_mut().insert(
+            "x-ccm-client",
+            axum::http::HeaderValue::from_static("term1"),
+        );
+        let response = forward(state.clone(), request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 2. one 503 at failure_threshold=1 opens the circuit
+        //    (CLOSED→OPEN transition persists); the next request skips
+        //    primary and succeeds on fallback.
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::SERVICE_UNAVAILABLE);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let primary_count_after_open = primary.requests.lock().unwrap().len();
+
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            primary.requests.lock().unwrap().len(),
+            primary_count_after_open,
+            "circuit OPEN skipped primary"
+        );
+
+        // 3. cooldown elapsed → probe admitted (OPEN→HALF_OPEN) → success
+        //    closes the circuit (HALF_OPEN→CLOSED).
+        sleep(Duration::from_millis(40)).await;
+        *primary.behavior.write().await = MockBehavior::OkStream;
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 4. one metric snapshot through the real handle (the serve()
+        //    snapshot task is not running in this test; the handle path is
+        //    identical).
+        state.history.record_metrics_snapshot(&MetricsSnapshot {
+            timestamp_ms: now_ms(),
+            models: state.metrics.read().await.clone().into_iter().collect(),
+        });
+
+        state.history.shutdown();
+
+        // Persisted decisions: ids strictly increasing from 1 on an empty
+        // store, client id retained, circuit-skip attempt sequence retained.
+        let decisions =
+            history::read_decisions(&history_dir, &crate::history::DecisionQuery::default())
+                .unwrap();
+        assert!(decisions.len() >= 4);
+        assert_eq!(decisions[0].id, 1, "seq starts at 1 on an empty store");
+        assert!(
+            decisions.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "ids strictly increasing"
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.client.as_deref() == Some("term1")),
+            "client id persisted on the decision"
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.attempts.iter().any(|a| a.result.contains("circuit OPEN"))),
+            "the circuit-skip attempt sequence persisted"
+        );
+
+        // The full circuit lifecycle persisted, model-scoped to `primary`.
+        let transitions = history::read_circuit_transitions(&history_dir, None, None);
+        assert!(transitions
+            .iter()
+            .any(|t| t.from == "CLOSED" && t.to == "OPEN"));
+        assert!(transitions
+            .iter()
+            .any(|t| t.from == "OPEN" && t.to == "HALF_OPEN"));
+        assert!(transitions
+            .iter()
+            .any(|t| t.from == "HALF_OPEN" && t.to == "CLOSED"));
+        assert!(transitions.iter().all(|t| t.model == "primary"));
+
+        // The snapshot round-trips with live counters.
+        let snapshots = history::read_metrics_snapshots(&history_dir, Some(1));
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].models.contains_key("primary"));
+        assert!(snapshots[0].models.contains_key("fallback"));
+        assert!(snapshots[0].models["primary"].attempts >= 2);
+
+        // Credential invariant (V0.4_PLAN §10, invariant 1): history files
+        // are whitelist serde structs; no key material ever appears.
+        for name in ["decisions.jsonl", "metrics.jsonl", "circuit.jsonl"] {
+            let contents = std::fs::read_to_string(history_dir.join(name))
+                .unwrap_or_else(|err| panic!("reading {name}: {err}"));
+            assert!(
+                !contents.contains("primary-secret") && !contents.contains("fallback-secret"),
+                "{name} leaked credential material"
+            );
+        }
+
+        primary_task.abort();
+        fallback_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PRIMARY_API_KEY");
+        std::env::remove_var("CCM_FALLBACK_API_KEY");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
