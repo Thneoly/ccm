@@ -17,7 +17,7 @@ For implementation continuation and release stabilization, read:
 
 Current status:
 
-> **v0.4.0 release in progress (2026-10-03)** — all v0.4 features have landed on main: the `openai-compatible` provider kind with upstream protocol translation, per-client runtime switching on one proxy (multi-client routing), and persistent observability (JSONL history, usage capture with cost accounting, Prometheus `/metrics`). Verification and packaging are under way. v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
+> **v0.4.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.4.0). v0.4 adds the `openai-compatible` provider kind with upstream protocol translation, per-client runtime switching on one proxy (multi-client routing), and persistent observability: JSONL history, usage capture with cost accounting, and Prometheus `/metrics`. v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
 
 New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
 
@@ -568,7 +568,7 @@ CI gate green on every push to main
 release packaging (Windows .exe + Linux binary + checksums)
 ```
 
-v0.4.0 is in release preparation with the same packaging and gate. The v0.4
+v0.4.0 shipped on 2026-10-03 with the same packaging and gate. The v0.4
 scope (multi-client routing, openai-compatible translation, observability
 persistence) and its milestone-by-milestone landing records live in
 `docs/V0.4_PLAN.md`.
