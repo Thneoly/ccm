@@ -13,6 +13,7 @@ mod proxy;
 mod route;
 mod routing;
 mod state;
+mod translate;
 
 use anyhow::{Context, Result};
 use clap::Parser;
