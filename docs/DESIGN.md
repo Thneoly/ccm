@@ -516,20 +516,24 @@ src/main.rs        CLI orchestration
 src/cli.rs         clap definitions
 src/config.rs      declarative configuration
 src/state.rs       persisted mutable state
-src/provider.rs    provider + auth strategy
+src/provider.rs    provider + auth strategy + kind->endpoint mapping
 src/model.rs       model/profile definitions
 src/route.rs       route + policy definitions
 src/manage.rs      add/config commands
 src/credential.rs  env/keyring credential resolution
 src/launcher.rs    Claude Code process environment
 src/integrate.rs   Claude Skill installation
-src/control.rs     runtime switch client
 src/health.rs      authenticated provider check
 src/doctor.rs      local environment diagnosis
-src/proxy.rs       routing engine + control plane
+src/translate.rs   pure anthropic<->openai translation engine (no IO)
+src/proxy.rs       forward() + HTTP path + mock integration tests
+src/routing/       mod.rs + select.rs / circuit.rs / metrics.rs / decision.rs
+src/control/       mod.rs (runtime switch client) + api.rs (control-plane Router + handlers)
 ```
 
-`src/proxy.rs` currently contains routing, metrics, circuit breaking, decisions, mock integration tests, and HTTP handlers. This is acceptable for v0.3 stabilization, but post-v0.3 refactoring should split these concerns.
+The v0.4 M0 split moved routing, metrics, circuit breaking, decisions, and
+the control API out of `proxy.rs` into `src/routing/` and `src/control/`;
+`proxy.rs` keeps the forwarding loop and the HTTP path (see §18.1).
 
 ## 15. Tests
 

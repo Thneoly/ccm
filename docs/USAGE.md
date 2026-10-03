@@ -1,8 +1,8 @@
 # CCM 使用指南
 
-CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
+CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
 
-本文是操作手册。架构背景见 `docs/DESIGN.md`，版本规划见 `docs/V0.3_PLAN.md`。
+本文是操作手册。架构背景见 `docs/DESIGN.md`，当前版本规划见 `docs/V0.4_PLAN.md`（v0.3 的发布与验证记录见 `docs/V0.3_PLAN.md`）。
 
 ---
 
@@ -224,7 +224,7 @@ healthy: minimax / MiniMax-M3
 | 会话中切模型 | 需退出重启 claude | `ccm switch` 或 `/switch` 即时生效 |
 | 改 config.toml 后 | 下次启动生效 | 每个请求都重载配置，免重启（活动 target 除外，见 FAQ） |
 
-**代理模式是主推方式**：只有它有 fallback/熔断/观测，且能在不退出 claude 的情况下切换目标。直连模式适合临时、单模型、不想多开一个终端的场景。
+**代理模式是主推方式**：只有它有 fallback/熔断/观测，且能在不退出 claude 的情况下切换目标。直连模式适合临时、单模型、不想多开一个终端的场景。另外：**openai-compatible 类模型只能在代理模式下使用**——协议翻译发生在代理内部，直连没有翻译层（见 4.2 与 5.5）。
 
 ### 4.2 直连模式
 
@@ -245,7 +245,9 @@ ccm 启动 claude 时设置的环境变量：
 
 外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
 
-没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用（解析口径是模型/profile；持久默认是路由名时的直连行为待确认）。
+**openai-compatible 模型不支持直连**：直连模式不做协议翻译，claude 会把 Anthropic 请求原样发给 OpenAI 端点（`{base_url}/v1/messages` 打到只有 `/v1/chat/completions` 的网关），必然失败。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
+
+没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用——解析口径只有模型/profile，传路由名会报 `unknown model or profile `...``。
 
 ### 4.3 代理模式
 
@@ -347,7 +349,7 @@ ccm switch minimax --proxy-url http://127.0.0.1:13522
 ccm run --proxy --proxy-url http://127.0.0.1:13522
 ```
 
-`ccm switch` 是 runtime-only（只改指定代理的内存目标，不写 state.toml），两个代理互不影响；会话内 `/switch` 也不会串——每个 claude 拿到的是自己代理的 `CCM_PROXY_URL`。按客户端 / 会话自动分流（如按 header 路由）目前不支持，属于 v0.3 之后的特性。
+`ccm switch` 是 runtime-only（只改指定代理的内存目标，不写 state.toml），两个代理互不影响；会话内 `/switch` 也不会串——每个 claude 拿到的是自己代理的 `CCM_PROXY_URL`。按客户端 / 会话自动分流（如按 header 路由）目前不支持，已在 v0.4 规划中（多客户端主题，见 `docs/V0.4_PLAN.md` §3.1）。
 
 ---
 
@@ -457,7 +459,8 @@ ccm use deepseek-chat
 
 - `--kind` 也接受别名 `openai`；
 - 省略 `--auth` 时按 kind 取默认：openai-compatible → `bearer`（`Authorization: Bearer ...`）；anthropic 类仍是 `x-api-key`（显式传 `--auth` 永远优先）；
-- 上游地址固定是 `base_url + /v1/chat/completions`，所以 `base_url` 填网关根地址即可（末尾 `/` 会被去掉）。
+- 上游地址固定是 `base_url + /v1/chat/completions`，所以 `base_url` 填网关根地址即可（末尾 `/` 会被去掉）；
+- **仅代理模式可用**：协议翻译在代理内部完成，直连模式（`ccm run <模型>` 不带 `--proxy`）会把 Anthropic 请求原样发给 OpenAI 端点而失败——openai 类模型请配 `ccm proxy` + `ccm run --proxy`。
 
 **混合协议路由**是合法的：一条 fallback 链里同时有 anthropic 类和 openai 类候选，fallback 按状态码判断，与协议无关。例：
 
@@ -479,7 +482,7 @@ fallback = ["glm"]
 | 推理内容 | 上游 `reasoning_content`（DeepSeek R 系风格）被丢弃，不会回传给客户端 |
 | usage / 计费 | 上报的缓存命中 tokens（`cached_tokens` / `prompt_cache_hit_tokens`）翻译为 `cache_read_input_tokens` 并从 `input_tokens` 中扣除；`cache_creation_input_tokens` 无 OpenAI 对应物，不回填 |
 
-错误与流为语义与 anthropic 类一致：上游错误体翻译成 Anthropic 错误信封（状态码保留）；已开始流式返回后翻译失败（如上游断流、坏帧），在已提交的流上发一个 `error` 事件然后结束响应体——**不会中途换模型**（v0.3 的"不中途切换"不变量继续生效）。
+错误与流式的语义与 anthropic 类一致：上游错误体翻译成 Anthropic 错误信封（状态码保留）；已开始流式返回后翻译失败（如上游断流、坏帧），在已提交的流上发一个 `error` 事件然后结束响应体——**不会中途换模型**（v0.3 的"不中途切换"不变量继续生效）。
 
 ---
 
@@ -496,8 +499,8 @@ fallback = ["glm"]
 | 端点 | 用途 / 返回要点 |
 |---|---|
 | `GET /health` | 存活检查，返回字面量 `ok` |
-| `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、fallback 列表、完整 policy |
-| `GET /_ccm/models` | 模型清单：model_id、provider、cost_weight、quality_weight |
+| `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、`kind`（与 provider 平级的顶层字段）、fallback 列表、完整 policy |
+| `GET /_ccm/models` | 模型清单：model_id、provider、`kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`；模型引用了未配置的 provider 时为 `unknown`）、cost_weight、quality_weight |
 | `GET /_ccm/routes` | 路由清单 + `active` 标记（哪条是当前内存目标） |
 | `GET /_ccm/traces` | 最近 100 条请求尝试记录 |
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
@@ -525,8 +528,8 @@ traces 和 decisions 是进程内环形缓冲，各保留**最近 100 条**，�
 
 1. `selection` + `ranked_candidates`：这次按什么策略、候选打分排序如何（`ordered` 时排序即配置顺序）；
 2. `attempts`：实际尝试序列，每项含 model、当时的熔断状态、result、是否 fallback。`result` 的取值包括 `HTTP {status}`、`timeout after {ms}ms`、`request error: {err}`、`skipped: circuit OPEN until {until}`、`skipped: HALF_OPEN probe already in flight`；
-3. `selected`：最终承接下来的模型；全部失败时代理返回 502；
-4. `outcome`：结果概述（取值枚举待确认）。
+3. `selected`：最终承接下来的模型；全部候选失败且无可透传响应时，代理返回 502。**例外**（见 5.4）：最后一次可用尝试遇到 `fallback_on` 状态码时，上游的错误响应会原样透传给客户端（openai 类经翻译），此时 `selected` 已设置、`outcome` 形如 `HTTP 429`——看起来像成功，实为透传的失败；
+4. `outcome`：结果概述——成功是 `HTTP {status}`；请求前解析失败是 `resolve error: ...`（该请求整体 502）；全部候选失败是 `failed: {候选: 原因; ...}`，或没有候选被放行 / 预算耗尽时是 `no candidate admitted or attempt budget exhausted`；上述第 3 条的透传例外下同样是 `HTTP {status}`。
 
 一个"熔断跳过 + fallback 成功"的决策示例（结构示意，个别字段名以实际响应为准）：
 
