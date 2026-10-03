@@ -47,6 +47,11 @@ pub(crate) struct RoutingDecision {
     pub(crate) id: u64,
     pub(crate) timestamp_ms: u64,
     pub(crate) target: String,
+    // Requesting client id (v0.4 M3), absent for no-id requests. Convention:
+    // skip-when-none on both this field and AttemptTrace.client, so no-id
+    // records serialize to the exact v0.3 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) client: Option<String>,
     pub(crate) selection: String,
     pub(crate) configured_candidates: Vec<String>,
     pub(crate) ranked_candidates: Vec<DecisionCandidate>,
@@ -59,6 +64,8 @@ pub(crate) struct RoutingDecision {
 pub(crate) struct AttemptTrace {
     timestamp_ms: u64,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) client: Option<String>,
     attempt: usize,
     model: String,
     result: String,
@@ -70,6 +77,7 @@ pub(crate) async fn build_routing_decision(
     config: &AppConfig,
     policy: &RoutePolicy,
     target: &str,
+    client: Option<&str>,
     configured_candidates: &[String],
     ranked_candidates: &[String],
 ) -> RoutingDecision {
@@ -92,6 +100,7 @@ pub(crate) async fn build_routing_decision(
         id: state.decision_seq.fetch_add(1, AtomicOrdering::Relaxed),
         timestamp_ms: now_ms(),
         target: target.to_string(),
+        client: client.map(str::to_string),
         selection: selection_name(&policy.selection).to_string(),
         configured_candidates: configured_candidates.to_vec(),
         ranked_candidates,
@@ -160,6 +169,7 @@ pub(crate) async fn record_http_response(
 pub(crate) async fn trace_attempt(
     state: &ProxyState,
     target: &str,
+    client: Option<&str>,
     attempt: usize,
     model: &str,
     result: &str,
@@ -168,18 +178,22 @@ pub(crate) async fn trace_attempt(
     let trace = AttemptTrace {
         timestamp_ms: now_ms(),
         target: target.to_string(),
+        client: client.map(str::to_string),
         attempt,
         model: model.to_string(),
         result: result.to_string(),
         fallback,
     };
 
+    let client_segment = client.map(|id| format!(" client={id}")).unwrap_or_default();
     if fallback {
         eprintln!(
-            "ccm route={target} attempt={attempt} model={model} result={result} action=fallback"
+            "ccm route={target}{client_segment} attempt={attempt} model={model} result={result} action=fallback"
         );
     } else {
-        eprintln!("ccm route={target} attempt={attempt} model={model} result={result}");
+        eprintln!(
+            "ccm route={target}{client_segment} attempt={attempt} model={model} result={result}"
+        );
     }
 
     let mut traces = state.traces.write().await;

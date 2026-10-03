@@ -34,9 +34,9 @@ use crate::{
         release_half_open_probe, CircuitDecision, CircuitState,
     },
     routing::decision::{
-        build_routing_decision, record_attempt_started, record_http_response, record_request_error,
-        record_timeout, store_decision, trace_attempt, AttemptTrace, DecisionAttempt,
-        RoutingDecision, DECISION_CAPACITY, TRACE_CAPACITY,
+        build_routing_decision, now_ms, record_attempt_started, record_http_response,
+        record_request_error, record_timeout, store_decision, trace_attempt, AttemptTrace,
+        DecisionAttempt, RoutingDecision, DECISION_CAPACITY, TRACE_CAPACITY,
     },
     routing::metrics::ModelMetrics,
     routing::select::select_candidates,
@@ -48,11 +48,25 @@ use crate::{
 pub(crate) struct ProxyState {
     pub(crate) client: Client,
     pub(crate) target: Arc<RwLock<String>>,
+    /// Per-client runtime targets (v0.4 M3): in-memory only, never written to
+    /// any file, cleared on restart (invariant 8). Entries are created ONLY by
+    /// a scoped switch — an unknown client id follows the global target and
+    /// never materializes an entry.
+    pub(crate) clients: Arc<RwLock<HashMap<String, ClientEntry>>>,
     pub(crate) traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
     pub(crate) circuits: Arc<RwLock<HashMap<String, CircuitState>>>,
     pub(crate) metrics: Arc<RwLock<HashMap<String, ModelMetrics>>>,
     pub(crate) decisions: Arc<RwLock<VecDeque<RoutingDecision>>>,
     pub(crate) decision_seq: Arc<AtomicU64>,
+}
+
+/// One client's runtime switch state. `requests` / `last_seen_ms` are usage
+/// counters bumped on every request that resolves through the entry.
+#[derive(Clone, Default)]
+pub(crate) struct ClientEntry {
+    pub(crate) target: String,
+    pub(crate) requests: u64,
+    pub(crate) last_seen_ms: u64,
 }
 
 pub async fn serve(bind: &str) -> Result<()> {
@@ -72,6 +86,7 @@ pub async fn serve(bind: &str) -> Result<()> {
     let state = ProxyState {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
+        clients: Arc::new(RwLock::new(HashMap::new())),
         traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
         circuits: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -114,12 +129,79 @@ pub(crate) async fn forward_messages(
     }
 }
 
+// ===========================================================================
+// client identity + per-client target resolution (v0.4 M3)
+// ===========================================================================
+
+/// Local identity header, injected by the launcher; never forwarded upstream.
+const CLIENT_HEADER: &str = "x-ccm-client";
+/// Bearer placeholder prefix carrying a client id (the launcher's fallback
+/// channel when the client cannot set custom headers).
+const CLIENT_TOKEN_PREFIX: &str = "ccm-local-";
+
+/// Client ids are `[A-Za-z0-9._-]{1,64}` — the same charset the scoped
+/// switch accepts. Shared with the control API's switch validation.
+pub(crate) fn valid_client_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Extract the requesting client id: the `x-ccm-client` header first, then the
+/// `Authorization: Bearer ccm-local-<id>` placeholder token. The bare v0.3
+/// placeholder `ccm-local` carries no id. A real bearer credential yields no
+/// id and is never parsed or logged beyond the prefix checks. Anything out of
+/// charset is treated as "no id" — the request still routes, globally.
+fn client_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get(CLIENT_HEADER) {
+        // The header channel is authoritative: an unusable value means no id,
+        // not a silent fallthrough to the token channel.
+        return value
+            .to_str()
+            .ok()
+            .filter(|id| valid_client_id(id))
+            .map(str::to_string);
+    }
+    let authorization = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let token = authorization.strip_prefix("Bearer ")?;
+    let id = token.strip_prefix(CLIENT_TOKEN_PREFIX)?;
+    valid_client_id(id).then(|| id.to_string())
+}
+
+/// Effective target for one request: a switched client's entry target (with
+/// its usage counters bumped), or the global target. An id WITHOUT an entry
+/// follows the global target and never creates an entry — only a scoped
+/// switch does. No id is byte-identical to v0.3.
+async fn resolve_request_target(state: &ProxyState, client: Option<&str>) -> String {
+    let global = state.target.read().await.clone();
+    match client {
+        Some(id) => {
+            let mut clients = state.clients.write().await;
+            match clients.get_mut(id) {
+                Some(entry) => {
+                    entry.requests += 1;
+                    entry.last_seen_ms = now_ms();
+                    entry.target.clone()
+                }
+                None => global,
+            }
+        }
+        None => global,
+    }
+}
+
 async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<Body>> {
     if request.method() != Method::POST {
         return Ok((StatusCode::METHOD_NOT_ALLOWED, "POST required").into_response());
     }
 
-    let target = state.target.read().await.clone();
+    // Client identity first (header channel, then the placeholder token): it
+    // decides which runtime target this request resolves through. No id means
+    // the global target, exactly as v0.3.
+    let client_id = client_id_from_headers(request.headers());
+    let target = resolve_request_target(&state, client_id.as_deref()).await;
     let config = AppConfig::load().context("failed to reload CCM config")?;
     let route = config.resolve_route(&target)?;
     let configured_candidates = route.candidates().map(str::to_string).collect::<Vec<_>>();
@@ -136,6 +218,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         &config,
         &route.policy,
         &target,
+        client_id.as_deref(),
         &configured_candidates,
         &candidates,
     )
@@ -179,6 +262,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 trace_attempt(
                     &state,
                     &target,
+                    client_id.as_deref(),
                     actual_attempts + 1,
                     candidate,
                     &result,
@@ -200,6 +284,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 trace_attempt(
                     &state,
                     &target,
+                    client_id.as_deref(),
                     actual_attempts + 1,
                     candidate,
                     &result,
@@ -247,7 +332,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                     release_half_open_probe(&state, candidate).await;
                 }
                 let result = format!("resolve error: {err:#}");
-                trace_attempt(&state, &target, attempt, candidate, &result, false).await;
+                trace_attempt(
+                    &state,
+                    &target,
+                    client_id.as_deref(),
+                    attempt,
+                    candidate,
+                    &result,
+                    false,
+                )
+                .await;
                 decision.attempts.push(DecisionAttempt {
                     attempt,
                     model: candidate.clone(),
@@ -280,7 +374,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 let result = format!("timeout after {}ms", route.policy.header_timeout_ms);
                 record_timeout(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
-                trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+                trace_attempt(
+                    &state,
+                    &target,
+                    client_id.as_deref(),
+                    attempt,
+                    candidate,
+                    &result,
+                    can_fallback,
+                )
+                .await;
                 decision.attempts.push(DecisionAttempt {
                     attempt,
                     model: candidate.clone(),
@@ -300,7 +403,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 let result = format!("request error: {err}");
                 record_request_error(&state, candidate, elapsed_ms).await;
                 circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
-                trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+                trace_attempt(
+                    &state,
+                    &target,
+                    client_id.as_deref(),
+                    attempt,
+                    candidate,
+                    &result,
+                    can_fallback,
+                )
+                .await;
                 decision.attempts.push(DecisionAttempt {
                     attempt,
                     model: candidate.clone(),
@@ -333,7 +445,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         if should_fallback_status(status, &route.policy) {
             circuit_failure(&state, candidate, &route.policy.circuit_breaker).await;
             let result = format!("HTTP {status}");
-            trace_attempt(&state, &target, attempt, candidate, &result, can_fallback).await;
+            trace_attempt(
+                &state,
+                &target,
+                client_id.as_deref(),
+                attempt,
+                candidate,
+                &result,
+                can_fallback,
+            )
+            .await;
             decision.attempts.push(DecisionAttempt {
                 attempt,
                 model: candidate.clone(),
@@ -357,7 +478,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
 
         circuit_success(&state, candidate, &route.policy.circuit_breaker).await;
         let result = format!("HTTP {status}");
-        trace_attempt(&state, &target, attempt, candidate, &result, false).await;
+        trace_attempt(
+            &state,
+            &target,
+            client_id.as_deref(),
+            attempt,
+            candidate,
+            &result,
+            false,
+        )
+        .await;
         decision.attempts.push(DecisionAttempt {
             attempt,
             model: candidate.clone(),
@@ -651,11 +781,14 @@ fn copy_request_headers(
     // anthropic-version is meaningless to OpenAI-protocol upstreams.
     let strip_anthropic_version = matches!(kind, ProviderKind::OpenAICompatible);
     headers.iter().fold(builder, |builder, (name, value)| {
+        // x-ccm-client is local identity and must never reach an upstream
+        // provider, for any provider kind.
         if is_hop_by_hop(name.as_str())
             || name == header::HOST
             || name == header::CONTENT_LENGTH
             || name.as_str().eq_ignore_ascii_case("x-api-key")
             || name == header::AUTHORIZATION
+            || name.as_str().eq_ignore_ascii_case(CLIENT_HEADER)
             || (strip_anthropic_version && name.as_str().eq_ignore_ascii_case("anthropic-version"))
         {
             builder
@@ -682,17 +815,21 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::api::status_view;
+    use crate::control::api::{
+        apply_switch, control_clients, control_decisions, control_status, control_switch,
+        control_traces, status_view, ClientParams,
+    };
     use crate::route::SelectionWeights;
     use crate::routing::decision::now_ms;
     use crate::routing::metrics::{health_score, success_rate, update_latency_ewma};
     use crate::routing::select::{candidate_health_rank, weighted_score};
+    use axum::extract::{Path, Query};
     use axum::{routing::post, Router};
     use serde_json::json;
 
-    /// Both integration tests mutate process env (`CCM_HOME`,
+    /// All three integration tests mutate process env (`CCM_HOME`,
     /// `CCM_<PROVIDER>_API_KEY`); each holds this lock for its whole duration
-    /// so the two never race (V0.3_PLAN §11.2 discipline).
+    /// so they never race (V0.3_PLAN §11.2 discipline).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -900,6 +1037,7 @@ mod tests {
         ProxyState {
             client: Client::new(),
             target: Arc::new(RwLock::new("test-route".to_string())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
             traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
             circuits: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -1615,6 +1753,450 @@ open_ms = 30
         std::env::remove_var("CCM_HOME");
         std::env::remove_var("CCM_OPENAI_API_KEY");
         std::env::remove_var("CCM_NATIVE_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // multi-client scoped switching contract (v0.4 M3)
+    // ------------------------------------------------------------------
+
+    fn write_multi_client_config(root: &std::path::Path, x_url: &str, y_url: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let raw = format!(
+            r#"
+[providers.px]
+kind = "anthropic-compatible"
+base_url = "{x_url}"
+auth = "x-api-key"
+
+[providers.py]
+kind = "anthropic-compatible"
+base_url = "{y_url}"
+auth = "bearer"
+
+[models.modelx]
+provider = "px"
+model_id = "upstream-x"
+
+[models.modely]
+provider = "py"
+model_id = "upstream-y"
+"#
+        );
+        std::fs::write(root.join("config.toml"), raw).unwrap();
+    }
+
+    /// A `/v1/messages` request with optional identity channels: the
+    /// `x-ccm-client` header and/or an `Authorization` bearer token.
+    fn client_tagged_request(
+        client_header: Option<&str>,
+        authorization: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(id) = client_header {
+            builder = builder.header("x-ccm-client", id);
+        }
+        if let Some(token) = authorization {
+            builder = builder.header(header::AUTHORIZATION, token);
+        }
+        builder
+            .body(Body::from(
+                r#"{"model":"ccm","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            ))
+            .unwrap()
+    }
+
+    #[allow(clippy::await_holding_lock)] // see note on the v0.3 test above
+    #[tokio::test]
+    async fn multi_client_integration_covers_scoped_switching_contract() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-client-integration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PX_API_KEY", "x-secret");
+        std::env::set_var("CCM_PY_API_KEY", "y-secret");
+
+        let (x_addr, x_mock, x_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (y_addr, y_mock, y_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_multi_client_config(
+            &root,
+            &format!("http://{x_addr}"),
+            &format!("http://{y_addr}"),
+        );
+        let state = integration_proxy_state();
+        // Global runtime target: modelx (mock X). Bare model targets resolve
+        // with the default policy (ordered, single candidate, always-200
+        // mocks => deterministic, no backoff ever fires).
+        *state.target.write().await = "modelx".to_string();
+
+        // Scoped switches: A -> modely, B -> modelx. Entries exist ONLY from
+        // here. A scoped switch never moves the global target.
+        apply_switch(&state, "modely", Some("A")).await.unwrap();
+        apply_switch(&state, "modelx", Some("B")).await.unwrap();
+        assert_eq!(*state.target.read().await, "modelx");
+
+        let x_before = x_mock.requests.lock().unwrap().len();
+        let y_before = y_mock.requests.lock().unwrap().len();
+
+        // A routes to ITS entry (modely -> mock Y); simultaneously, on the
+        // same proxy state, B routes to its entry (modelx -> mock X). The
+        // upstream body carries the per-target model rewrite, proving which
+        // mock served each client. Strip proof: no identity headers upstream.
+        let response = forward(state.clone(), client_tagged_request(Some("A"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_start"));
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 1);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before);
+        {
+            let requests = y_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.body["model"], "upstream-y");
+            assert!(captured.headers.get("x-ccm-client").is_none());
+            // py injects its bearer credential; no client identity rides along.
+            assert_eq!(
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer y-secret"
+            );
+        }
+
+        let response = forward(state.clone(), client_tagged_request(Some("B"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 1);
+        {
+            let requests = x_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.body["model"], "upstream-x");
+            assert_eq!(
+                captured.headers.get("x-api-key").unwrap().to_str().unwrap(),
+                "x-secret"
+            );
+            assert!(captured.headers.get("x-ccm-client").is_none());
+            assert!(captured.headers.get(header::AUTHORIZATION).is_none());
+        }
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.len(), 2);
+            assert_eq!(clients.get("A").unwrap().target, "modely");
+            assert_eq!(clients.get("A").unwrap().requests, 1);
+            assert!(clients.get("A").unwrap().last_seen_ms > 0);
+            assert_eq!(clients.get("B").unwrap().target, "modelx");
+            assert_eq!(clients.get("B").unwrap().requests, 1);
+        }
+
+        // A no-id request follows the GLOBAL target and changes no entry:
+        // nothing is created, no target moves, no counter bumps.
+        let response = forward(state.clone(), client_tagged_request(None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 2);
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.len(), 2);
+            assert_eq!(clients.get("A").unwrap().requests, 1);
+            assert_eq!(clients.get("B").unwrap().requests, 1);
+            assert_eq!(clients.get("A").unwrap().target, "modely");
+            assert_eq!(clients.get("B").unwrap().target, "modelx");
+        }
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.client, None);
+            assert_eq!(decision.target, "modelx");
+        }
+
+        // A GLOBAL switch (no client param) moves only the global target;
+        // scoped entries survive untouched.
+        apply_switch(&state, "modely", None).await.unwrap();
+        assert_eq!(*state.target.read().await, "modely");
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.get("B").unwrap().target, "modelx");
+        }
+        // B still routes per its own entry (mock X), not the moved global
+        // target — a scoped switch does not affect the other client.
+        let response = forward(state.clone(), client_tagged_request(Some("B"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 3);
+        // ... while a no-id request now follows the moved global target.
+        let response = forward(state.clone(), client_tagged_request(None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 2);
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.get("B").unwrap().requests, 2);
+        }
+
+        // An unknown id (never switched) follows the global target and
+        // creates NO entry.
+        let response = forward(state.clone(), client_tagged_request(Some("ghost"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 3);
+        {
+            let clients = state.clients.read().await;
+            assert!(clients.get("ghost").is_none());
+            assert_eq!(clients.len(), 2);
+        }
+        {
+            let decisions = state.decisions.read().await;
+            let decision = decisions.back().unwrap();
+            assert_eq!(decision.client.as_deref(), Some("ghost"));
+            assert_eq!(decision.target, "modely"); // effective == global
+        }
+
+        // Token channel: `Bearer ccm-local-foo` resolves client foo (no
+        // entry => global). The placeholder token itself must not leak
+        // upstream (Authorization is stripped).
+        let response = forward(
+            state.clone(),
+            client_tagged_request(None, Some("Bearer ccm-local-foo")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 4);
+        {
+            let requests = y_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            // The placeholder token was stripped and replaced by the upstream
+            // credential — `ccm-local-foo` never reaches the provider.
+            assert_eq!(
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer y-secret"
+            );
+            assert!(captured.headers.get("x-ccm-client").is_none());
+        }
+        {
+            let decisions = state.decisions.read().await;
+            assert_eq!(decisions.back().unwrap().client.as_deref(), Some("foo"));
+        }
+        assert!(state.clients.read().await.get("foo").is_none());
+
+        // Legacy v0.3 placeholder (`ccm-local` without an id) => no id.
+        let response = forward(
+            state.clone(),
+            client_tagged_request(None, Some("Bearer ccm-local")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 5);
+        {
+            let decisions = state.decisions.read().await;
+            assert_eq!(decisions.back().unwrap().client, None);
+        }
+
+        // A real-looking bearer credential gets no id, is not parsed beyond
+        // the prefix check, and never appears in any record or header.
+        let response = forward(
+            state.clone(),
+            client_tagged_request(None, Some("Bearer sk-ant-supersecret")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 6);
+        {
+            let requests = y_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            // The real credential was stripped; only the upstream credential
+            // was injected. Nothing else about the token is recorded.
+            assert_eq!(
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer y-secret"
+            );
+        }
+        {
+            let decisions = state.decisions.read().await;
+            assert_eq!(decisions.back().unwrap().client, None);
+        }
+
+        // Header precedence: with both channels present, x-ccm-client wins
+        // over the token (B's entry -> mock X, not A's -> mock Y).
+        let response = forward(
+            state.clone(),
+            client_tagged_request(Some("B"), Some("Bearer ccm-local-A")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 4);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 6);
+        {
+            let decisions = state.decisions.read().await;
+            assert_eq!(decisions.back().unwrap().client.as_deref(), Some("B"));
+        }
+
+        // An out-of-charset request id is treated as NO id (global routing),
+        // never rejected.
+        let response = forward(state.clone(), client_tagged_request(Some("bad id!"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 7);
+        {
+            let decisions = state.decisions.read().await;
+            assert_eq!(decisions.back().unwrap().client, None);
+        }
+
+        // Scoped switch validation: invalid charset (and over-length) ids
+        // fail — surfaced as HTTP 400 by the handler — and unknown targets
+        // fail for BOTH scoped and global switches, changing nothing.
+        let response = control_switch(
+            State(state.clone()),
+            Path("modelx".to_string()),
+            Query(ClientParams {
+                client: Some("bad id!".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("invalid client id"));
+        assert!(apply_switch(&state, "modelx", Some(&"x".repeat(65)))
+            .await
+            .is_err());
+        let response = control_switch(
+            State(state.clone()),
+            Path("no-such-target".to_string()),
+            Query(ClientParams {
+                client: Some("A".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(apply_switch(&state, "no-such-target", None).await.is_err());
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.len(), 2); // no failed-switch side effects
+            assert_eq!(clients.get("A").unwrap().target, "modely");
+            assert_eq!(clients.get("B").unwrap().target, "modelx");
+        }
+
+        // /_ccm/clients lists exactly the switched entries.
+        let clients = control_clients(State(state.clone())).await.0;
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client, "A");
+        assert_eq!(clients[0].target, "modely");
+        assert_eq!(clients[0].requests, 1);
+        assert!(clients[0].last_seen_ms > 0);
+        assert_eq!(clients[1].client, "B");
+        assert_eq!(clients[1].target, "modelx");
+        assert_eq!(clients[1].requests, 3);
+
+        // ?client= filters on traces and decisions; records carry the field.
+        let traces_a = control_traces(
+            State(state.clone()),
+            Query(ClientParams {
+                client: Some("A".to_string()),
+            }),
+        )
+        .await
+        .0;
+        assert!(!traces_a.is_empty());
+        assert!(traces_a.iter().all(|t| t.client.as_deref() == Some("A")));
+        let traces_all = control_traces(State(state.clone()), Query(ClientParams { client: None }))
+            .await
+            .0;
+        assert!(traces_all.len() > traces_a.len());
+        assert!(traces_all.iter().any(|t| t.client.is_none()));
+
+        let decisions_b = control_decisions(
+            State(state.clone()),
+            Query(ClientParams {
+                client: Some("B".to_string()),
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(decisions_b.len(), 3);
+        assert!(decisions_b.iter().all(|d| d.client.as_deref() == Some("B")));
+        let decisions_all =
+            control_decisions(State(state.clone()), Query(ClientParams { client: None }))
+                .await
+                .0;
+        assert_eq!(decisions_all.len(), 11);
+        // Serialized records carry `client` only when present, and never the
+        // real bearer credential.
+        let serialized = serde_json::to_string(&decisions_all).unwrap();
+        assert!(serialized.contains("\"client\":\"B\""));
+        assert!(!serialized.contains("sk-ant-supersecret"));
+        let traces_serialized = serde_json::to_string(&traces_all).unwrap();
+        assert!(!traces_serialized.contains("sk-ant-supersecret"));
+
+        // Status with ?client= shows the client's EFFECTIVE view; without the
+        // parameter the shape is unchanged (no client/follows_global keys).
+        let response = control_status(
+            State(state.clone()),
+            Query(ClientParams {
+                client: Some("B".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["target"], "modelx"); // B's entry
+        assert_eq!(view["model_id"], "upstream-x");
+        assert_eq!(view["client"], "B");
+        assert_eq!(view["follows_global"], false);
+        let response = control_status(
+            State(state.clone()),
+            Query(ClientParams {
+                client: Some("ghost".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["target"], "modely"); // falls back to global
+        assert_eq!(view["client"], "ghost");
+        assert_eq!(view["follows_global"], true);
+        let response = control_status(State(state.clone()), Query(ClientParams { client: None }))
+            .await
+            .into_response();
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["target"], "modely"); // the global view
+        assert!(view.get("client").is_none());
+        assert!(view.get("follows_global").is_none());
+
+        x_task.abort();
+        y_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PX_API_KEY");
+        std::env::remove_var("CCM_PY_API_KEY");
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -3,25 +3,31 @@
 
 use std::cmp::Ordering;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{Response, StatusCode},
     response::IntoResponse,
     routing::{any, get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    proxy::{forward_messages, ProxyState},
+    proxy::{forward_messages, valid_client_id, ClientEntry, ProxyState},
     route::{CircuitBreakerPolicy, RoutePolicy, SelectionWeights},
     routing::decision::{now_ms, AttemptTrace, RoutingDecision},
     routing::metrics::{health_score, success_rate},
     routing::select::{candidate_score_view, selection_name},
 };
+
+/// `?client=<id>` query parameter shared by the client-aware endpoints.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ClientParams {
+    pub(crate) client: Option<String>,
+}
 
 #[derive(Clone, Serialize)]
 struct ModelMetricsView {
@@ -110,6 +116,13 @@ pub(crate) struct StatusView {
     pub(crate) kind: String,
     pub(crate) fallback: Vec<String>,
     pub(crate) policy: PolicyView,
+    // Present only for `?client=<id>` requests (v0.4 M3): the client the view
+    // was resolved for, and whether it fell back to the global target (no
+    // scoped entry). Absent otherwise, so the default shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) follows_global: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -132,12 +145,24 @@ struct RouteView {
 }
 
 #[derive(Serialize)]
-struct SwitchView {
+pub(crate) struct SwitchView {
     requested: String,
     target: String,
     primary: String,
     fallback: Vec<String>,
     policy: PolicyView,
+    // Present only for scoped switches (`?client=<id>`); absent for global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
+}
+
+/// One `/_ccm/clients` entry: a client's runtime switch state.
+#[derive(Serialize)]
+pub(crate) struct ClientView {
+    pub(crate) client: String,
+    pub(crate) target: String,
+    pub(crate) requests: u64,
+    pub(crate) last_seen_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -159,6 +184,7 @@ pub(crate) fn control_router(state: ProxyState) -> Router {
         .route("/_ccm/metrics", get(control_metrics))
         .route("/_ccm/scores", get(control_scores))
         .route("/_ccm/decisions", get(control_decisions))
+        .route("/_ccm/clients", get(control_clients))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
         .with_state(state)
@@ -168,10 +194,26 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn control_status(State(state): State<ProxyState>) -> impl IntoResponse {
-    let target = state.target.read().await.clone();
+pub(crate) async fn control_status(
+    State(state): State<ProxyState>,
+    Query(params): Query<ClientParams>,
+) -> impl IntoResponse {
+    // `?client=<id>` shows that client's EFFECTIVE view: its entry target if
+    // switched, else the global target (indicated by `follows_global`).
+    let global = state.target.read().await.clone();
+    let (target, follows_global) = match params.client.as_deref() {
+        Some(id) => match state.clients.read().await.get(id) {
+            Some(entry) => (entry.target.clone(), Some(false)),
+            None => (global, Some(true)),
+        },
+        None => (global, None),
+    };
     match AppConfig::load().and_then(|config| status_view(&config, &target)) {
-        Ok(view) => Json(view).into_response(),
+        Ok(mut view) => {
+            view.client = params.client.clone();
+            view.follows_global = follows_global;
+            Json(view).into_response()
+        }
         Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
@@ -218,8 +260,18 @@ async fn control_routes(State(state): State<ProxyState>) -> impl IntoResponse {
     }
 }
 
-async fn control_traces(State(state): State<ProxyState>) -> Json<Vec<AttemptTrace>> {
-    let traces = state.traces.read().await.iter().cloned().collect();
+pub(crate) async fn control_traces(
+    State(state): State<ProxyState>,
+    Query(params): Query<ClientParams>,
+) -> Json<Vec<AttemptTrace>> {
+    let traces = state
+        .traces
+        .read()
+        .await
+        .iter()
+        .filter(|trace| client_matches(params.client.as_deref(), &trace.client))
+        .cloned()
+        .collect();
     Json(traces)
 }
 
@@ -297,29 +349,96 @@ async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {
     Json(views).into_response()
 }
 
-async fn control_decisions(State(state): State<ProxyState>) -> Json<Vec<RoutingDecision>> {
-    let decisions = state.decisions.read().await.iter().cloned().collect();
+pub(crate) async fn control_decisions(
+    State(state): State<ProxyState>,
+    Query(params): Query<ClientParams>,
+) -> Json<Vec<RoutingDecision>> {
+    let decisions = state
+        .decisions
+        .read()
+        .await
+        .iter()
+        .filter(|decision| client_matches(params.client.as_deref(), &decision.client))
+        .cloned()
+        .collect();
     Json(decisions)
 }
 
-async fn control_switch(
+/// One client's runtime entry, as listed by `/_ccm/clients`.
+pub(crate) async fn control_clients(State(state): State<ProxyState>) -> Json<Vec<ClientView>> {
+    let clients = state.clients.read().await;
+    let mut views = clients
+        .iter()
+        .map(|(client, entry)| ClientView {
+            client: client.clone(),
+            target: entry.target.clone(),
+            requests: entry.requests,
+            last_seen_ms: entry.last_seen_ms,
+        })
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| left.client.cmp(&right.client));
+    Json(views)
+}
+
+/// A `?client=` filter matches records tagged with exactly that client; no
+/// filter passes everything through unchanged.
+fn client_matches(filter: Option<&str>, client: &Option<String>) -> bool {
+    match filter {
+        Some(id) => client.as_deref() == Some(id),
+        None => true,
+    }
+}
+
+pub(crate) async fn control_switch(
     State(state): State<ProxyState>,
     Path(target): Path<String>,
+    Query(params): Query<ClientParams>,
 ) -> impl IntoResponse {
-    match AppConfig::load().and_then(|config| config.resolve_route(&target)) {
-        Ok(route) => {
-            *state.target.write().await = route.target.clone();
-            Json(SwitchView {
-                requested: target,
-                target: route.target,
-                primary: route.primary,
-                fallback: route.fallback,
-                policy: PolicyView::from(&route.policy),
-            })
-            .into_response()
-        }
+    match apply_switch(&state, &target, params.client.as_deref()).await {
+        Ok(view) => Json(view).into_response(),
         Err(err) => control_error(StatusCode::BAD_REQUEST, err),
     }
+}
+
+/// Switch logic shared by the HTTP handler and the integration test. Without
+/// a client id this is the v0.3 global switch (runtime-only, invariant 8);
+/// with one it create-or-updates that client's in-memory entry — never
+/// `state.toml` (invariant 9) and never the global target. Invalid id charset
+/// and unknown targets are errors (both surface as HTTP 400).
+pub(crate) async fn apply_switch(
+    state: &ProxyState,
+    requested: &str,
+    client: Option<&str>,
+) -> Result<SwitchView> {
+    if let Some(id) = client {
+        if !valid_client_id(id) {
+            bail!("invalid client id `{id}`: must be 1-64 characters of [A-Za-z0-9._-]");
+        }
+    }
+    let config = AppConfig::load()?;
+    let route = config.resolve_route(requested)?;
+    match client {
+        Some(id) => {
+            let mut clients = state.clients.write().await;
+            let entry = clients
+                .entry(id.to_string())
+                .or_insert_with(ClientEntry::default);
+            entry.target = route.target.clone();
+            entry.last_seen_ms = now_ms();
+            // `requests` is a usage counter and survives a re-switch.
+        }
+        None => {
+            *state.target.write().await = route.target.clone();
+        }
+    }
+    Ok(SwitchView {
+        requested: requested.to_string(),
+        target: route.target,
+        primary: route.primary,
+        fallback: route.fallback,
+        policy: PolicyView::from(&route.policy),
+        client: client.map(str::to_string),
+    })
 }
 
 fn control_error(status: StatusCode, err: anyhow::Error) -> Response<Body> {
@@ -340,6 +459,8 @@ pub(crate) fn status_view(config: &AppConfig, target: &str) -> Result<StatusView
         kind: provider_kind_name(config, &model.provider),
         fallback: route.fallback,
         policy: PolicyView::from(&route.policy),
+        client: None,
+        follows_global: None,
     })
 }
 
