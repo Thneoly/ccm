@@ -17,7 +17,7 @@ For implementation continuation and release stabilization, read:
 
 Current status:
 
-> **v0.3.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0). v0.4 in progress: the openai-compatible provider kind with upstream protocol translation, and per-client runtime switching (multi-client routing on one proxy), are implemented.
+> **v0.4.0 release in progress (2026-10-03)** — all v0.4 features have landed on main: the `openai-compatible` provider kind with upstream protocol translation, per-client runtime switching on one proxy (multi-client routing), and persistent observability (JSONL history, usage capture with cost accounting, Prometheus `/metrics`). Verification and packaging are under way. v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
 
 New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
 
@@ -45,7 +45,7 @@ macOS    ~/.local/bin
 
 Override the destination with `-Destination <dir>` (PowerShell) or `CCM_INSTALL_DIR=<dir>` (sh). Re-running the script upgrades an existing installation in place.
 
-macOS is unverified for v0.3 — there is no macOS host to run the release gate on. See [Supported release platforms](#supported-release-platforms).
+macOS is unverified for v0.4 — there is no macOS host to run the release gate on. See [Supported release platforms](#supported-release-platforms).
 
 ## Quick start
 
@@ -568,6 +568,11 @@ CI gate green on every push to main
 release packaging (Windows .exe + Linux binary + checksums)
 ```
 
+v0.4.0 is in release preparation with the same packaging and gate. The v0.4
+scope (multi-client routing, openai-compatible translation, observability
+persistence) and its milestone-by-milestone landing records live in
+`docs/V0.4_PLAN.md`.
+
 ## In-session switching from Claude Code
 
 Install once:
@@ -596,7 +601,7 @@ ccm add provider <name> [--base-url URL]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
   [--cost-weight N]
   [--quality-weight N]
-ccm add route <name> --primary MODEL [--fallback MODEL1,MODEL2]
+ccm add route <name> [--primary MODEL] [--fallback MODEL1,MODEL2]
   [--selection ordered|healthiest|lowest-latency|lowest-cost|weighted]
   [--reliability-weight N]
   [--latency-weight N]
@@ -630,7 +635,7 @@ ccm health <model-or-profile>
 
 ## Release verification
 
-The v0.3 release gate uses the same four Rust checks on every supported platform:
+The release gate uses the same four Rust checks on every supported platform:
 
 ```text
 cargo fmt --all -- --check
@@ -668,21 +673,21 @@ The repository pins the stable Rust channel and installs `rustfmt` and `clippy` 
 
 ### Supported release platforms
 
-The v0.3 release target is:
+The v0.4 release target is:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-02
+Windows  x86_64-pc-windows-msvc     verified 2026-10-03
 Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
 ```
 
-macOS is not claimed as supported for v0.3: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
+macOS is not claimed as supported for v0.4: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
 
 Credential storage is configured per target:
 
 ```text
 Windows → Windows Credential Manager
 Linux   → Linux keyutils + synchronous Secret Service
-macOS   → Apple Keychain (untested; macOS is not a verified v0.3 platform)
+macOS   → Apple Keychain (untested; macOS is not a verified v0.4 platform)
 ```
 
 The Linux keyring backends compile and the credential resolution path is tested with environment credentials; interactive `ccm auth set` against a desktop Secret Service has not been exercised.

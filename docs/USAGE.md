@@ -59,7 +59,7 @@ CCM_INSTALL_DIR=/usr/local/bin ./scripts/install.sh
 
 默认装到 `~/.local/bin`（请确认该目录在你的 PATH 中），同样先构建、后用 `ccm --version` 验证。
 
-**注意：v0.3 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
+**注意：v0.4 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
 
 ### 手动构建
 
@@ -79,7 +79,7 @@ cp target/release/ccm ~/.local/bin/
 ccm --version
 ```
 
-输出 `ccm 0.3.0`。
+输出 `ccm 0.4.0`。
 
 ---
 
@@ -210,7 +210,7 @@ healthy: zai / glm-5.3
 healthy: minimax / MiniMax-M3
 ```
 
-注意 `health` 只接受**模型名或 profile 名，不接受路由名**（`use` / `switch` / `proxy` 三者才接受路由名）。常见报错：401/403 → `provider reachable but authentication failed (401)`；名字拼错 → `unknown model `...``。
+注意 `health` 只接受**模型名或 profile 名，不接受路由名**（`use` / `switch` / `proxy` 三者才接受路由名）。常见报错：401/403 → `provider reachable but authentication failed (401)`；名字拼错 → `unknown model/profile `...``（解析发生在发请求之前）。
 
 ---
 
@@ -251,7 +251,7 @@ ccm 启动 claude 时设置的环境变量：
 
 **openai-compatible 模型不支持直连**：直连模式没有翻译层，ccm 会在启动前直接拒绝并报错 `cannot launch ... directly: openai-compatible models are proxy-only ...`，不会把任何请求发给上游。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
 
-没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用——解析口径只有模型/profile，传路由名会报 `unknown model or profile `...``。
+没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用——解析口径只有模型/profile，传路由名会报 `unknown model/profile `...``。
 
 ### 4.3 代理模式
 
@@ -783,13 +783,13 @@ Claude Code 的 `~/.claude/settings.json`（和 `settings.local.json`）里的 `
 不会了（v0.4）。每个 `ccm run --proxy` 会话带自己的 client id（默认随机，可 `--client` / `CCM_CLIENT_ID` 指定），会话内 `/switch` 继承 `CCM_CLIENT_ID` 只切本会话，`ccm run --proxy <target>` 的预切换也只作用于本会话。只有不带 id 的 `ccm switch`（或显式 `--global`）才动全局默认。没单独切过的客户端跟随全局。详见 4.6。client id 不是认证——别指望它隔离不可信的本地进程。
 
 **`ccm proxy --bind 0.0.0.0`（或局域网 IP）被拒？**
-v0.3 只允许回环地址（`127.x.x.x`、`[::1]`），完整报错：
+ccm 只允许回环地址（`127.x.x.x`、`[::1]`），完整报错：
 
 ```text
-refusing to bind non-loopback address 0.0.0.0: the CCM control API is unauthenticated, remote binding is not supported in v0.3
+refusing to bind non-loopback address 0.0.0.0: the CCM control API is unauthenticated, remote binding is not supported
 ```
 
-控制 API 和凭据注入代理都没有鉴权，远程/LAN 绑定需要先做鉴权设计（v0.3 之后）。想从别的机器用，请在那台机器上各自跑 ccm。
+控制 API 和凭据注入代理都没有鉴权，远程/LAN 绑定需要先做鉴权设计（仍在 backlog）。想从别的机器用，请在那台机器上各自跑 ccm。
 
 **遇到 429 / 超时后，去哪确认有没有降级？**
 三处：代理 stderr 的 `ccm route=... result=... action=fallback` 日志；`GET /_ccm/decisions`（每次请求的尝试序列）；`GET /_ccm/circuits` + `GET /_ccm/metrics`（谁被熔断、成功率如何）。

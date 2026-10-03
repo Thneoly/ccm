@@ -581,7 +581,7 @@ Binding Proxy to a non-loopback address would expose:
 - upstream proxy capability
 - access to credentials resolved by CCM
 
-v0.3 enforces loopback-only binding: `ccm proxy` refuses non-loopback bind addresses before loading configuration or opening the listener. Remote/LAN binding requires an authentication design first and is deferred to post-v0.3.
+v0.3 enforces loopback-only binding: `ccm proxy` refuses non-loopback bind addresses before loading configuration or opening the listener. Remote/LAN binding requires an authentication design first and remains deferred (open backlog, unchanged through v0.4).
 
 ## 14. Main Source Modules
 
@@ -652,13 +652,13 @@ failover), and HALF_OPEN probe release on translate failure.
 
 ## 16. Cross-platform Release Target
 
-Target platforms and v0.3 claim status:
+Target platforms and v0.4 claim status:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-02
+Windows  x86_64-pc-windows-msvc     verified 2026-10-03
 Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
-macOS    aarch64-apple-darwin       not claimed for v0.3 (no host to verify)
-macOS    x86_64-apple-darwin        not claimed for v0.3 (no host to verify)
+macOS    aarch64-apple-darwin       not claimed for v0.4 (no host to verify)
+macOS    x86_64-apple-darwin        not claimed for v0.4 (no host to verify)
 ```
 
 See `docs/V0.3_PLAN.md` §3 for the decision record and macOS re-entry criteria.
@@ -690,9 +690,17 @@ scope then and where each item now stands:
   `openai-compatible` provider kind (`src/translate.rs` + proxy wiring);
   see §4 and the v0.4 plan
 - Codex/Aider/OpenCode native integrations (v0.4+ scope)
-- persistent metrics database (still out of scope)
-- persistent decision trace/replay store (still out of scope)
-- Prometheus exporter (still out of scope)
+- ~~persistent metrics database~~ — delivered in v0.4 M5 as append-only
+  JSONL metric snapshots (`metrics.jsonl`, 30s cadence, rotation +
+  retention) read back by `ccm history metrics` and the history engine;
+  deliberately not a queryable database
+- ~~persistent decision trace/replay store~~ — delivered in v0.4 M5:
+  every routing decision appends to `decisions.jsonl` with disk-backed
+  filtered queries (`/_ccm/decisions?since=&until=&model=`,
+  `ccm history decisions`); the attempt-trace ring (last 100) stays
+  runtime-only by design, and full replay tooling remains unscoped
+- ~~Prometheus exporter~~ — delivered in v0.4 M7 (`GET /metrics`
+  hand-rendered text format on the same listener; see §8)
 - Web UI (still out of scope)
 - distributed CCM (still out of scope)
 - remote CCM control plane (still out of scope)
@@ -730,7 +738,7 @@ Validation should eventually enforce legal HTTP ranges and possibly deduplicate 
 
 ### 18.4 Runtime observability persistence
 
-Partially resolved in v0.4 M5: routing decisions, periodic metric
+Resolved across v0.4 M5–M7. M5: routing decisions, periodic metric
 snapshots, and circuit transitions persist to append-only JSONL under
 `$CCM_HOME/history/` (rotation + 14-day retention, single-writer OS lock;
 query via `/_ccm/decisions?since=&until=&model=` or `ccm history`, both
