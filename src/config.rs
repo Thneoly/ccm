@@ -103,6 +103,9 @@ impl AppConfig {
                     cost_weight: 1.0,
                     quality_weight: 1.0,
                 },
+                // the starter ships unpriced: prices are hand-entered facts
+                // about the owner's plan, never sample values (M6).
+                pricing: None,
             },
         );
         models.insert(
@@ -114,6 +117,7 @@ impl AppConfig {
                     cost_weight: 0.25,
                     quality_weight: 0.85,
                 },
+                pricing: None,
             },
         );
 
@@ -184,6 +188,7 @@ impl AppConfig {
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let config: AppConfig = toml::from_str(&raw).context("invalid TOML configuration")?;
         config.validate_observability()?;
+        config.validate_model_pricing()?;
         Ok(config)
     }
 
@@ -203,6 +208,31 @@ impl AppConfig {
         }
         if observability.metrics_snapshot_interval_secs == 0 {
             bail!("[observability] metrics_snapshot_interval_secs must be greater than 0");
+        }
+        Ok(())
+    }
+
+    /// `[models.<name>.pricing]` sanity (v0.4 M6): prices are USD per
+    /// million tokens; a negative or non-finite price would produce
+    /// meaningless (or NaN-poisoned) cost sums. A missing table stays
+    /// legal — unpriced is a recorded state, not an error.
+    pub fn validate_model_pricing(&self) -> Result<()> {
+        for (name, model) in &self.models {
+            let Some(pricing) = &model.pricing else {
+                continue;
+            };
+            for (field, value) in [
+                ("input", pricing.input),
+                ("output", pricing.output),
+                ("cache_read", pricing.cache_read),
+                ("cache_write", pricing.cache_write),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    bail!(
+                        "model `{name}` pricing.{field} must be a finite value >= 0 (USD per million tokens)"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -374,6 +404,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelPricing;
 
     #[test]
     fn legacy_current_deserializes_but_is_not_serialized() {
@@ -430,6 +461,98 @@ base_url = "https://api.anthropic.com"
     }
 
     #[test]
+    fn pricing_defaults_and_validation() {
+        // pre-M6 configs load unchanged with pricing = None
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-5-5"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert!(config.models["claude"].pricing.is_none());
+        config.validate_model_pricing().unwrap();
+
+        // a full table loads; cache rates default to 0
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-5-5"
+
+[models.claude.pricing]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        let pricing = config.models["claude"].pricing.as_ref().unwrap();
+        assert_eq!(
+            (
+                pricing.input,
+                pricing.output,
+                pricing.cache_read,
+                pricing.cache_write
+            ),
+            (3.0, 15.0, 0.3, 3.75)
+        );
+        config.validate_model_pricing().unwrap();
+        // 1M in + 1M out + 2M cache-read + 1M cache-write = 3 + 15 + 0.6 + 3.75
+        assert!(
+            (pricing.cost_usd(1_000_000, 1_000_000, 2_000_000, 1_000_000) - 22.35).abs() < 1e-9
+        );
+
+        // missing cache rates default to 0, not to the input price
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-5-5"
+pricing = { input = 3.0, output = 15.0 }
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        let pricing = config.models["claude"].pricing.as_ref().unwrap();
+        assert_eq!((pricing.cache_read, pricing.cache_write), (0.0, 0.0));
+        assert!((pricing.cost_usd(0, 0, 1_000_000, 1_000_000) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pricing_validation_rejects_negative_and_non_finite() {
+        for bad in [-0.01, f64::NAN, f64::INFINITY] {
+            let mut config = AppConfig::starter();
+            config.models.get_mut("glm").unwrap().pricing = Some(ModelPricing {
+                input: bad,
+                output: 1.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            });
+            assert!(
+                config.validate_model_pricing().is_err(),
+                "input = {bad} must be rejected"
+            );
+        }
+        // every field is checked, not just input
+        let mut config = AppConfig::starter();
+        config.models.get_mut("glm").unwrap().pricing = Some(ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_read: 0.0,
+            cache_write: -1.0,
+        });
+        assert!(config.validate_model_pricing().is_err());
+    }
+
+    #[test]
     fn resolves_model_alias() {
         let config = AppConfig::starter();
         assert_eq!(config.resolve_target("glm").unwrap(), "glm");
@@ -461,6 +584,7 @@ base_url = "https://api.anthropic.com"
                 provider: "missing".to_string(),
                 model_id: "x".to_string(),
                 routing: ModelRouting::default(),
+                pricing: None,
             },
         );
         assert!(result.is_err());
@@ -478,6 +602,7 @@ base_url = "https://api.anthropic.com"
                     cost_weight: -1.0,
                     quality_weight: 1.0,
                 },
+                pricing: None,
             },
         );
         assert!(result.is_err());
@@ -501,6 +626,7 @@ base_url = "https://api.anthropic.com"
                     provider: "deepseek".to_string(),
                     model_id: "deepseek-chat".to_string(),
                     routing: ModelRouting::default(),
+                    pricing: None,
                 },
             )
             .unwrap();

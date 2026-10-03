@@ -132,12 +132,13 @@ impl From<&crate::config::ObservabilityConfig> for HistoryLimits {
 // Streams and events
 // ===========================================================================
 
-/// The three persisted JSONL kinds.
+/// The four persisted JSONL kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HistoryStream {
     Decisions,
     Metrics,
     Circuit,
+    Usage,
 }
 
 impl HistoryStream {
@@ -146,6 +147,7 @@ impl HistoryStream {
             HistoryStream::Decisions => "decisions",
             HistoryStream::Metrics => "metrics",
             HistoryStream::Circuit => "circuit",
+            HistoryStream::Usage => "usage",
         }
     }
 }
@@ -156,6 +158,7 @@ pub(crate) enum HistoryEvent {
     Decision(String),
     Metrics(String),
     Circuit(String),
+    Usage(String),
 }
 
 impl HistoryEvent {
@@ -164,6 +167,7 @@ impl HistoryEvent {
             HistoryEvent::Decision(_) => HistoryStream::Decisions,
             HistoryEvent::Metrics(_) => HistoryStream::Metrics,
             HistoryEvent::Circuit(_) => HistoryStream::Circuit,
+            HistoryEvent::Usage(_) => HistoryStream::Usage,
         }
     }
 
@@ -171,7 +175,8 @@ impl HistoryEvent {
         match self {
             HistoryEvent::Decision(line)
             | HistoryEvent::Metrics(line)
-            | HistoryEvent::Circuit(line) => line,
+            | HistoryEvent::Circuit(line)
+            | HistoryEvent::Usage(line) => line,
         }
     }
 }
@@ -257,6 +262,17 @@ impl History {
             Ok(line) => self.record(HistoryEvent::Circuit(line)),
             Err(err) => {
                 eprintln!("ccm: history: failed to serialize circuit transition: {err}");
+            }
+        }
+    }
+
+    /// One captured usage record (v0.4 M6). Emitted from the response-body
+    /// wrapper's finalize closure on the request task.
+    pub(crate) fn record_usage(&self, record: &crate::usage::UsageRecord) {
+        match serde_json::to_string(record) {
+            Ok(line) => self.record(HistoryEvent::Usage(line)),
+            Err(err) => {
+                eprintln!("ccm: history: failed to serialize usage record: {err}");
             }
         }
     }
@@ -432,9 +448,9 @@ fn spawn_writer(
 struct StreamFiles {
     dir: PathBuf,
     limits: HistoryLimits,
-    writers: [Option<BufWriter<File>>; 3],
-    records: [u64; 3],
-    bytes: [u64; 3],
+    writers: [Option<BufWriter<File>>; 4],
+    records: [u64; 4],
+    bytes: [u64; 4],
 }
 
 impl StreamFiles {
@@ -442,9 +458,9 @@ impl StreamFiles {
         Self {
             dir,
             limits,
-            writers: [None, None, None],
-            records: [0; 3],
-            bytes: [0; 3],
+            writers: [None, None, None, None],
+            records: [0; 4],
+            bytes: [0; 4],
         }
     }
 
@@ -453,6 +469,7 @@ impl StreamFiles {
             HistoryStream::Decisions => 0,
             HistoryStream::Metrics => 1,
             HistoryStream::Circuit => 2,
+            HistoryStream::Usage => 3,
         }
     }
 
@@ -679,6 +696,7 @@ fn jsonl_lines(path: &Path) -> Vec<String> {
     };
     let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
+    let mut first = true;
     loop {
         let mut bytes = Vec::new();
         match reader.read_until(b'\n', &mut bytes) {
@@ -689,6 +707,17 @@ fn jsonl_lines(path: &Path) -> Vec<String> {
                     if bytes.last() == Some(&b'\r') {
                         bytes.pop();
                     }
+                }
+                // A UTF-8 BOM (EF BB BF) on the first line — the writer never
+                // emits one, but a Windows editor or PowerShell redirection
+                // merging files does — would otherwise fail that line's JSON
+                // parse and silently drop the first record.
+                if first {
+                    bytes = bytes
+                        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or(bytes);
+                    first = false;
                 }
                 let line = String::from_utf8_lossy(&bytes);
                 if !line.trim().is_empty() {
@@ -785,6 +814,101 @@ fn matches_query(record: &RoutingDecision, query: &DecisionQuery) -> bool {
         }
     }
     true
+}
+
+/// Time / model / client / limit filters for disk-backed usage queries —
+/// the [`UsageRecord`](crate::usage::UsageRecord) counterpart of
+/// [`DecisionQuery`]. `model` matches the record's model alias directly (a
+/// usage record belongs to the one model that served the response).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsageQuery {
+    pub(crate) since: Option<u64>,
+    pub(crate) until: Option<u64>,
+    pub(crate) model: Option<String>,
+    pub(crate) client: Option<String>,
+    pub(crate) limit: Option<usize>,
+}
+
+/// Read persisted usage records matching `query`, oldest first (the most
+/// recent N when `limit` is set) — same bounded newest-first walk as
+/// [`read_decisions`]; the day aggregation on `/_ccm/cost` passes explicit
+/// `since`/`until` with no limit, because an aggregation must see the whole
+/// day, not the newest slice of it. Both branches prune rotated files whose
+/// name timestamp predates `since`, so even the unbounded path reads only
+/// the files a `since` window can touch (plus the active file) instead of
+/// deserializing the entire retained history.
+pub(crate) fn read_usage(dir: &Path, query: &UsageQuery) -> Result<Vec<crate::usage::UsageRecord>> {
+    let matches = |record: &crate::usage::UsageRecord| {
+        if let Some(since) = query.since {
+            if record.timestamp_ms < since {
+                return false;
+            }
+        }
+        if let Some(until) = query.until {
+            if record.timestamp_ms > until {
+                return false;
+            }
+        }
+        if let Some(model) = &query.model {
+            if record.model != *model {
+                return false;
+            }
+        }
+        if let Some(client) = &query.client {
+            if record.client.as_deref() != Some(client.as_str()) {
+                return false;
+            }
+        }
+        true
+    };
+    if let Some(limit) = query.limit {
+        let mut newest: Vec<crate::usage::UsageRecord> = Vec::new();
+        'files: for (key, path) in kind_files_keyed(dir, HistoryStream::Usage)
+            .into_iter()
+            .rev()
+        {
+            if let Some(since) = query.since {
+                if key.0 != u64::MAX && key.0 < since {
+                    break;
+                }
+            }
+            for line in jsonl_lines(&path).into_iter().rev() {
+                let Ok(record) = serde_json::from_str::<crate::usage::UsageRecord>(&line) else {
+                    continue;
+                };
+                if !matches(&record) {
+                    continue;
+                }
+                if newest.len() == limit {
+                    break 'files;
+                }
+                newest.push(record);
+            }
+        }
+        newest.reverse();
+        return Ok(newest);
+    }
+    let mut records: Vec<crate::usage::UsageRecord> = Vec::new();
+    for (key, path) in kind_files_keyed(dir, HistoryStream::Usage) {
+        // Same since-pruning as the bounded branch, in ascending order: a
+        // rotated file's name timestamp is an upper bound on the records
+        // inside it, so a file that rotated before `since` holds nothing
+        // relevant — skip it whole instead of deserializing all of it. The
+        // day aggregation on `/_ccm/cost` reaches this branch with `since`
+        // set on every request; without the prune it would deserialize the
+        // entire retained usage history per query (the exact pattern the M5
+        // fix pass removed from decisions). The active file keys u64::MAX
+        // and is always read; `since: None` (unfiltered offline reads)
+        // prunes nothing.
+        if let Some(since) = query.since {
+            if key.0 != u64::MAX && key.0 < since {
+                continue;
+            }
+        }
+        records.extend(parse_lines::<crate::usage::UsageRecord>(&path));
+    }
+    records.retain(|record| matches(record));
+    Ok(records)
 }
 
 /// Read metric snapshots oldest-first; `limit` keeps the most recent N.
@@ -1531,5 +1655,179 @@ mod tests {
     #[test]
     fn json_helper() {
         assert_eq!(json!({"ok": true})["ok"], true);
+    }
+
+    // a UTF-8 BOM on the first line (a Windows editor or PowerShell
+    // redirection merging history files) must not cost the first record
+    #[test]
+    fn jsonl_lines_tolerate_a_leading_bom() {
+        let (dir, history) = store_with("bom", HistoryLimits::default());
+        history.record_decision(&decision(1, 1_000, &["glm"], Some("glm")));
+        history.record_decision(&decision(2, 2_000, &["glm"], Some("glm")));
+        drop(history);
+
+        let path = dir.path().join("decisions.jsonl");
+        let body = fs::read(&path).unwrap();
+        let mut bommed = vec![0xEF, 0xBB, 0xBF];
+        bommed.extend_from_slice(&body);
+        fs::write(&path, bommed).unwrap();
+
+        let records = read_decisions(dir.path(), &DecisionQuery::default()).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the BOM'd first record still reads"
+        );
+    }
+
+    /// A usage record shaped exactly like the proxy emits it (built through
+    /// the scanner + `from_capture`, cost math included), with a
+    /// deterministic `timestamp_ms` for time-window tests.
+    fn usage_record(
+        id: u64,
+        timestamp_ms: u64,
+        model: &str,
+        client: Option<&str>,
+        priced: bool,
+    ) -> crate::usage::UsageRecord {
+        use crate::model::ModelPricing;
+        use crate::usage::{UsageMeta, UsageRecord};
+
+        let meta = UsageMeta {
+            decision_id: id,
+            model: model.to_string(),
+            client: client.map(str::to_string),
+            pricing: priced.then_some(ModelPricing {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            }),
+        };
+        let mut scanner = crate::usage::UsageScanner::new(false);
+        scanner.feed(
+            format!("{{\"usage\":{{\"input_tokens\":{id},\"output_tokens\":2}}}}").as_bytes(),
+        );
+        let mut record = UsageRecord::from_capture(meta, scanner.finish(true));
+        record.timestamp_ms = timestamp_ms;
+        record
+    }
+
+    // usage records round-trip through the store with the same filter
+    // semantics as decisions: time window, model alias, client tag, and the
+    // bounded newest-first walk (v0.4 M6).
+    #[test]
+    fn read_usage_filters_and_bounded_walk() {
+        let (dir, history) = store_with("usage-read", HistoryLimits::default());
+        history.record_usage(&usage_record(1, 1_000, "glm", Some("term1"), true));
+        history.record_usage(&usage_record(2, 2_000, "deepseek", None, false));
+        history.record_usage(&usage_record(3, 3_000, "glm", None, true));
+        drop(history); // flush
+
+        // Full scan, oldest first.
+        let all = read_usage(dir.path(), &UsageQuery::default()).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // Day window (inclusive bounds) — the /_ccm/cost shape.
+        let window = read_usage(
+            dir.path(),
+            &UsageQuery {
+                since: Some(2_000),
+                until: Some(2_000),
+                ..UsageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].model, "deepseek");
+        assert!(window[0].pricing.is_none(), "unpriced record kept as-is");
+
+        // Model alias filter + client filter compose.
+        let by_model = read_usage(
+            dir.path(),
+            &UsageQuery {
+                model: Some("glm".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_model.len(), 2);
+        let by_client = read_usage(
+            dir.path(),
+            &UsageQuery {
+                client: Some("term1".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_client.len(), 1);
+        assert_eq!(by_client[0].decision_id, 1);
+
+        // Bounded walk keeps the newest N, oldest-first order.
+        let newest = read_usage(
+            dir.path(),
+            &UsageQuery {
+                limit: Some(2),
+                ..UsageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            newest.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    // `since` prunes whole rotated files in the UNBOUNDED usage walk too —
+    // the `/_ccm/cost` path reaches that branch with `since` set on every
+    // request (M6 verify finding: without the prune each query
+    // deserialized the entire retained usage history). The prune's contract:
+    // a rotated file whose name timestamp predates `since` is skipped whole.
+    // Pinned with a discriminating record — a timestamp that would match the
+    // window but lives in a pre-`since` file; in real history the name is an
+    // upper bound on the records inside so such a line cannot exist, and the
+    // prune must win if one ever does. Files rotated at/after `since` are
+    // read and filtered per record as usual.
+    #[test]
+    fn unbounded_usage_read_prunes_rotated_files_older_than_since() {
+        let dir = TempDir::new("usage-prune");
+        let line = |id: u64, ts: u64| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&usage_record(id, ts, "glm", None, true)).unwrap()
+            )
+        };
+        fs::write(
+            dir.path().join("usage-1000.jsonl"),
+            format!("{}{}", line(1, 900), line(2, 2_500)),
+        )
+        .unwrap();
+        fs::write(dir.path().join("usage-2000.jsonl"), line(3, 1_500)).unwrap();
+        fs::write(dir.path().join("usage.jsonl"), line(4, 3_000)).unwrap();
+
+        let records = read_usage(
+            dir.path(),
+            &UsageQuery {
+                since: Some(2_000),
+                ..UsageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![4],
+            "pre-since rotated file skipped whole; at-since files filtered per record"
+        );
+
+        // Without `since` (offline full scans) nothing is pruned: all four
+        // records read, oldest first, regardless of file names.
+        let all = read_usage(dir.path(), &UsageQuery::default()).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
     }
 }

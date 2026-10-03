@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     pin::Pin,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{atomic::AtomicU64, Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
@@ -43,6 +43,7 @@ use crate::{
     routing::select::select_candidates,
     state::AppState,
     translate::{self, SseEvent, SseTranslator},
+    usage::{UsageMeta, UsageRecord, UsageStream},
 };
 
 #[derive(Clone)]
@@ -63,6 +64,12 @@ pub(crate) struct ProxyState {
     /// and whenever the single-writer lock cannot be acquired — every
     /// `record_*` is then a no-op, so no call site branches on it.
     pub(crate) history: History,
+    /// In-memory usage-record ring (v0.4 M6), newest last, capped at
+    /// [`crate::usage::USAGE_CAPACITY`]. A plain `Mutex`, not the tokio
+    /// `RwLock` used by the neighbors: the finalize path runs synchronously
+    /// inside `poll_next`/`Drop` on the response body, where awaiting is
+    /// impossible.
+    pub(crate) usage: Arc<Mutex<VecDeque<UsageRecord>>>,
 }
 
 /// One client's runtime switch state. `requests` / `last_seen_ms` are usage
@@ -136,6 +143,9 @@ pub async fn serve(bind: &str) -> Result<()> {
         decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
         decision_seq: Arc::new(AtomicU64::new(decision_seq_start)),
         history,
+        usage: Arc::new(Mutex::new(VecDeque::with_capacity(
+            crate::usage::USAGE_CAPACITY,
+        ))),
     };
 
     // Periodic whole-state metric snapshots (v0.4 M5). Skipped while the
@@ -548,7 +558,8 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
             if matches!(provider.kind, ProviderKind::OpenAICompatible) {
                 return translated_error_response(upstream_response).await;
             }
-            return proxy_response(upstream_response);
+            // Terminal fallback-status passthrough: an error body, no usage.
+            return proxy_response(upstream_response, None);
         }
 
         circuit_success(&state, candidate, &route.policy.circuit_breaker).await;
@@ -572,6 +583,16 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         });
         decision.selected = Some(candidate.clone());
         decision.outcome = result;
+        // Usage capture (v0.4 M6): wrap the ACCEPTED body only. The
+        // decision id must be read before `store_decision` moves it.
+        let usage = usage_context(
+            &state,
+            &config,
+            decision.id,
+            candidate,
+            client_id.as_deref(),
+            status.is_success(),
+        );
         store_decision(&state, decision).await;
         if matches!(provider.kind, ProviderKind::OpenAICompatible) {
             if !status.is_success() {
@@ -580,11 +601,11 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 return translated_error_response(upstream_response).await;
             }
             if client_wants_stream && response_is_event_stream(&upstream_response) {
-                return translated_sse_response(upstream_response, &model_id);
+                return translated_sse_response(upstream_response, &model_id, usage.as_ref());
             }
-            return translated_json_response(upstream_response, &model_id).await;
+            return translated_json_response(upstream_response, &model_id, usage.as_ref()).await;
         }
-        return proxy_response(upstream_response);
+        return proxy_response(upstream_response, usage.as_ref());
     }
 
     decision.outcome = if failures.is_empty() {
@@ -614,9 +635,87 @@ fn should_fallback_status(status: reqwest::StatusCode, policy: &RoutePolicy) -> 
     policy.fallback_on.contains(&status.as_u16())
 }
 
-fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>> {
+// ===========================================================================
+// usage capture wiring (v0.4 M6)
+// ===========================================================================
+
+/// What the unified response dispatch point hands to the usage wrapper for
+/// one accepted response. Built per terminal attempt in `forward()`;
+/// `None` on the error passthrough paths (terminal fallback status,
+/// translated error bodies) where no accepted body is worth scanning. The
+/// pricing snapshot is resolved here, at capture time, so a config edit
+/// mid-flight never rewrites an already-emitted record.
+struct UsageContext {
+    meta: UsageMeta,
+    history: History,
+    ring: Arc<Mutex<VecDeque<UsageRecord>>>,
+}
+
+impl UsageContext {
+    /// Wrap a response-body stream with the usage scanner; `sse` selects
+    /// line scanning (true) vs whole-body JSON scan (false). The record is
+    /// emitted on stream end, transport error, or wrapper Drop (client
+    /// disconnect) — see [`UsageStream`]. Both the ring push and the
+    /// history enqueue are synchronous and non-blocking by design.
+    fn wrap<E: Send + 'static>(
+        &self,
+        inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>,
+        sse: bool,
+    ) -> UsageStream<E> {
+        let meta = self.meta.clone();
+        let history = self.history.clone();
+        let ring = Arc::clone(&self.ring);
+        UsageStream::new(inner, sse, meta, move |record| {
+            {
+                let mut ring = ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if ring.len() >= crate::usage::USAGE_CAPACITY {
+                    ring.pop_front();
+                }
+                ring.push_back(record.clone());
+            }
+            history.record_usage(&record);
+        })
+    }
+}
+
+/// Build the usage capture context for one terminal attempt, or `None`
+/// when this response is not an accepted 2xx body. Kept next to the
+/// dispatch call sites so the accepted/error split stays visible.
+fn usage_context(
+    state: &ProxyState,
+    config: &AppConfig,
+    decision_id: u64,
+    candidate: &str,
+    client: Option<&str>,
+    accepted: bool,
+) -> Option<UsageContext> {
+    if !accepted {
+        return None;
+    }
+    Some(UsageContext {
+        meta: UsageMeta {
+            decision_id,
+            model: candidate.to_string(),
+            client: client.map(str::to_string),
+            // Snapshot, not a reference into config: the body may outlive
+            // this request's config reload.
+            pricing: config
+                .models
+                .get(candidate)
+                .and_then(|model| model.pricing.clone()),
+        },
+        history: state.history.clone(),
+        ring: Arc::clone(&state.usage),
+    })
+}
+
+fn proxy_response(
+    upstream_response: reqwest::Response,
+    usage: Option<&UsageContext>,
+) -> Result<Response<Body>> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
+    let sse = response_is_event_stream(&upstream_response);
     let stream = upstream_response.bytes_stream();
 
     let mut response = Response::builder().status(status.as_u16());
@@ -627,8 +726,14 @@ fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>
         response = response.header(name, value);
     }
 
+    let boxed: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(stream);
+    let body = match usage {
+        // Native path: SSE vs JSON follows the actual upstream content-type.
+        Some(ctx) => Body::from_stream(ctx.wrap(boxed, sse)),
+        None => Body::from_stream(boxed),
+    };
     response
-        .body(Body::from_stream(stream))
+        .body(body)
         .context("failed to build proxy response")
 }
 
@@ -686,6 +791,7 @@ fn response_is_event_stream(response: &reqwest::Response) -> bool {
 fn translated_sse_response(
     upstream_response: reqwest::Response,
     model_id: &str,
+    usage: Option<&UsageContext>,
 ) -> Result<Response<Body>> {
     let status = upstream_response.status();
     let stream = TranslatedSseStream {
@@ -694,10 +800,17 @@ fn translated_sse_response(
         pending: VecDeque::new(),
         finished: false,
     };
+    let boxed: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = Box::pin(stream);
+    let body = match usage {
+        // The wire body is the TRANSLATED anthropic event stream — that is
+        // what the scanner sees, so message_delta carries the real usage.
+        Some(ctx) => Body::from_stream(ctx.wrap(boxed, true)),
+        None => Body::from_stream(boxed),
+    };
     Response::builder()
         .status(status.as_u16())
         .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
+        .body(body)
         .context("failed to build translated streaming response")
 }
 
@@ -708,6 +821,7 @@ fn translated_sse_response(
 async fn translated_json_response(
     upstream_response: reqwest::Response,
     model_id: &str,
+    usage: Option<&UsageContext>,
 ) -> Result<Response<Body>> {
     let status = upstream_response.status();
     let body = upstream_response
@@ -724,6 +838,8 @@ async fn translated_json_response(
                 status,
                 serde_json::to_vec(&translate::translate_error_body(&openai))
                     .context("failed to serialize error response")?,
+                // an error body is not a billable response
+                None,
             );
         }
         Ok(openai) => translate::translate_response(&openai, model_id)
@@ -736,11 +852,14 @@ async fn translated_json_response(
         Ok(message) => chunked_json_response(
             status,
             serde_json::to_vec(&message).context("failed to serialize translated response")?,
+            // the translated anthropic envelope carries the usage object
+            usage,
         ),
         Err(err) => chunked_json_response(
             StatusCode::BAD_GATEWAY,
             serde_json::to_vec(&translation_failure_body(&format!("{err:#}")))
                 .context("failed to serialize error response")?,
+            None,
         ),
     }
 }
@@ -763,6 +882,8 @@ async fn translated_error_response(upstream_response: reqwest::Response) -> Resu
     chunked_json_response(
         status,
         serde_json::to_vec(&envelope).context("failed to serialize error response")?,
+        // terminal error passthrough: no usage capture
+        None,
     )
 }
 
@@ -778,12 +899,24 @@ fn translation_failure_body(detail: &str) -> Value {
 }
 
 /// JSON response without content-length (chunked), used by the translated
-/// non-streaming paths so the body framing matches `proxy_response`.
-fn chunked_json_response(status: StatusCode, body: Vec<u8>) -> Result<Response<Body>> {
+/// non-streaming paths so the body framing matches `proxy_response`. A
+/// `usage` context (accepted bodies only) wraps the single chunk with the
+/// usage scanner.
+fn chunked_json_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    usage: Option<&UsageContext>,
+) -> Result<Response<Body>> {
+    let boxed: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> =
+        Box::pin(OnceStream::new(body));
+    let body = match usage {
+        Some(ctx) => Body::from_stream(ctx.wrap(boxed, false)),
+        None => Body::from_stream(boxed),
+    };
     Response::builder()
         .status(status.as_u16())
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from_stream(OnceStream::new(body)))
+        .body(body)
         .context("failed to build translated response")
 }
 
@@ -1058,6 +1191,10 @@ mod tests {
         OkStream,
         Status(StatusCode),
         DelayOk(u64),
+        // 200 + text/event-stream carrying a REAL native usage contract:
+        // message_start with input/cache tokens, message_delta with output
+        // (v0.4 M6 usage-capture fixtures).
+        OkStreamWithUsage,
         // 200 + text/event-stream with scriptable raw SSE bytes (the
         // openai-compatible upstream contract).
         OpenaiSse(String),
@@ -1098,6 +1235,7 @@ mod tests {
 
         match state.behavior.read().await.clone() {
             MockBehavior::OkStream => stream_ok(),
+            MockBehavior::OkStreamWithUsage => stream_ok_with_usage(),
             MockBehavior::Status(status) => Response::builder()
                 .status(status)
                 .body(Body::from(format!("mock {status}")))
@@ -1141,6 +1279,25 @@ mod tests {
             .unwrap()
     }
 
+    /// Native anthropic stream with the full usage contract: start carries
+    /// input + cache_read + cache_write, the final delta carries output.
+    fn stream_ok_with_usage() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":5}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )))
+            .unwrap()
+    }
+
     async fn spawn_mock(
         behavior: MockBehavior,
     ) -> (SocketAddr, MockProviderState, tokio::task::JoinHandle<()>) {
@@ -1171,6 +1328,9 @@ mod tests {
             decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
             decision_seq: Arc::new(AtomicU64::new(1)),
             history: History::disabled(),
+            usage: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+                crate::usage::USAGE_CAPACITY,
+            ))),
         }
     }
 
@@ -1185,7 +1345,13 @@ mod tests {
             .unwrap()
     }
 
-    fn write_integration_config(
+    /// Shared fixture config. `kind` picks the protocol pair — the openai
+    /// variant reuses the same two mock upstreams but both providers speak
+    /// `chat/completions`. Pricing tables (v0.4 M6) ride along on both
+    /// models so usage-capture tests can assert real cost math; routing
+    /// itself never reads them.
+    #[allow(clippy::too_many_arguments)] // test fixture writer, args mirror the config knobs
+    fn write_integration_config_with_kind(
         root: &std::path::Path,
         primary_url: &str,
         fallback_url: &str,
@@ -1193,17 +1359,18 @@ mod tests {
         header_timeout_ms: u64,
         failure_threshold: usize,
         open_ms: u64,
+        kind: &str,
     ) {
         std::fs::create_dir_all(root).unwrap();
         let raw = format!(
             r#"
 [providers.primary]
-kind = "anthropic-compatible"
+kind = "{kind}"
 base_url = "{primary_url}"
 auth = "x-api-key"
 
 [providers.fallback]
-kind = "anthropic-compatible"
+kind = "{kind}"
 base_url = "{fallback_url}"
 auth = "bearer"
 
@@ -1215,6 +1382,12 @@ model_id = "upstream-primary"
 cost_weight = 10.0
 quality_weight = 0.2
 
+[models.primary.pricing]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+
 [models.fallback]
 provider = "fallback"
 model_id = "upstream-fallback"
@@ -1222,6 +1395,10 @@ model_id = "upstream-fallback"
 [models.fallback.routing]
 cost_weight = 0.1
 quality_weight = 0.9
+
+[models.fallback.pricing]
+input = 1.0
+output = 2.0
 
 [routes.test-route]
 primary = "primary"
@@ -1247,6 +1424,27 @@ open_ms = {open_ms}
 "#,
         );
         std::fs::write(root.join("config.toml"), raw).unwrap();
+    }
+
+    fn write_integration_config(
+        root: &std::path::Path,
+        primary_url: &str,
+        fallback_url: &str,
+        selection: &str,
+        header_timeout_ms: u64,
+        failure_threshold: usize,
+        open_ms: u64,
+    ) {
+        write_integration_config_with_kind(
+            root,
+            primary_url,
+            fallback_url,
+            selection,
+            header_timeout_ms,
+            failure_threshold,
+            open_ms,
+            "anthropic-compatible",
+        );
     }
 
     async fn body_text(response: Response<Body>) -> String {
@@ -2659,6 +2857,9 @@ model_id = "upstream-y"
             decisions: Arc::new(RwLock::new(VecDeque::with_capacity(DECISION_CAPACITY))),
             decision_seq: Arc::new(AtomicU64::new(history::recover_decision_seq(&history_dir))),
             history: store,
+            usage: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+                crate::usage::USAGE_CAPACITY,
+            ))),
         };
 
         let (primary_addr, primary, primary_task) = spawn_mock(MockBehavior::OkStream).await;
@@ -2692,11 +2893,14 @@ model_id = "upstream-y"
         );
 
         // 3. cooldown elapsed → probe admitted (OPEN→HALF_OPEN) → success
-        //    closes the circuit (HALF_OPEN→CLOSED).
+        //    closes the circuit (HALF_OPEN→CLOSED). The probe body carries
+        //    a REAL usage contract so the M6 capture path persists too —
+        //    draining the body is what runs the scanner.
         sleep(Duration::from_millis(40)).await;
-        *primary.behavior.write().await = MockBehavior::OkStream;
+        *primary.behavior.write().await = MockBehavior::OkStreamWithUsage;
         let response = forward(state.clone(), integration_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_stop"));
 
         // 4. one metric snapshot through the real handle (the serve()
         //    snapshot task is not running in this test; the handle path is
@@ -2754,9 +2958,49 @@ model_id = "upstream-y"
         assert!(snapshots[0].models.contains_key("fallback"));
         assert!(snapshots[0].models["primary"].attempts >= 2);
 
+        // usage.jsonl (v0.4 M6): the drained probe body became one record,
+        // joined to its decision id, with the pricing snapshot and cost.
+        // (The dedicated reader lands with the query endpoints; this pins
+        // the on-disk contract by parsing the lines directly.)
+        let usage_text =
+            std::fs::read_to_string(history_dir.join("usage.jsonl")).expect("usage.jsonl");
+        let usage_records: Vec<crate::usage::UsageRecord> = usage_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("usage line parses"))
+            .collect();
+        assert_eq!(
+            usage_records.len(),
+            1,
+            "one record per drained accepted body"
+        );
+        let record = &usage_records[0];
+        assert_eq!(record.model, "primary");
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens
+            ),
+            (100, 7, 40, 5)
+        );
+        assert!(record.complete);
+        assert!(
+            decisions.iter().any(|d| d.id == record.decision_id),
+            "usage joins a persisted decision id"
+        );
+        assert_eq!(record.pricing.as_ref().map(|p| p.input), Some(3.0));
+        let expected = (100.0 * 3.0 + 7.0 * 15.0 + 40.0 * 0.3 + 5.0 * 3.75) / 1_000_000.0;
+        assert!((record.cost_usd.unwrap() - expected).abs() < 1e-12);
+
         // Credential invariant (V0.4_PLAN §10, invariant 1): history files
         // are whitelist serde structs; no key material ever appears.
-        for name in ["decisions.jsonl", "metrics.jsonl", "circuit.jsonl"] {
+        for name in [
+            "decisions.jsonl",
+            "metrics.jsonl",
+            "circuit.jsonl",
+            "usage.jsonl",
+        ] {
             let contents = std::fs::read_to_string(history_dir.join(name))
                 .unwrap_or_else(|err| panic!("reading {name}: {err}"));
             assert!(
@@ -2764,6 +3008,126 @@ model_id = "upstream-y"
                 "{name} leaked credential material"
             );
         }
+
+        primary_task.abort();
+        fallback_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PRIMARY_API_KEY");
+        std::env::remove_var("CCM_FALLBACK_API_KEY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // v0.4 M6 usage capture: one record per accepted 2xx response. Native
+    // anthropic stream (start+delta merge, pricing snapshot, cost math,
+    // decision-id join), translated openai stream (real usage rides the
+    // delta), and the terminal error passthrough (no capture at all).
+    // History stays disabled here — the disk path is pinned by the
+    // persistence test above; this one pins the ring + capture semantics.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn usage_capture_integration_covers_native_and_translated_streams() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-usage-integration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PRIMARY_API_KEY", "primary-secret");
+        std::env::set_var("CCM_FALLBACK_API_KEY", "fallback-secret");
+
+        let (primary_addr, primary, primary_task) =
+            spawn_mock(MockBehavior::OkStreamWithUsage).await;
+        let (fallback_addr, fallback, fallback_task) = spawn_mock(MockBehavior::OkStream).await;
+        let primary_url = format!("http://{primary_addr}");
+        let fallback_url = format!("http://{fallback_addr}");
+        let state = integration_proxy_state();
+        let _ = &fallback;
+
+        // 1. native anthropic stream: full token set, cost math, decision join
+        write_integration_config(&root, &primary_url, &fallback_url, "ordered", 250, 3, 50);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // draining the body is what drives the scanner to finalize
+        assert!(body_text(response).await.contains("message_stop"));
+
+        let last_decision_id = state.decisions.read().await.back().unwrap().id;
+        let records = state.usage.lock().unwrap().clone();
+        assert_eq!(records.len(), 1, "exactly one record per accepted body");
+        let record = &records[0];
+        assert_eq!(
+            record.decision_id, last_decision_id,
+            "usage joins the decision"
+        );
+        assert_eq!(record.model, "primary");
+        assert_eq!(record.client, None, "no client id on a plain request");
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens
+            ),
+            (100, 7, 40, 5)
+        );
+        assert!(record.complete);
+        assert_eq!(record.pricing.as_ref().map(|p| p.input), Some(3.0));
+        let expected = (100.0 * 3.0 + 7.0 * 15.0 + 40.0 * 0.3 + 5.0 * 3.75) / 1_000_000.0;
+        assert!((record.cost_usd.unwrap() - expected).abs() < 1e-12);
+
+        // 2. translated openai stream: message_start carries zeros; the
+        //    real usage (prompt 10, completion 2) rides message_delta
+        write_integration_config_with_kind(
+            &root,
+            &primary_url,
+            &fallback_url,
+            "ordered",
+            250,
+            3,
+            50,
+            "openai-compatible",
+        );
+        *primary.behavior.write().await = MockBehavior::OpenaiSse(openai_stream_body());
+        // the SSE translation branch needs a streaming client request
+        let stream_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"ccm","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ping"}]}"#,
+            ))
+            .unwrap();
+        let response = forward(state.clone(), stream_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("message_stop"));
+
+        let records = state.usage.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        let record = &records[1];
+        assert_eq!(record.model, "primary");
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens
+            ),
+            (10, 2, 0)
+        );
+        assert!(record.complete);
+
+        // 3. terminal error passthrough (both candidates 429, budget spent):
+        //    no accepted body, no usage record
+        *primary.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
+        *fallback.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
+        let response = forward(state.clone(), integration_request()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "last-attempt 429 passes through"
+        );
+        body_text(response).await; // drain; still nothing to scan
+        let records = state.usage.lock().unwrap();
+        assert_eq!(records.len(), 2, "error passthrough captured no usage");
 
         primary_task.abort();
         fallback_task.abort();
@@ -2992,5 +3356,249 @@ model_id = "upstream-y"
 
         drop(state); // release the single-writer lock before cleanup
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // v0.4 M6: /_ccm/usage mirrors the decisions dual-branch contract
+    // (in-memory ring without history filters, bounded disk read with any),
+    // and /_ccm/cost?day= aggregates one UTC day by model — priced and
+    // unpriced separated, complete counted. Explicit directory, no env
+    // mutation — this test needs no env lock.
+    #[tokio::test]
+    async fn usage_and_cost_endpoints_cover_disk_contract() {
+        use crate::control::api::{control_cost, control_usage, CostParams, UsageParams};
+        use crate::model::ModelPricing;
+        use crate::usage::{UsageMeta, UsageRecord};
+
+        let root = std::env::temp_dir().join(format!(
+            "ccm-usage-endpoints-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = root.join("history");
+        let store = history::open_history(
+            dir.clone(),
+            HistoryLimits::default(),
+            history::CHANNEL_CAPACITY,
+        )
+        .unwrap();
+
+        // Records on two UTC days. Timestamps are pinned relative to the
+        // real clock so the default-?day= branch is also exercised
+        // deterministically: "today" records land inside today's window
+        // whatever the local timezone.
+        let today_start =
+            crate::date::parse_utc_day(&crate::date::utc_day_of(crate::date::now_ms()))
+                .expect("utc_day_of always produces a parseable day");
+        let record = |id: u64, timestamp_ms: u64, model: &str, client: Option<&str>| {
+            let meta = UsageMeta {
+                decision_id: id,
+                model: model.to_string(),
+                client: client.map(str::to_string),
+                pricing: (model == "glm").then_some(ModelPricing {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                }),
+            };
+            let mut scanner = crate::usage::UsageScanner::new(false);
+            scanner.feed(br#"{"usage":{"input_tokens":100,"output_tokens":7,"cache_read_input_tokens":40,"cache_creation_input_tokens":5}}"#);
+            let mut record = UsageRecord::from_capture(meta, scanner.finish(true));
+            record.timestamp_ms = timestamp_ms;
+            record
+        };
+        store.record_usage(&record(1, today_start + 1_000, "glm", Some("term1")));
+        store.record_usage(&record(2, today_start + 2_000, "glm", Some("term2")));
+        store.record_usage(&record(3, today_start + 3_000, "deepseek", None));
+        // yesterday: a day filter must exclude it
+        store.record_usage(&record(4, today_start - 1, "glm", None));
+        // a disconnected stream today: counted, but not complete
+        let mut incomplete = record(5, today_start + 4_000, "glm", None);
+        incomplete.complete = false;
+        store.record_usage(&incomplete);
+        drop(store); // deterministic flush
+
+        let store = history::open_history(
+            dir.clone(),
+            HistoryLimits::default(),
+            history::CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        let mut state = integration_proxy_state();
+        state.history = store;
+        // The ring holds a DIFFERENT record so the branch choice is
+        // observable from what comes back.
+        state
+            .usage
+            .lock()
+            .unwrap()
+            .push_back(record(99, today_start + 9_999, "ring-only", None));
+
+        // --- /_ccm/usage: no history filters -> the in-memory ring.
+        let ring =
+            usage_from(control_usage(State(state.clone()), Query(UsageParams::default())).await)
+                .await;
+        assert_eq!(
+            ring.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![99],
+            "no filters -> the in-memory ring"
+        );
+        // client-only filter also stays in memory (and may match nothing).
+        let ring_client = usage_from(
+            control_usage(
+                State(state.clone()),
+                Query(UsageParams {
+                    client: Some("nobody".to_string()),
+                    ..UsageParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(ring_client.is_empty());
+
+        // --- /_ccm/usage: any history filter -> disk, oldest first.
+        let disk = usage_from(
+            control_usage(
+                State(state.clone()),
+                Query(UsageParams {
+                    since: Some(0),
+                    ..UsageParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            disk.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // model + since compose on the disk branch.
+        let disk_model = usage_from(
+            control_usage(
+                State(state.clone()),
+                Query(UsageParams {
+                    since: Some(0),
+                    model: Some("deepseek".to_string()),
+                    ..UsageParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(disk_model.len(), 1);
+        assert_eq!(disk_model[0].model, "deepseek");
+
+        // --- /_ccm/cost?day=: today's aggregation, priced vs unpriced
+        // separated, complete counted, yesterday excluded.
+        let today = crate::date::utc_day_of(crate::date::now_ms());
+        let response = control_cost(
+            State(state.clone()),
+            Query(CostParams {
+                day: Some(today.clone()),
+                client: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["day"], today.as_str());
+        assert_eq!(view["since"], json!(today_start));
+        assert_eq!(view["until"], json!(today_start + 86_400_000 - 1));
+        assert_eq!(view["requests"], json!(4), "yesterday's record excluded");
+        assert_eq!(
+            view["complete"],
+            json!(3),
+            "the disconnected stream is not complete"
+        );
+        let models = view["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2, "glm + deepseek");
+        assert_eq!(models[0]["model"], "deepseek", "rows sorted by name");
+        assert_eq!(models[0]["requests"], json!(1));
+        assert_eq!(models[0]["unpriced_requests"], json!(1));
+        assert_eq!(models[0]["cost_usd"], json!(0.0), "unpriced adds zero");
+        assert_eq!(models[1]["model"], "glm");
+        assert_eq!(models[1]["requests"], json!(3));
+        assert_eq!(models[1]["unpriced_requests"], json!(0));
+        // glm cost math: 3 × (100×3.0 + 7×15.0 + 40×0.3 + 5×3.75) / 1e6
+        let expected = 3.0 * (100.0 * 3.0 + 7.0 * 15.0 + 40.0 * 0.3 + 5.0 * 3.75) / 1_000_000.0;
+        let glm_cost = models[1]["cost_usd"].as_f64().unwrap();
+        assert!((glm_cost - expected).abs() < 1e-12);
+        assert_eq!(view["total_unpriced_requests"], json!(1));
+        let total = view["total_cost_usd"].as_f64().unwrap();
+        assert!((total - expected).abs() < 1e-12, "total = glm only");
+
+        // client filter narrows the day: term1's one glm record.
+        let response = control_cost(
+            State(state.clone()),
+            Query(CostParams {
+                day: Some(today.clone()),
+                client: Some("term1".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["requests"], json!(1));
+        assert_eq!(view["client"], "term1");
+        assert_eq!(view["models"][0]["requests"], json!(1));
+
+        // a different day: only yesterday's record.
+        let yesterday = crate::date::utc_day_of(today_start - 1);
+        let response = control_cost(
+            State(state.clone()),
+            Query(CostParams {
+                day: Some(yesterday),
+                client: None,
+            }),
+        )
+        .await
+        .into_response();
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["requests"], json!(1));
+
+        // malformed day and a missing store are 400s naming the cause.
+        let response = control_cost(
+            State(state.clone()),
+            Query(CostParams {
+                day: Some("2026-02-30".to_string()),
+                client: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("invalid ?day"));
+        let response = control_cost(
+            State(integration_proxy_state()), // History::disabled()
+            Query(CostParams::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("history_enabled"));
+        // ... and so is a history-filtered /_ccm/usage without a store.
+        let response = control_usage(
+            State(integration_proxy_state()),
+            Query(UsageParams {
+                since: Some(0),
+                ..UsageParams::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("history_enabled"));
+
+        drop(state); // release the single-writer lock before cleanup
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Decode a `/_ccm/usage` handler response into its records (same shape
+    /// as `decisions_from`).
+    async fn usage_from(response: impl IntoResponse) -> Vec<crate::usage::UsageRecord> {
+        let text = body_text(response.into_response()).await;
+        serde_json::from_str(&text).unwrap()
     }
 }

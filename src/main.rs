@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod control;
 mod credential;
+mod date;
 mod doctor;
 mod health;
 mod history;
@@ -16,6 +17,7 @@ mod route;
 mod routing;
 mod state;
 mod translate;
+mod usage;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;

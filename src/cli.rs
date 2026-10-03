@@ -179,4 +179,13 @@ pub enum HistoryCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Aggregate usage and cost by model for one UTC day (v0.4 M6).
+    Cost {
+        /// UTC day to aggregate, `YYYY-MM-DD` (default: today).
+        #[arg(long)]
+        day: Option<String>,
+        /// Only records tagged with exactly this client id.
+        #[arg(long)]
+        client: Option<String>,
+    },
 }

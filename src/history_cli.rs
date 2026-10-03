@@ -72,8 +72,67 @@ fn run_at(command: HistoryCommand, dir: &Path) -> Result<()> {
                 println!("{}", transition_line(transition));
             }
         }
+        HistoryCommand::Cost { day, client } => {
+            // Default: today in UTC — the same day the running proxy's
+            // `/_ccm/cost` (no ?day=) would aggregate.
+            let day = day.unwrap_or_else(|| crate::date::utc_day_of(crate::date::now_ms()));
+            let Some(since) = crate::date::parse_utc_day(&day) else {
+                bail!("invalid --day `{day}`: expected YYYY-MM-DD (UTC)");
+            };
+            let query = history::UsageQuery {
+                since: Some(since),
+                until: Some(since + 86_400_000 - 1),
+                model: None,
+                client,
+                limit: None,
+            };
+            let records = history::read_usage(dir, &query)?;
+            let aggregation = crate::usage::aggregate_costs(&records);
+            print_cost(&day, &aggregation);
+        }
     }
     Ok(())
+}
+
+/// The `ccm history cost` table. Pure so tests can pin the format.
+fn print_cost(day: &str, aggregation: &crate::usage::CostAggregation) {
+    println!("== {day} (UTC)");
+    if aggregation.models.is_empty() {
+        println!("no usage records for this day");
+        return;
+    }
+    println!(
+        "{:<20} {:>7} {:>9} {:>10} {:>10} {:>9} {:>9} {:>12}",
+        "model", "reqs", "complete", "input", "output", "cache_r", "cache_w", "cost_usd"
+    );
+    for row in &aggregation.models {
+        println!("{}", cost_row(row));
+    }
+    println!(
+        "total: {} requests, {:.6} USD",
+        aggregation.total_requests, aggregation.total_cost_usd
+    );
+    if aggregation.total_unpriced_requests > 0 {
+        println!(
+            "note: {} request(s) had no [pricing] table — their cost is unknown, not zero",
+            aggregation.total_unpriced_requests
+        );
+    }
+}
+
+/// One `ccm history cost` table row; pure so tests can pin the format.
+fn cost_row(row: &crate::usage::CostByModel) -> String {
+    format!(
+        "{:<20} {:>7} {:>9} {:>10} {:>10} {:>9} {:>9} {:>12.6}",
+        row.model,
+        row.requests,
+        row.complete,
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read_tokens,
+        row.cache_write_tokens,
+        row.cost_usd
+    )
 }
 
 fn print_snapshot(snapshot: &MetricsSnapshot) {
@@ -122,23 +181,11 @@ fn transition_line(transition: &CircuitTransition) -> String {
     )
 }
 
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a unix-ms timestamp (civil-from-days,
-/// Howard Hinnant's algorithm). Presentation only — filtering and ordering
-/// always use the raw `timestamp_ms` numbers.
+/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a unix-ms timestamp (formatting of
+/// `date::utc_parts`). Presentation only — filtering and ordering always
+/// use the raw `timestamp_ms` numbers.
 fn utc_ms(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    let (hour, minute, second) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
+    let (year, month, day, hour, minute, second) = crate::date::utc_parts(ms);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
@@ -186,5 +233,41 @@ mod tests {
         assert!(line.contains("1970-01-01T00:00:00Z"), "{line}");
         assert!(line.contains("CLOSED -> OPEN"), "{line}");
         assert!(line.contains("failure threshold reached"), "{line}");
+    }
+
+    #[test]
+    fn cost_row_formats_the_essentials() {
+        let row = cost_row(&crate::usage::CostByModel {
+            model: "glm".to_string(),
+            requests: 12,
+            complete: 11,
+            input_tokens: 123_456,
+            output_tokens: 7_890,
+            cache_read_tokens: 40_000,
+            cache_write_tokens: 0,
+            unpriced_requests: 0,
+            cost_usd: 0.012345,
+        });
+        assert!(row.contains("glm"), "{row}");
+        assert!(row.contains("12"), "{row}");
+        assert!(row.contains("11"), "{row}");
+        assert!(row.contains("0.012345"), "{row}");
+    }
+
+    #[test]
+    fn run_at_rejects_impossible_cost_day() {
+        let dir = std::env::temp_dir().join("ccm-history-cli-cost-day");
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = run_at(
+            HistoryCommand::Cost {
+                day: Some("2026-02-30".to_string()),
+                client: None,
+            },
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid --day"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

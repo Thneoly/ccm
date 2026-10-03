@@ -47,6 +47,27 @@ pub(crate) struct DecisionParams {
     pub(crate) limit: Option<usize>,
 }
 
+/// `/_ccm/usage` query (v0.4 M6): the same dual-branch contract as
+/// `/_ccm/decisions` — without any of since/until/model the in-memory ring
+/// (last 100 records) is served; any of them switches to a bounded disk
+/// read over the persisted usage.jsonl. `?limit=` applies on both branches.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UsageParams {
+    pub(crate) client: Option<String>,
+    pub(crate) since: Option<u64>,
+    pub(crate) until: Option<u64>,
+    pub(crate) model: Option<String>,
+    pub(crate) limit: Option<usize>,
+}
+
+/// `/_ccm/cost` query (v0.4 M6): `?day=YYYY-MM-DD` selects a UTC day
+/// (default: today); `?client=` narrows the aggregation to that client.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CostParams {
+    pub(crate) day: Option<String>,
+    pub(crate) client: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct ModelMetricsView {
     model: String,
@@ -202,6 +223,8 @@ pub(crate) fn control_router(state: ProxyState) -> Router {
         .route("/_ccm/metrics", get(control_metrics))
         .route("/_ccm/scores", get(control_scores))
         .route("/_ccm/decisions", get(control_decisions))
+        .route("/_ccm/usage", get(control_usage))
+        .route("/_ccm/cost", get(control_cost))
         .route("/_ccm/clients", get(control_clients))
         .route("/_ccm/switch/{target}", post(control_switch))
         .route("/v1/messages", any(forward_messages))
@@ -425,6 +448,137 @@ pub(crate) async fn control_decisions(
             anyhow::anyhow!("history read task failed: {err}"),
         ),
     }
+}
+
+/// `/_ccm/usage` (v0.4 M6): the usage-record mirror of
+/// `/_ccm/decisions` — the in-memory ring without history filters, a
+/// bounded disk read with any of them.
+pub(crate) async fn control_usage(
+    State(state): State<ProxyState>,
+    Query(params): Query<UsageParams>,
+) -> impl IntoResponse {
+    if params.since.is_none() && params.until.is_none() && params.model.is_none() {
+        let mut records: Vec<crate::usage::UsageRecord> = state
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|record| client_matches(params.client.as_deref(), &record.client))
+            .cloned()
+            .collect();
+        if let Some(limit) = params.limit {
+            if records.len() > limit {
+                records.drain(..records.len() - limit);
+            }
+        }
+        return Json(records).into_response();
+    }
+    const DEFAULT_DISK_LIMIT: usize = 1000;
+    let Some(dir) = state.history.dir() else {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!(
+                "history query parameters (since/until/model) require a running history store; check [observability] history_enabled and that no other proxy holds the single-writer lock"
+            ),
+        );
+    };
+    let query = crate::history::UsageQuery {
+        since: params.since,
+        until: params.until,
+        model: params.model.clone(),
+        client: params.client.clone(),
+        limit: Some(params.limit.unwrap_or(DEFAULT_DISK_LIMIT)),
+    };
+    let dir = dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::history::read_usage(&dir, &query)).await {
+        Ok(Ok(records)) => Json(records).into_response(),
+        Ok(Err(err)) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("history read task failed: {err}"),
+        ),
+    }
+}
+
+/// `/_ccm/cost?day=` (v0.4 M6): usage and cost aggregated by model over one
+/// UTC calendar day (default: today). Always a disk read — a day of records
+/// does not fit the in-memory ring, and cost analysis is a history feature.
+/// The day window is inclusive of the whole day: `[midnight, next
+/// midnight)`.
+pub(crate) async fn control_cost(
+    State(state): State<ProxyState>,
+    Query(params): Query<CostParams>,
+) -> impl IntoResponse {
+    let day = params
+        .day
+        .clone()
+        .unwrap_or_else(|| crate::date::utc_day_of(now_ms()));
+    let Some(since) = crate::date::parse_utc_day(&day) else {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("invalid ?day=`{day}`: expected YYYY-MM-DD (UTC)"),
+        );
+    };
+    let Some(dir) = state.history.dir() else {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!(
+                "cost aggregation requires a running history store; check [observability] history_enabled and that no other proxy holds the single-writer lock"
+            ),
+        );
+    };
+    let query = crate::history::UsageQuery {
+        since: Some(since),
+        // next midnight minus 1ms: the inclusive end of the day
+        until: Some(since + 86_400_000 - 1),
+        model: None,
+        client: params.client.clone(),
+        // No limit: an aggregation must see the whole day, not the newest
+        // slice of it. Retention bounds the scan in practice.
+        limit: None,
+    };
+    let dir = dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        crate::history::read_usage(&dir, &query).map(|records| {
+            let aggregation = crate::usage::aggregate_costs(&records);
+            (records, aggregation)
+        })
+    })
+    .await
+    {
+        Ok(Ok((records, aggregation))) => Json(CostView {
+            day,
+            since,
+            until: since + 86_400_000 - 1,
+            client: params.client,
+            requests: aggregation.total_requests,
+            models: aggregation.models,
+            total_cost_usd: aggregation.total_cost_usd,
+            total_unpriced_requests: aggregation.total_unpriced_requests,
+            complete: records.iter().filter(|record| record.complete).count(),
+        })
+        .into_response(),
+        Ok(Err(err)) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("history read task failed: {err}"),
+        ),
+    }
+}
+
+/// Response shape of `/_ccm/cost`: one day's aggregation.
+#[derive(Serialize)]
+struct CostView {
+    day: String,
+    since: u64,
+    until: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
+    requests: u64,
+    models: Vec<crate::usage::CostByModel>,
+    total_cost_usd: f64,
+    total_unpriced_requests: u64,
+    complete: usize,
 }
 
 /// One client's runtime entry, as listed by `/_ccm/clients`.

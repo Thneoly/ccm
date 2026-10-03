@@ -329,6 +329,7 @@ mod tests {
                     provider: "deepseek".to_string(),
                     model_id: "deepseek-chat".to_string(),
                     routing: crate::model::ModelRouting::default(),
+                    pricing: None,
                 },
             )
             .unwrap();

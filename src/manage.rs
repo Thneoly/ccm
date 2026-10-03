@@ -57,6 +57,9 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
                         cost_weight,
                         quality_weight,
                     },
+                    // `ccm add model` has no pricing flags (M6): prices are
+                    // hand-edited TOML facts, not CLI defaults.
+                    pricing: None,
                 },
             )?;
             config.save()?;
