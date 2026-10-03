@@ -987,7 +987,23 @@ impl SseTranslator {
             .and_then(|t| t.as_array())
         {
             for tc in tool_calls {
-                let raw_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let raw_index = match tc.get("index") {
+                    // The OpenAI schema always carries `index`; treat its
+                    // absence as slot 0 (lenient v0.3 behavior) but reject a
+                    // present-but-invalid value as a bad frame — folding a
+                    // negative, string, or fractional index into slot 0 would
+                    // silently corrupt that call's accumulated arguments.
+                    None => 0u64,
+                    Some(v) => match v.as_u64() {
+                        Some(index) => index,
+                        None => {
+                            self.errored = true;
+                            return vec![error_event(&format!(
+                                "tool_calls index is not a non-negative integer: {v}"
+                            ))];
+                        }
+                    },
+                };
                 if raw_index >= MAX_TOOL_CALL_SLOTS as u64 {
                     // An out-of-range index degrades like any other
                     // malformed frame instead of panicking (`index + 1`
@@ -2066,6 +2082,41 @@ mod tests {
             .unwrap();
         assert!(events.iter().any(|e| e.event == "message_stop"));
         assert!(events.iter().any(|e| e.data.contains("\"name\":\"fine\"")));
+
+        // a present-but-invalid index is equally terminal — negative, string,
+        // null, fractional are never folded into slot 0
+        for bad in [json!(-1), json!("0"), json!(null), json!(1.5)] {
+            let frame = json!({"id": "b", "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": bad, "id": "call_x", "type": "function",
+                 "function": {"name": "boom", "arguments": ""}}
+            ]}}]});
+            let mut t = SseTranslator::new("up");
+            let events = t.feed(format!("data: {frame}\n\n").as_bytes()).unwrap();
+            let names = event_names(&events);
+            assert_eq!(names.last().copied(), Some("error"), "index {bad}");
+            assert!(!names.contains(&"message_stop"), "index {bad}");
+            let err: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not a non-negative integer"),
+                "index {bad}"
+            );
+            assert!(t.feed(b"data: [DONE]\n\n").unwrap().is_empty());
+        }
+
+        // an absent index stays slot 0 (lenient v0.3 behavior)
+        let no_index = json!({"id": "b", "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"id": "call_noidx", "type": "function",
+             "function": {"name": "works", "arguments": "{}"}}
+        ]}}]});
+        let mut t = SseTranslator::new("up");
+        let events = t
+            .feed(format!("data: {no_index}\n\ndata: [DONE]\n\n").as_bytes())
+            .unwrap();
+        assert!(events.iter().any(|e| e.event == "message_stop"));
+        assert!(events.iter().any(|e| e.data.contains("call_noidx")));
     }
 
     // 27. a mid-stream error frame (valid JSON, no choices) terminates the
