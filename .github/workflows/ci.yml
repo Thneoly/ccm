@@ -1,9 +1,10 @@
 name: CI
 
-# Dispatch-only until the release owner approves CI as the final verification
-# matrix (docs/V0.3_PLAN.md section 4). Adding push/pull_request triggers
-# below is the enabling step.
+# Push triggers enabled 2026-10-03 with release-owner approval
+# (docs/V0.3_PLAN.md section 4): CI is the verification matrix for main.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:

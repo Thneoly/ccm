@@ -651,7 +651,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-GitHub Actions CI is dispatch-only: `.github/workflows/ci.yml` (ubuntu-latest + windows-latest release gate) runs only when manually triggered via `workflow_dispatch`. Automatic push/pull_request triggers stay off until the release owner approves CI as the final verification matrix (`docs/V0.3_PLAN.md` section 4).
+GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-latest + windows-latest) on every push to `main` and via manual `workflow_dispatch`.
 
 ## Current scope
 
