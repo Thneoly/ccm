@@ -34,8 +34,9 @@ pub(crate) struct ClientParams {
 /// `/_ccm/decisions` query (v0.4 M5): `?client=` as before, plus disk-backed
 /// history filters `?since=&until=&model=` and `?limit=`. Without any of
 /// since/until/model the handler keeps the exact in-memory behavior (last
-/// 100 decisions). Disk reads keep the most recent `limit` records and are
-/// bounded by a default cap when `limit` is absent.
+/// 100 decisions). Disk reads keep the most recent `limit` records and the
+/// read itself is bounded — files are walked newest-first and parsing stops
+/// once `limit` matches are held (default 1000 when `limit` is absent).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct DecisionParams {
     pub(crate) client: Option<String>,
@@ -383,12 +384,13 @@ pub(crate) async fn control_decisions(
         return Json(decisions).into_response();
     }
     // Any of since/until/model: a disk read over the persisted history
-    // (oldest first), still honoring the client filter. The read is bounded:
-    // deserializing the entire retained history (hundreds of MB under a busy
-    // proxy) on a routine dashboard query would spike memory and stall a
-    // worker, so absent an explicit `?limit=` the most recent 1000 records
-    // come back. The read is blocking file IO — run it off the workers that
-    // serve /v1/messages.
+    // (oldest first), still honoring the client filter. The read is bounded,
+    // not just the response: `read_decisions` walks files newest-first and
+    // stops once `limit` matches are held, so a routine dashboard query
+    // costs O(limit + one file) — deserializing the entire retained history
+    // (hundreds of MB under a busy proxy) would spike memory, and absent an
+    // explicit `?limit=` the most recent 1000 records come back. The read is
+    // blocking file IO — run it off the workers that serve /v1/messages.
     const DEFAULT_DISK_LIMIT: usize = 1000;
     let Some(dir) = state.history.dir() else {
         return control_error(

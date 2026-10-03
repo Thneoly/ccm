@@ -519,10 +519,13 @@ accept `?client=<id>` to filter to one client.
 
 History queries (v0.4 M5): `GET /_ccm/decisions?since=&until=&model=`
 (unix-ms, inclusive) switches the endpoint from the in-memory ring to a
-disk read over the full persisted history (oldest first); `?client=` still
-applies on that branch, and a history filter with no running history store
-is a 400 naming the likely causes. Without any of the three parameters the
-endpoint is byte-identical to the v0.3 in-memory behavior.
+disk read over the persisted history (oldest first). That read is bounded,
+not just the response: files are walked newest-first and parsing stops once
+`?limit=` matches are held — default 1000 when absent — so the cost scales
+with the limit rather than the retained history. `?client=` still applies
+on that branch, and a history filter with no running history store is a 400
+naming the likely causes. Without any of since/until/model the endpoint is
+byte-identical to the v0.3 in-memory behavior.
 
 Control API is currently unauthenticated and intended for localhost use.
 

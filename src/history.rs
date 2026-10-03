@@ -618,6 +618,17 @@ pub(crate) struct DecisionQuery {
 /// holds the newest records). Malformed suffixes sort first (safest for
 /// time-ordered reads: they are still complete lines).
 pub(crate) fn kind_files(dir: &Path, stream: HistoryStream) -> Vec<PathBuf> {
+    kind_files_keyed(dir, stream)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Keyed variant of [`kind_files`]: each file paired with its sort key, so
+/// callers that read newest-first (see [`read_decisions`]) can also use the
+/// key itself — a rotated file's name timestamp is an upper bound on the
+/// record timestamps inside it.
+fn kind_files_keyed(dir: &Path, stream: HistoryStream) -> Vec<((u64, u64), PathBuf)> {
     let prefix = format!("{}-", stream.file_stem());
     let active_name = format!("{}.jsonl", stream.file_stem());
     let mut files: Vec<((u64, u64), PathBuf)> = Vec::new();
@@ -638,7 +649,7 @@ pub(crate) fn kind_files(dir: &Path, stream: HistoryStream) -> Vec<PathBuf> {
         }
     }
     files.sort_by_key(|(key, _)| *key);
-    files.into_iter().map(|(_, path)| path).collect()
+    files
 }
 
 /// Sort key for a rotated file's name suffix (the part between `<kind>-` and
@@ -676,17 +687,54 @@ fn parse_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
 
 /// Read persisted decisions matching `query`, oldest first (the most recent
 /// N when `limit` is set). Torn or foreign lines are skipped.
+///
+/// With a limit the READ is bounded, not just the result: files are visited
+/// newest first (`kind_files` order reversed; file order equals append
+/// order) and iteration stops as soon as `limit` matching records are
+/// held, so the work scales with the limit plus at most one file instead
+/// of the whole retained history. When `since` is set, rotated files whose
+/// name timestamp predates it are skipped entirely — no record in a
+/// rotated file can be newer than the file's rotation time, and in the
+/// descending visit order everything after such a file is older still.
+/// Without a limit (the offline CLI default) the full scan stays.
 pub(crate) fn read_decisions(dir: &Path, query: &DecisionQuery) -> Result<Vec<RoutingDecision>> {
+    if let Some(limit) = query.limit {
+        let mut newest: Vec<RoutingDecision> = Vec::new();
+        'files: for (key, path) in kind_files_keyed(dir, HistoryStream::Decisions)
+            .into_iter()
+            .rev()
+        {
+            if let Some(since) = query.since {
+                // The active file is keyed (u64::MAX, u64::MAX) and is never
+                // pruned; malformed names key (0, 0), which sorts oldest and
+                // is visited last here.
+                if key.0 != u64::MAX && key.0 < since {
+                    break;
+                }
+            }
+            for line in jsonl_lines(&path).into_iter().rev() {
+                let Ok(record) = serde_json::from_str::<RoutingDecision>(&line) else {
+                    continue;
+                };
+                if !matches_query(&record, query) {
+                    continue;
+                }
+                // Checked before the push so `limit = 0` collects nothing
+                // (and still stops at the first match rather than scanning on).
+                if newest.len() == limit {
+                    break 'files;
+                }
+                newest.push(record);
+            }
+        }
+        newest.reverse();
+        return Ok(newest);
+    }
     let mut records: Vec<RoutingDecision> = Vec::new();
     for path in kind_files(dir, HistoryStream::Decisions) {
         records.extend(parse_lines::<RoutingDecision>(&path));
     }
     records.retain(|record| matches_query(record, query));
-    if let Some(limit) = query.limit {
-        if records.len() > limit {
-            records.drain(..records.len() - limit);
-        }
-    }
     Ok(records)
 }
 
@@ -1341,6 +1389,117 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    // 16. a limit bounds the READ, not just the result: newest-first file
+    //     iteration with an early stop returns exactly the most recent N of
+    //     the full scan, across rotated files; `since` prunes whole files by
+    //     their name timestamp; `limit = 0` yields nothing
+    #[test]
+    fn limit_reads_newest_first_across_files() {
+        let dir = TempDir::new("bounded");
+        // Record timestamps respect the file-name upper bound: nothing in
+        // decisions-<ms>.jsonl is newer than <ms>.
+        let line = |id: u64, ts: u64| {
+            format!(
+                "{}\n",
+                serde_json::to_string(&decision(id, ts, &["glm"], Some("glm"))).unwrap()
+            )
+        };
+        fs::write(
+            dir.path().join("decisions-1000.jsonl"),
+            format!("{}{}", line(1, 900), line(2, 1000)),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("decisions-2000.jsonl"),
+            format!("{}{}", line(3, 1900), line(4, 2000)),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("decisions.jsonl"),
+            format!("{}{}", line(5, 3000), line(6, 3100)),
+        )
+        .unwrap();
+
+        // The most recent N across files, oldest first — identical to a
+        // full scan truncated at the end.
+        let limited = read_decisions(
+            dir.path(),
+            &DecisionQuery {
+                limit: Some(3),
+                ..DecisionQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            limited.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+
+        // A limit at or beyond the match count returns everything, oldest
+        // first.
+        let generous = read_decisions(
+            dir.path(),
+            &DecisionQuery {
+                limit: Some(100),
+                ..DecisionQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            generous.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+
+        // `since` prunes rotated files older than the window (by name
+        // timestamp) and matches the unbounded path exactly.
+        for since in [2_000u64, 2_001] {
+            let bounded = read_decisions(
+                dir.path(),
+                &DecisionQuery {
+                    since: Some(since),
+                    limit: Some(10),
+                    ..DecisionQuery::default()
+                },
+            )
+            .unwrap();
+            let unbounded = read_decisions(
+                dir.path(),
+                &DecisionQuery {
+                    since: Some(since),
+                    ..DecisionQuery::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                bounded.iter().map(|r| r.id).collect::<Vec<_>>(),
+                unbounded.iter().map(|r| r.id).collect::<Vec<_>>(),
+                "since={since}: bounded read matches the full scan"
+            );
+        }
+        // since=2001 excludes id 4 (ts 2000) via both paths.
+        let window = read_decisions(
+            dir.path(),
+            &DecisionQuery {
+                since: Some(2_001),
+                limit: Some(10),
+                ..DecisionQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(window.iter().map(|r| r.id).collect::<Vec<_>>(), vec![5, 6]);
+
+        // limit = 0 collects nothing.
+        let empty = read_decisions(
+            dir.path(),
+            &DecisionQuery {
+                limit: Some(0),
+                ..DecisionQuery::default()
+            },
+        )
+        .unwrap();
+        assert!(empty.is_empty());
     }
 
     // sanity: the json helper compiles (keeps the serde_json import honest)

@@ -544,7 +544,7 @@ Invoke-RestMethod http://127.0.0.1:13521/_ccm/metrics
 curl -s http://127.0.0.1:13521/_ccm/decisions
 ```
 
-traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清零；metrics/circuits 同样只活在进程内。decisions 的无参数视图同样在内存里，但 v0.4 起每条决策同时持久化到磁盘（见 6.3），带时间/模型过滤的查询走磁盘全量历史。
+traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清零；metrics/circuits 同样只活在进程内。decisions 的无参数视图同样在内存里，但 v0.4 起每条决策同时持久化到磁盘（见 6.3），带时间/模型过滤的查询走磁盘历史（默认返回最新 1000 条，`?limit=` 可调）。
 
 ### 6.2 怎么读 `/_ccm/decisions`
 
@@ -620,7 +620,7 @@ ccm history circuit --model glm
 Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1759300000000&model=glm"
 ```
 
-HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——运行中的代理不该被一次全量历史反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
+HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——查询按最新优先扫描文件、凑够条数即停，读取代价随 limit 而不是历史总量增长，运行中的代理不会被一次全量反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
 
 `[observability]` 配置节（全部有默认值，v0.4 之前的配置文件不用改；任一阈值填 0 会在加载时报错）：
 
