@@ -827,7 +827,7 @@ mod tests {
     use axum::{routing::post, Router};
     use serde_json::json;
 
-    /// All three integration tests mutate process env (`CCM_HOME`,
+    /// All four integration tests mutate process env (`CCM_HOME`,
     /// `CCM_<PROVIDER>_API_KEY`); each holds this lock for its whole duration
     /// so they never race (V0.3_PLAN §11.2 discipline).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2116,6 +2116,30 @@ model_id = "upstream-y"
         assert_eq!(clients[1].target, "modelx");
         assert_eq!(clients[1].requests, 3);
 
+        // Re-switch (existing-entry branch): switching A AGAIN moves its
+        // target while the arrival counter survives. Driven through the
+        // control_switch handler to also pin the scoped SUCCESS body.
+        let response = control_switch(
+            State(state.clone()),
+            Path("modelx".to_string()),
+            Query(ClientParams {
+                client: Some("A".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(view["client"], "A");
+        assert_eq!(view["target"], "modelx");
+        {
+            let clients = state.clients.read().await;
+            assert_eq!(clients.len(), 2); // updated in place, no new entry
+            assert_eq!(clients.get("A").unwrap().target, "modelx"); // moved...
+            assert_eq!(clients.get("A").unwrap().requests, 1); // ...counter kept
+        }
+        apply_switch(&state, "modely", Some("A")).await.unwrap(); // restore
+
         // ?client= filters on traces and decisions; records carry the field.
         let traces_a = control_traces(
             State(state.clone()),
@@ -2155,6 +2179,18 @@ model_id = "upstream-y"
         assert!(!serialized.contains("sk-ant-supersecret"));
         let traces_serialized = serde_json::to_string(&traces_all).unwrap();
         assert!(!traces_serialized.contains("sk-ant-supersecret"));
+        // M5 freezes this JSONL schema: a record WITHOUT a client must not
+        // grow a client:null key — skip_serializing_if keeps the no-id shape
+        // byte-identical to v0.3. Pin one decision (its nested attempts
+        // included) and one trace.
+        let no_id_decision = decisions_all.iter().find(|d| d.client.is_none()).unwrap();
+        assert!(!serde_json::to_string(no_id_decision)
+            .unwrap()
+            .contains("\"client\""));
+        let no_id_trace = traces_all.iter().find(|t| t.client.is_none()).unwrap();
+        assert!(!serde_json::to_string(no_id_trace)
+            .unwrap()
+            .contains("\"client\""));
 
         // Status with ?client= shows the client's EFFECTIVE view; without the
         // parameter the shape is unchanged (no client/follows_global keys).
@@ -2192,6 +2228,156 @@ model_id = "upstream-y"
         assert!(view.get("client").is_none());
         assert!(view.get("follows_global").is_none());
 
+        x_task.abort();
+        y_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PX_API_KEY");
+        std::env::remove_var("CCM_PY_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // control-plane wire contract (v0.4 M3): real router, real HTTP,
+    // real query strings
+    // ------------------------------------------------------------------
+
+    /// Serve the actual control router on an ephemeral loopback port and
+    /// drive it with a real HTTP client — closing the gap between the
+    /// handler-level tests above and route registration / query extraction,
+    /// including the no-query-string shapes the v0.3 CLI sends.
+    #[allow(clippy::await_holding_lock)] // see note on the v0.3 test above
+    #[tokio::test]
+    async fn control_router_serves_client_contract_over_http() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-control-wire-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PX_API_KEY", "x-secret");
+        std::env::set_var("CCM_PY_API_KEY", "y-secret");
+
+        let (x_addr, x_mock, x_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (y_addr, y_mock, y_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_multi_client_config(
+            &root,
+            &format!("http://{x_addr}"),
+            &format!("http://{y_addr}"),
+        );
+        let state = integration_proxy_state();
+        *state.target.write().await = "modelx".to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, control_router(state)).await.unwrap();
+        });
+        let http = Client::new();
+
+        // The v0.3 CLI shape — NO query string — is still a global switch,
+        // and its success body carries no `client` key.
+        let response = http
+            .post(format!("{base}/_ccm/switch/modely"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = response.json().await.unwrap();
+        assert_eq!(view["target"], "modely");
+        assert!(view.get("client").is_none());
+
+        // Scoped switch over the wire: `?client=` lands in the entry.
+        let response = http
+            .post(format!("{base}/_ccm/switch/modelx?client=A"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = response.json().await.unwrap();
+        assert_eq!(view["client"], "A");
+        assert_eq!(view["target"], "modelx");
+
+        // Invalid charset over the wire is a 400, changing nothing.
+        let response = http
+            .post(format!("{base}/_ccm/switch/modelx?client=bad%20id"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // /_ccm/clients is a registered route and lists exactly the entry.
+        let response = http
+            .get(format!("{base}/_ccm/clients"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let clients: Value = response.json().await.unwrap();
+        assert_eq!(clients.as_array().unwrap().len(), 1);
+        assert_eq!(clients[0]["client"], "A");
+        assert_eq!(clients[0]["target"], "modelx");
+
+        // /_ccm/status: `?client=` shows the effective view; without the
+        // parameter the v0.3 shape is unchanged (global view, no new keys).
+        let response = http
+            .get(format!("{base}/_ccm/status?client=A"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = response.json().await.unwrap();
+        assert_eq!(view["client"], "A");
+        assert_eq!(view["follows_global"], false);
+        assert_eq!(view["target"], "modelx");
+        let response = http
+            .get(format!("{base}/_ccm/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = response.json().await.unwrap();
+        assert_eq!(view["target"], "modely"); // the global target
+        assert!(view.get("client").is_none());
+        assert!(view.get("follows_global").is_none());
+
+        // End to end through the mounted forward path: a wire request with
+        // `x-ccm-client: A` routes to A's entry (mock X) and the identity
+        // header never reaches the provider; a request WITHOUT the header
+        // follows the global target (mock Y).
+        let x_before = x_mock.requests.lock().unwrap().len();
+        let y_before = y_mock.requests.lock().unwrap().len();
+        let response = http
+            .post(format!("{base}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-ccm-client", "A")
+            .body(
+                r#"{"model":"ccm","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 1);
+        {
+            let requests = x_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.body["model"], "upstream-x");
+            assert!(captured.headers.get("x-ccm-client").is_none());
+        }
+        let response = http
+            .post(format!("{base}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(
+                r#"{"model":"ccm","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 1);
+
+        router_task.abort();
         x_task.abort();
         y_task.abort();
         std::env::remove_var("CCM_HOME");
