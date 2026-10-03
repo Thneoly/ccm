@@ -931,10 +931,10 @@ mod tests {
     use super::*;
     use crate::control::api::{
         apply_switch, control_clients, control_decisions, control_status, control_switch,
-        control_traces, status_view, ClientParams,
+        control_traces, status_view, ClientParams, DecisionParams,
     };
     use crate::route::SelectionWeights;
-    use crate::routing::decision::now_ms;
+    use crate::routing::decision::{now_ms, DecisionCandidate};
     use crate::routing::metrics::{health_score, success_rate, update_latency_ewma};
     use crate::routing::select::{candidate_health_rank, weighted_score};
     use axum::extract::{Path, Query};
@@ -1251,6 +1251,14 @@ open_ms = {open_ms}
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Decode a `/_ccm/decisions` handler response into its records. The
+    /// handler returns `impl IntoResponse` (in-memory, disk-backed, or error
+    /// branches), so tests read the JSON body instead of a typed return.
+    async fn decisions_from(response: impl IntoResponse) -> Vec<RoutingDecision> {
+        let text = body_text(response.into_response()).await;
+        serde_json::from_str(&text).unwrap()
     }
 
     // The env mutex guard is held across awaits on purpose: it serializes
@@ -2374,20 +2382,30 @@ model_id = "upstream-y"
         assert!(traces_all.len() > traces_a.len());
         assert!(traces_all.iter().any(|t| t.client.is_none()));
 
-        let decisions_b = control_decisions(
-            State(state.clone()),
-            Query(ClientParams {
-                client: Some("B".to_string()),
-            }),
+        let decisions_b = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    client: Some("B".to_string()),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
         )
-        .await
-        .0;
+        .await;
         assert_eq!(decisions_b.len(), 3);
         assert!(decisions_b.iter().all(|d| d.client.as_deref() == Some("B")));
-        let decisions_all =
-            control_decisions(State(state.clone()), Query(ClientParams { client: None }))
-                .await
-                .0;
+        let decisions_all = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    client: None,
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(decisions_all.len(), 11);
         // Serialized records carry `client` only when present, and never the
         // real bearer credential.
@@ -2747,6 +2765,175 @@ model_id = "upstream-y"
         std::env::remove_var("CCM_HOME");
         std::env::remove_var("CCM_PRIMARY_API_KEY");
         std::env::remove_var("CCM_FALLBACK_API_KEY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // v0.4 M5: any of ?since/?until/?model switches /_ccm/decisions from the
+    // in-memory ring to a disk read over the persisted history; the filters
+    // compose (time × model × client); a history filter without a running
+    // store is a 400 naming the likely causes. Explicit directory, no env
+    // mutation — this test needs no env lock.
+    #[tokio::test]
+    async fn decisions_endpoint_reads_disk_when_history_filters_present() {
+        let root = std::env::temp_dir().join(format!(
+            "ccm-decisions-disk-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = root.join("history");
+        let store = history::open_history(
+            dir.clone(),
+            HistoryLimits::default(),
+            history::CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        let record =
+            |id: u64, timestamp_ms: u64, model: &str, client: Option<&str>| RoutingDecision {
+                id,
+                timestamp_ms,
+                target: "route".to_string(),
+                client: client.map(str::to_string),
+                selection: "ordered".to_string(),
+                configured_candidates: vec![model.to_string()],
+                ranked_candidates: vec![DecisionCandidate {
+                    rank: 1,
+                    model: model.to_string(),
+                    reliability_score: 1.0,
+                    latency_score: 1.0,
+                    cost_score: 1.0,
+                    quality_score: 1.0,
+                    weighted_score: 1.0,
+                }],
+                attempts: vec![DecisionAttempt {
+                    attempt: 1,
+                    model: model.to_string(),
+                    circuit: "CLOSED".to_string(),
+                    result: "HTTP 200".to_string(),
+                    fallback: false,
+                }],
+                selected: Some(model.to_string()),
+                outcome: "HTTP 200".to_string(),
+            };
+        store.record_decision(&record(1, 1_000, "alpha", None));
+        store.record_decision(&record(2, 2_000, "beta", Some("term1")));
+        store.record_decision(&record(3, 3_000, "alpha", None));
+        store.shutdown(); // deterministic flush to disk
+
+        let mut state = integration_proxy_state();
+        state.history = store;
+        // The in-memory ring holds a DIFFERENT record so the branch choice is
+        // observable from what comes back.
+        state
+            .decisions
+            .write()
+            .await
+            .push_back(record(99, 9_999, "ring-only", None));
+
+        // No history filters: the in-memory ring, exactly as v0.3.
+        let ring = decisions_from(
+            control_decisions(State(state.clone()), Query(DecisionParams::default())).await,
+        )
+        .await;
+        assert_eq!(
+            ring.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![99],
+            "no filters -> the in-memory ring"
+        );
+        // A client-only filter also stays in memory.
+        let ring_client = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    client: Some("nobody".to_string()),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(ring_client.is_empty(), "client filter, still in-memory");
+
+        // since=0: the full disk history, oldest first.
+        let disk = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    since: Some(0),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            disk.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "any history filter -> disk read"
+        );
+
+        // Inclusive time window pins the boundary record.
+        let window = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    since: Some(2_000),
+                    until: Some(2_000),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(window.iter().map(|d| d.id).collect::<Vec<_>>(), vec![2]);
+
+        // Model filter on the disk branch (via selected or attempts).
+        let by_model = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    model: Some("beta".to_string()),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(by_model.iter().map(|d| d.id).collect::<Vec<_>>(), vec![2]);
+
+        // Client composes with the time filter on disk reads.
+        let composed = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    since: Some(0),
+                    client: Some("term1".to_string()),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            composed.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![2],
+            "client filter composes on the disk branch"
+        );
+
+        // A history filter without a running store is a 400 that names the
+        // likely causes (config off or single-writer lock lost).
+        let response = control_decisions(
+            State(integration_proxy_state()), // History::disabled()
+            Query(DecisionParams {
+                since: Some(0),
+                ..DecisionParams::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("history_enabled"));
+
+        drop(state); // release the single-writer lock before cleanup
         let _ = std::fs::remove_dir_all(&root);
     }
 }

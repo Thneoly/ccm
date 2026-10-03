@@ -31,6 +31,17 @@ pub(crate) struct ClientParams {
     pub(crate) client: Option<String>,
 }
 
+/// `/_ccm/decisions` query (v0.4 M5): `?client=` as before, plus disk-backed
+/// history filters `?since=&until=&model=`. Without any of since/until/model
+/// the handler keeps the exact in-memory behavior (last 100 decisions).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DecisionParams {
+    pub(crate) client: Option<String>,
+    pub(crate) since: Option<u64>,
+    pub(crate) until: Option<u64>,
+    pub(crate) model: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct ModelMetricsView {
     model: String,
@@ -353,17 +364,42 @@ async fn control_scores(State(state): State<ProxyState>) -> impl IntoResponse {
 
 pub(crate) async fn control_decisions(
     State(state): State<ProxyState>,
-    Query(params): Query<ClientParams>,
-) -> Json<Vec<RoutingDecision>> {
-    let decisions = state
-        .decisions
-        .read()
-        .await
-        .iter()
-        .filter(|decision| client_matches(params.client.as_deref(), &decision.client))
-        .cloned()
-        .collect();
-    Json(decisions)
+    Query(params): Query<DecisionParams>,
+) -> impl IntoResponse {
+    // No history filters: the in-memory ring, byte-identical to the v0.3
+    // behavior (last 100, newest last, `?client=` filter).
+    if params.since.is_none() && params.until.is_none() && params.model.is_none() {
+        let decisions: Vec<RoutingDecision> = state
+            .decisions
+            .read()
+            .await
+            .iter()
+            .filter(|decision| client_matches(params.client.as_deref(), &decision.client))
+            .cloned()
+            .collect();
+        return Json(decisions).into_response();
+    }
+    // Any of since/until/model: a disk read over the full persisted history
+    // (oldest first), still honoring the client filter.
+    let Some(dir) = state.history.dir() else {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!(
+                "history query parameters (since/until/model) require a running history store; check [observability] history_enabled and that no other proxy holds the single-writer lock"
+            ),
+        );
+    };
+    let query = crate::history::DecisionQuery {
+        since: params.since,
+        until: params.until,
+        model: params.model.clone(),
+        client: params.client.clone(),
+        limit: None,
+    };
+    match crate::history::read_decisions(dir, &query) {
+        Ok(decisions) => Json(decisions).into_response(),
+        Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
 }
 
 /// One client's runtime entry, as listed by `/_ccm/clients`.
