@@ -511,7 +511,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
                 // translate the OpenAI error body, preserve the status code.
                 return translated_error_response(upstream_response).await;
             }
-            if client_wants_stream {
+            if client_wants_stream && response_is_event_stream(&upstream_response) {
                 return translated_sse_response(upstream_response, &model_id);
             }
             return translated_json_response(upstream_response, &model_id).await;
@@ -586,6 +586,27 @@ fn prepare_request_body(bytes: &Bytes, model_id: &str, kind: ProviderKind) -> Re
                 .context("failed to serialize translated request body")
         }
     }
+}
+
+/// True when the upstream response declares an SSE body (media type
+/// `text/event-stream`, parameters ignored). A gateway answering a whole
+/// JSON body on a stream request must go through the buffered JSON
+/// translation path — feeding it to the SSE state machine would find no
+/// `data:` lines and synthesize an empty "clean" message over content the
+/// proxy never parsed (the second-round review's whole-body variant).
+fn response_is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
 }
 
 /// Accepted streaming response from an openai-compatible upstream: translate
@@ -1747,6 +1768,40 @@ open_ms = 30
             .expect("client body completes without upstream EOF");
         assert!(held_sse.contains("event: error"));
         assert!(!held_sse.contains("message_stop"));
+
+        // Non-SSE body on a stream request: a gateway that ignores `stream`
+        // and answers a whole JSON completion goes through the buffered JSON
+        // translation path instead of the SSE state machine (which would
+        // synthesize an empty message over content it never parsed).
+        *openai.behavior.write().await = MockBehavior::OpenaiJson(
+            json!({
+                "id": "chatcmpl-ns2",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "whole body reply"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+            })
+            .to_string(),
+        );
+        let response = forward(state.clone(), openai_integration_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/json"
+        );
+        let message: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["content"][0]["text"], "whole body reply");
 
         // HALF_OPEN probe release on translate failure: a request the
         // translator rejects must release an in-flight probe and record the
