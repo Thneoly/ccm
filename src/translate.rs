@@ -654,6 +654,14 @@ fn map_usage(usage: Option<&Value>) -> Value {
 // Error body translation
 // ===========================================================================
 
+/// True when an upstream JSON body or stream frame carries an `error` field
+/// worth surfacing: any non-null shape counts. The OpenAI schema uses an
+/// object, but string-form errors appear in the wild (OneAPI-class
+/// aggregators); `null` is not an error.
+pub fn carries_error(body: &Value) -> bool {
+    body.get("error").is_some_and(|v| !v.is_null())
+}
+
 /// Translate an OpenAI-style terminal error body into the Anthropic error
 /// envelope `{"type":"error","error":{type,message}}`. A body that does not
 /// parse as an OpenAI error becomes an `api_error` envelope carrying a short
@@ -672,6 +680,13 @@ pub fn translate_error_body(openai_error: &Value) -> Value {
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string)
+        // string-form `error` fields carry the message directly
+        .or_else(|| {
+            openai_error
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| format!("upstream error: {}", raw_fragment(openai_error)));
     json!({"type": "error", "error": {"type": anthropic_type, "message": message}})
 }
@@ -878,11 +893,13 @@ impl SseTranslator {
         }
         // Some gateways (OpenAI under load, Azure content filters,
         // OneAPI-class aggregators) report failure mid-stream as a
-        // valid-JSON frame carrying an `error` object on the still-200 SSE
+        // valid-JSON frame carrying an `error` field on the still-200 SSE
         // response. Dropping it as a choices-less frame would synthesize a
         // clean close over an upstream failure; instead map it through the
-        // same envelope translation as non-200 bodies and terminate.
-        if chunk.get("error").is_some_and(Value::is_object) {
+        // same envelope translation as non-200 bodies and terminate. Any
+        // non-null error shape counts — string-form errors are real in the
+        // wild.
+        if carries_error(chunk) {
             self.errored = true;
             return vec![sse("error", translate_error_body(chunk))];
         }
@@ -2097,6 +2114,43 @@ mod tests {
         let events = t.feed(format!("data: {hybrid}\n\n").as_bytes()).unwrap();
         assert_eq!(event_names(&events).last().copied(), Some("error"));
         assert!(!events.iter().any(|e| e.event == "message_stop"));
+    }
+
+    // 31. error frames of any non-null shape terminate the stream: a
+    //     string-form error carries the message; `"error": null` is not an
+    //     error and the frame's choices process normally
+    #[test]
+    fn sse_error_frame_shape_coverage() {
+        let string_err = json!({"error": "gateway exploded"});
+        let mut t = SseTranslator::new("up");
+        let events = t
+            .feed(format!("data: {string_err}\n\n").as_bytes())
+            .unwrap();
+        let names = event_names(&events);
+        assert_eq!(names.last().copied(), Some("error"));
+        assert!(!names.contains(&"message_stop"));
+        let err: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+        assert_eq!(err["error"]["type"], "api_error");
+        assert_eq!(err["error"]["message"], "gateway exploded");
+        // terminal: nothing more from feed or finish
+        assert!(t.is_done());
+        assert!(t.feed(b"data: [DONE]\n\n").unwrap().is_empty());
+        assert!(t.finish().unwrap().is_empty());
+
+        // "error": null is not an error
+        let null_err = json!({"error": null,
+                              "choices": [{"index": 0, "delta": {"content": "ok"}}]});
+        let mut t = SseTranslator::new("up");
+        let events = t
+            .feed(format!("data: {null_err}\n\ndata: [DONE]\n\n").as_bytes())
+            .unwrap();
+        assert!(events.iter().any(|e| e.event == "message_stop"));
+        assert!(!events.iter().any(|e| e.event == "error"));
+
+        // non-stream error body: string form becomes the message
+        let out = translate_error_body(&json!({"error": "boom string"}));
+        assert_eq!(out["error"]["type"], "api_error");
+        assert_eq!(out["error"]["message"], "boom string");
     }
 
     // 29. a message whose every block is unmappable (URL-source image)

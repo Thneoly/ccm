@@ -647,6 +647,17 @@ async fn translated_json_response(
         .await
         .context("failed to read upstream response body")?;
     let message = match serde_json::from_slice::<Value>(&body) {
+        // A 200 body carrying an error (misbehaving gateways): translate the
+        // error envelope and preserve the status instead of failing the
+        // choices[0] extraction into a generic 502 that loses the upstream
+        // type and message.
+        Ok(openai) if translate::carries_error(&openai) => {
+            return chunked_json_response(
+                status,
+                serde_json::to_vec(&translate::translate_error_body(&openai))
+                    .context("failed to serialize error response")?,
+            );
+        }
         Ok(openai) => translate::translate_response(&openai, model_id)
             .map_err(|err| anyhow::anyhow!("failed to translate response: {err}")),
         Err(err) => Err(anyhow::anyhow!(
@@ -1802,6 +1813,22 @@ open_ms = 30
         let message: Value = serde_json::from_str(&body_text(response).await).unwrap();
         assert_eq!(message["type"], "message");
         assert_eq!(message["content"][0]["text"], "whole body reply");
+
+        // A 200 body carrying an error (misbehaving gateways): status kept,
+        // upstream type and message preserved through the envelope
+        // translation instead of a generic 502.
+        *openai.behavior.write().await = MockBehavior::OpenaiJson(
+            json!({"error": {"message": "late failure", "type": "rate_limit_error"}}).to_string(),
+        );
+        let response = forward(state.clone(), openai_non_stream_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let error_body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(
+            error_body,
+            json!({"type": "error", "error": {"type": "rate_limit_error", "message": "late failure"}})
+        );
 
         // HALF_OPEN probe release on translate failure: a request the
         // translator rejects must release an in-flight probe and record the
