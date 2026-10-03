@@ -622,20 +622,11 @@ scope then and where each item now stands:
 
 ### 18.1 Proxy file size
 
-`src/proxy.rs` is large and should be split after v0.3.
-
-Suggested future modules:
-
-```text
-proxy/http.rs
-routing/select.rs
-routing/circuit.rs
-routing/metrics.rs
-routing/decision.rs
-control/api.rs
-```
-
-Do not perform this refactor before release unless required by a correctness problem.
+Resolved in v0.4 M0: the routing stack now lives in `src/routing/`
+(`select` / `circuit` / `metrics` / `decision`) and the control API in
+`src/control/api.rs`; `src/proxy.rs` keeps the forwarding loop and the
+HTTP path. It is still the largest module — prefer extracting a new
+concern over growing it further.
 
 ### 18.2 Policy update UX
 
@@ -665,6 +656,15 @@ This is intentional for v0.3.
 Proxy forwarding currently focuses on `/v1/messages`.
 
 If future Anthropic-compatible APIs depend on query strings, forwarding behavior must be reviewed.
+
+### 18.6 Non-stream translation buffers the upstream body
+
+For non-streaming openai-compatible responses, the whole upstream body is
+read inside `forward()` before the client receives any byte, because the
+translation needs the complete JSON. `header_timeout_ms` only bounds time
+to upstream response headers, so a stalled committed body holds the client
+request open. Accepted for v0.4 — this mirrors reqwest's default of no
+body-level timeout; revisit only if it bites in practice.
 
 ## 19. Design Invariants for Future Agents
 

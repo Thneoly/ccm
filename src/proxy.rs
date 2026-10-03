@@ -146,12 +146,22 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         .await
         .context("failed to read request body")?;
 
-    // Request-level stream flag: parsed once (a malformed body simply yields
-    // false here; the per-candidate preparation will fail on it anyway).
-    let client_wants_stream = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .map(|value| translate::request_wants_stream(&value))
-        .unwrap_or(false);
+    // Request-level stream flag: parsed once, and only when a candidate can
+    // actually require an openai-compatible translation — anthropic-only
+    // routes (the v0.3 hot path) skip the extra full-body parse entirely. A
+    // malformed body simply yields false here; the per-candidate preparation
+    // will fail on it anyway.
+    let may_translate = candidates.iter().any(|candidate| {
+        config
+            .models
+            .get(candidate)
+            .and_then(|model| config.providers.get(&model.provider))
+            .is_some_and(|provider| provider.kind == ProviderKind::OpenAICompatible)
+    });
+    let client_wants_stream = may_translate
+        && serde_json::from_slice::<Value>(&bytes)
+            .map(|value| translate::request_wants_stream(&value))
+            .unwrap_or(false);
 
     let mut failures = Vec::new();
     let mut actual_attempts = 0usize;
@@ -253,7 +263,7 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         let upstream = format!(
             "{}{}",
             provider.base_url.trim_end_matches('/'),
-            upstream_path(provider.kind)
+            provider.kind.upstream_path()
         );
 
         let mut builder = state.client.post(upstream).body(body);
@@ -420,14 +430,6 @@ fn proxy_response(upstream_response: reqwest::Response) -> Result<Response<Body>
 // ===========================================================================
 // openai-compatible translation wiring (v0.4 M2)
 // ===========================================================================
-
-/// Upstream chat endpoint for a provider kind.
-fn upstream_path(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => "/v1/messages",
-        ProviderKind::OpenAICompatible => "/v1/chat/completions",
-    }
-}
 
 /// Prepare the upstream request body for one candidate. Anthropic kinds keep
 /// the byte-identical model rewrite; openai-compatible candidates get the full
@@ -805,6 +807,8 @@ mod tests {
         // 200 + text/event-stream with scriptable raw SSE bytes (the
         // openai-compatible upstream contract).
         OpenaiSse(String),
+        // 200 + application/json body (a complete OpenAI chat completion).
+        OpenaiJson(String),
         // status + application/json body (OpenAI-shaped error envelope).
         OpenaiError(StatusCode, String),
     }
@@ -849,6 +853,11 @@ mod tests {
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::from(raw))
+                .unwrap(),
+            MockBehavior::OpenaiJson(body) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
                 .unwrap(),
             MockBehavior::OpenaiError(status, body) => Response::builder()
                 .status(status)
@@ -1214,6 +1223,19 @@ open_ms = {open_ms}
             .unwrap()
     }
 
+    /// Non-streaming counterpart of `openai_integration_request`: same
+    /// surface, `stream: false`.
+    fn openai_non_stream_request() -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"ccm","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap()
+    }
+
     fn write_openai_integration_config(root: &std::path::Path, openai_url: &str, native_url: &str) {
         std::fs::create_dir_all(root).unwrap();
         let raw = format!(
@@ -1398,6 +1420,76 @@ open_ms = 30
             json!({"type": "error", "error": {"type": "api_error", "message": "upstream boom"}})
         );
 
+        // Non-streaming translation: the client's `stream: false` yields a
+        // buffered Anthropic message JSON, chunked (no content-length).
+        *openai.behavior.write().await = MockBehavior::OpenaiJson(
+            json!({
+                "id": "chatcmpl-ns",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello world"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 2}
+            })
+            .to_string(),
+        );
+        let openai_before = openai.requests.lock().unwrap().len();
+        let response = forward(state.clone(), openai_non_stream_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/json"
+        );
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        let message: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["model"], "deepseek-chat");
+        assert_eq!(
+            message["content"][0],
+            json!({"type": "text", "text": "Hello world"})
+        );
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(message["usage"]["input_tokens"], 12);
+        assert_eq!(message["usage"]["output_tokens"], 2);
+        {
+            let requests = openai.requests.lock().unwrap();
+            assert_eq!(requests.len(), openai_before + 1);
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.path, "/v1/chat/completions");
+            assert_eq!(captured.body["stream"], json!(false));
+        }
+
+        // Post-commit translation failure (plan §8.2): an untranslatable 200
+        // body surfaces a 502 Anthropic envelope with NO retry and NO
+        // fallback — exactly one upstream request, zero fallback requests.
+        *openai.behavior.write().await =
+            MockBehavior::OpenaiJson(json!({"unexpected": true}).to_string());
+        let openai_before = openai.requests.lock().unwrap().len();
+        let native_before = native.requests.lock().unwrap().len();
+        let response = forward(state.clone(), openai_non_stream_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let failure: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(failure["type"], "error");
+        assert_eq!(failure["error"]["type"], "api_error");
+        assert!(failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccm: upstream translation failure:"));
+        assert_eq!(openai.requests.lock().unwrap().len(), openai_before + 1);
+        assert_eq!(native.requests.lock().unwrap().len(), native_before);
+
         // Mixed-protocol fallback: openai primary returns 429, native
         // anthropic fallback serves the response as native Anthropic SSE.
         *openai.behavior.write().await = MockBehavior::Status(StatusCode::TOO_MANY_REQUESTS);
@@ -1489,6 +1581,33 @@ open_ms = 30
             let decision = decisions.back().unwrap();
             assert_eq!(decision.attempts[0].circuit, "HALF_OPEN");
             assert_eq!(decision.selected.as_deref(), Some("openai"));
+        }
+
+        // Health check follows the kind: the openai model pings
+        // /v1/chat/completions with Bearer auth, max_tokens 1, and no
+        // anthropic-version header.
+        let health_before = openai.requests.lock().unwrap().len();
+        crate::health::check(&AppConfig::load().unwrap(), "openai")
+            .await
+            .unwrap();
+        {
+            let requests = openai.requests.lock().unwrap();
+            assert_eq!(requests.len(), health_before + 1);
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.path, "/v1/chat/completions");
+            assert_eq!(
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer openai-secret"
+            );
+            assert!(captured.headers.get("anthropic-version").is_none());
+            assert_eq!(captured.body["model"], "deepseek-chat");
+            assert_eq!(captured.body["max_tokens"], 1);
+            assert_eq!(captured.body["messages"][0]["content"], "ping");
         }
 
         openai_task.abort();

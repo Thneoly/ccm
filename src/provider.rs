@@ -59,6 +59,16 @@ impl ProviderKind {
             ProviderKind::OpenAICompatible => "openai-compatible",
         }
     }
+
+    /// Upstream chat endpoint for this kind. This is the ONLY place the
+    /// kind -> endpoint mapping is defined; forwarding and health checks
+    /// share it so they can never diverge.
+    pub fn upstream_path(&self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => "/v1/messages",
+            ProviderKind::OpenAICompatible => "/v1/chat/completions",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +134,19 @@ auth = "bearer"
         );
         let serialized = toml::to_string(&provider).unwrap();
         assert!(serialized.contains(r#"auth = "bearer""#));
+    }
+
+    #[test]
+    fn upstream_paths_follow_provider_kind() {
+        assert_eq!(ProviderKind::Anthropic.upstream_path(), "/v1/messages");
+        assert_eq!(
+            ProviderKind::AnthropicCompatible.upstream_path(),
+            "/v1/messages"
+        );
+        assert_eq!(
+            ProviderKind::OpenAICompatible.upstream_path(),
+            "/v1/chat/completions"
+        );
     }
 
     #[test]

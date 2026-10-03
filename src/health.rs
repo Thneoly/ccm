@@ -1,11 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 
-use crate::{
-    config::AppConfig,
-    credential,
-    provider::{Provider, ProviderKind},
-};
+use crate::{config::AppConfig, credential, provider::ProviderKind};
 
 pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
     let model = config
@@ -21,7 +17,7 @@ pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
     let url = format!(
         "{}{}",
         provider.base_url.trim_end_matches('/'),
-        health_path(provider)
+        provider.kind.upstream_path()
     );
     let client = reqwest::Client::new();
     // The ping body shape is identical for both protocols; only the endpoint
@@ -55,14 +51,6 @@ pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
 
     let body = response.text().await.unwrap_or_default();
     anyhow::bail!("provider returned {status}: {}", truncate(&body, 300));
-}
-
-/// Health-check endpoint for a provider kind.
-fn health_path(provider: &Provider) -> &'static str {
-    match provider.kind {
-        ProviderKind::OpenAICompatible => "/v1/chat/completions",
-        ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => "/v1/messages",
-    }
 }
 
 fn truncate(input: &str, max: usize) -> String {
