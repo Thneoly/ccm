@@ -1,0 +1,4 @@
+# POSIX shell scripts must keep LF endings in every working tree — a CRLF
+# checkout (Windows autocrlf default) breaks their shebangs under WSL/Linux
+# (v0.4 M8 finding; the WSL2 gate reads the Windows tree via /mnt).
+*.sh text eol=lf
