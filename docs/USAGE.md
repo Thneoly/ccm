@@ -262,10 +262,13 @@ ccm proxy
 ```
 
 ```text
+History: C:\Users\you\.ccm\history (decisions, metric snapshots, circuit transitions)
 CCM proxy listening on http://127.0.0.1:13521
 Claude Code base URL: http://127.0.0.1:13521
 Runtime switch: `ccm switch <model-or-profile-or-route>`.
 ```
+
+首行的 `History:` 只在 history 存储成功打开时出现（默认配置即有）；被 `[observability]` 关掉或单写者锁被另一个代理占用时，改为 stderr 一条警告、代理照常路由（见 6.3）。
 
 终端 B 启动 claude：
 
@@ -526,7 +529,7 @@ fallback = ["glm"]
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
 | `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
-| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的完整历史（见 6.3），无运行中的 history 存储时该组合返回 400 |
+| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3），`?limit=` 限制返回条数（保留最新 N，默认 1000），无运行中的 history 存储时该组合返回 400 |
 | `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
@@ -616,6 +619,8 @@ ccm history circuit --model glm
 # 控制接口（代理运行中；unix-ms 含边界；与 ?client= 可组合）
 Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1759300000000&model=glm"
 ```
+
+HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——运行中的代理不该被一次全量历史反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
 
 `[observability]` 配置节（全部有默认值，v0.4 之前的配置文件不用改；任一阈值填 0 会在加载时报错）：
 

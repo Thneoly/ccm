@@ -489,14 +489,37 @@ impl StreamFiles {
     }
 
     fn open_active(&mut self, stream: HistoryStream, slot: usize) -> std::io::Result<()> {
-        // If an active file already exists, continue counting from its
-        // actual size (a restarted proxy appends to the previous tail).
+        // If an active file already exists, a restarted proxy appends to the
+        // previous tail: continue the byte accounting from its actual size,
+        // count the complete lines already in it (so the per-file record cap
+        // holds across restarts, as documented), and terminate a torn last
+        // line (crash mid-write) before appending — otherwise the first new
+        // record would merge onto the torn fragment and BOTH would be
+        // unreadable forever.
         let path = self.dir.join(format!("{}.jsonl", stream.file_stem()));
         let already = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let (mut bytes, mut records) = (already, 0u64);
+        if already > 0 {
+            let mut existing = BufReader::new(File::open(&path)?);
+            let mut buffer = [0u8; 8192];
+            let mut last_byte = 0u8;
+            loop {
+                let read = existing.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                records += buffer[..read].iter().filter(|&&b| b == b'\n').count() as u64;
+                last_byte = buffer[read - 1];
+            }
+            if last_byte != b'\n' {
+                file.write_all(b"\n")?;
+                bytes += 1;
+            }
+        }
         self.writers[slot] = Some(BufWriter::new(file));
-        self.bytes[slot] = already;
-        self.records[slot] = 0;
+        self.bytes[slot] = bytes;
+        self.records[slot] = records;
         Ok(())
     }
 
@@ -517,13 +540,15 @@ impl StreamFiles {
     }
 
     /// `<stem>-<unix_ms>.jsonl`, with a numeric suffix on same-millisecond
-    /// collisions (small test caps can rotate twice inside one ms).
+    /// collisions (small test caps can rotate twice inside one ms). The ms
+    /// is sampled once so a collision probe spanning a clock tick cannot
+    /// jump to a different timestamp mid-search.
     fn rotated_path(&self, stem: &str) -> PathBuf {
-        let base = format!("{stem}-{}.jsonl", now_ms());
-        let mut candidate = self.dir.join(&base);
+        let ms = now_ms();
+        let mut candidate = self.dir.join(format!("{stem}-{ms}.jsonl"));
         let mut n = 1u32;
         while candidate.exists() {
-            candidate = self.dir.join(format!("{stem}-{}-{n}.jsonl", now_ms()));
+            candidate = self.dir.join(format!("{stem}-{ms}-{n}.jsonl"));
             n += 1;
         }
         candidate
@@ -588,13 +613,14 @@ pub(crate) struct DecisionQuery {
 }
 
 /// All files of one stream kind, oldest first: rotated files by their
-/// timestamp suffix, then the active `<kind>.jsonl` (it holds the newest
-/// records). Malformed suffixes sort first (safest for time-ordered reads:
-/// they are still complete lines).
+/// timestamp suffix (same-millisecond collision suffixes ordered by their
+/// number — see [`rotated_sort_key`]), then the active `<kind>.jsonl` (it
+/// holds the newest records). Malformed suffixes sort first (safest for
+/// time-ordered reads: they are still complete lines).
 pub(crate) fn kind_files(dir: &Path, stream: HistoryStream) -> Vec<PathBuf> {
     let prefix = format!("{}-", stream.file_stem());
     let active_name = format!("{}.jsonl", stream.file_stem());
-    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    let mut files: Vec<((u64, u64), PathBuf)> = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -602,17 +628,29 @@ pub(crate) fn kind_files(dir: &Path, stream: HistoryStream) -> Vec<PathBuf> {
         let name = entry.file_name();
         let name = name.to_string_lossy().into_owned();
         if name == active_name {
-            files.push((u64::MAX, entry.path()));
+            files.push(((u64::MAX, u64::MAX), entry.path()));
         } else if let Some(suffix) = name.strip_prefix(&prefix) {
             let key = suffix
                 .strip_suffix(".jsonl")
-                .and_then(|digits| digits.parse::<u64>().ok())
-                .unwrap_or(0);
+                .and_then(rotated_sort_key)
+                .unwrap_or((0, 0));
             files.push((key, entry.path()));
         }
     }
     files.sort_by_key(|(key, _)| *key);
     files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Sort key for a rotated file's name suffix (the part between `<kind>-` and
+/// `.jsonl`): `<ms>` maps to `(ms, 0)` and the same-millisecond collision
+/// form `<ms>-<n>` to `(ms, n)`. Within one millisecond the plain `<ms>`
+/// name rotated first and therefore holds OLDER records than `<ms>-1`,
+/// `<ms>-2`, ….
+fn rotated_sort_key(suffix: &str) -> Option<(u64, u64)> {
+    match suffix.split_once('-') {
+        Some((ms, n)) => Some((ms.parse::<u64>().ok()?, n.parse::<u64>().ok()?)),
+        None => suffix.parse::<u64>().ok().map(|ms| (ms, 0)),
+    }
 }
 
 /// Iterate complete lines of a JSONL file. A torn final line (crash
@@ -1199,6 +1237,110 @@ mod tests {
         let snapshots = read_metrics_snapshots(dir.path(), None);
         assert_eq!(snapshots.len(), 1, "only the well-formed record parses");
         assert_eq!(snapshots[0].timestamp_ms, 2);
+    }
+
+    // 13. a torn tail from a crash does not swallow the first record after
+    //     a restart: open_active terminates the partial line before the
+    //     first append, so the new records stay readable
+    #[test]
+    fn restart_repairs_torn_tail_before_appending() {
+        let (dir, history) = store_with("torn-restart", HistoryLimits::default());
+        history.record_decision(&decision(1, 100, &["glm"], Some("glm")));
+        drop(history);
+
+        let active = dir.path().join("decisions.jsonl");
+        let mut contents = fs::read_to_string(&active).unwrap();
+        contents.push_str("{\"id\": 9, \"timestamp_ms\":"); // crash mid-write
+        fs::write(&active, contents).unwrap();
+
+        let reopened = open_history(
+            dir.path().to_path_buf(),
+            HistoryLimits::default(),
+            CHANNEL_CAPACITY,
+        )
+        .unwrap();
+        reopened.record_decision(&decision(2, 200, &["glm"], Some("glm")));
+        reopened.record_decision(&decision(3, 300, &["glm"], Some("glm")));
+        drop(reopened);
+
+        let records = read_decisions(dir.path(), &DecisionQuery::default()).unwrap();
+        let ids: Vec<u64> = records.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "the torn line is skipped, the post-restart records survive"
+        );
+    }
+
+    // 14. same-millisecond rotation collisions (`<kind>-<ms>-<n>.jsonl`)
+    //     sort after the plain `<ms>` file and before later timestamps
+    #[test]
+    fn kind_files_orders_same_millisecond_collisions() {
+        let dir = TempDir::new("order");
+        for name in [
+            "decisions-2000.jsonl",
+            "decisions-1000-1.jsonl",
+            "decisions.jsonl",
+            "decisions-1000.jsonl",
+            "notes.txt",
+            "metrics-1000.jsonl",
+        ] {
+            fs::write(dir.path().join(name), "{}\n").unwrap();
+        }
+        let names: Vec<String> = kind_files(dir.path(), HistoryStream::Decisions)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "decisions-1000.jsonl",
+                "decisions-1000-1.jsonl",
+                "decisions-2000.jsonl",
+                "decisions.jsonl",
+            ],
+            "oldest first: plain <ms>, then its collision suffixes, then later ms, active last"
+        );
+    }
+
+    // 15. the per-file record cap counts records written before the restart
+    //     too, so the documented 50k-per-file behavior holds across restarts
+    #[test]
+    fn record_cap_counts_pre_restart_records() {
+        let limits = HistoryLimits {
+            max_records_per_file: 3,
+            ..HistoryLimits::default()
+        };
+        let (dir, history) = store_with("cap-restart", limits);
+        history.record_decision(&decision(1, 100, &["glm"], Some("glm")));
+        history.record_decision(&decision(2, 200, &["glm"], Some("glm")));
+        drop(history);
+
+        let reopened = open_history(dir.path().to_path_buf(), limits, CHANNEL_CAPACITY).unwrap();
+        reopened.record_decision(&decision(3, 300, &["glm"], Some("glm")));
+        reopened.record_decision(&decision(4, 400, &["glm"], Some("glm")));
+        drop(reopened);
+
+        let rotated = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_rotated_name(&entry.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(
+            rotated, 1,
+            "the pre-restart records pushed the file over the cap"
+        );
+        assert_eq!(
+            jsonl_lines(&dir.path().join("decisions.jsonl")).len(),
+            1,
+            "active holds only the overflow record"
+        );
+        let ids: Vec<u64> = read_decisions(dir.path(), &DecisionQuery::default())
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
     }
 
     // sanity: the json helper compiles (keeps the serde_json import honest)

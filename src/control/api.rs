@@ -32,14 +32,17 @@ pub(crate) struct ClientParams {
 }
 
 /// `/_ccm/decisions` query (v0.4 M5): `?client=` as before, plus disk-backed
-/// history filters `?since=&until=&model=`. Without any of since/until/model
-/// the handler keeps the exact in-memory behavior (last 100 decisions).
+/// history filters `?since=&until=&model=` and `?limit=`. Without any of
+/// since/until/model the handler keeps the exact in-memory behavior (last
+/// 100 decisions). Disk reads keep the most recent `limit` records and are
+/// bounded by a default cap when `limit` is absent.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct DecisionParams {
     pub(crate) client: Option<String>,
     pub(crate) since: Option<u64>,
     pub(crate) until: Option<u64>,
     pub(crate) model: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Clone, Serialize)]
@@ -379,8 +382,14 @@ pub(crate) async fn control_decisions(
             .collect();
         return Json(decisions).into_response();
     }
-    // Any of since/until/model: a disk read over the full persisted history
-    // (oldest first), still honoring the client filter.
+    // Any of since/until/model: a disk read over the persisted history
+    // (oldest first), still honoring the client filter. The read is bounded:
+    // deserializing the entire retained history (hundreds of MB under a busy
+    // proxy) on a routine dashboard query would spike memory and stall a
+    // worker, so absent an explicit `?limit=` the most recent 1000 records
+    // come back. The read is blocking file IO — run it off the workers that
+    // serve /v1/messages.
+    const DEFAULT_DISK_LIMIT: usize = 1000;
     let Some(dir) = state.history.dir() else {
         return control_error(
             StatusCode::BAD_REQUEST,
@@ -394,11 +403,16 @@ pub(crate) async fn control_decisions(
         until: params.until,
         model: params.model.clone(),
         client: params.client.clone(),
-        limit: None,
+        limit: Some(params.limit.unwrap_or(DEFAULT_DISK_LIMIT)),
     };
-    match crate::history::read_decisions(dir, &query) {
-        Ok(decisions) => Json(decisions).into_response(),
-        Err(err) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    let dir = dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::history::read_decisions(&dir, &query)).await {
+        Ok(Ok(decisions)) => Json(decisions).into_response(),
+        Ok(Err(err)) => control_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("history read task failed: {err}"),
+        ),
     }
 }
 

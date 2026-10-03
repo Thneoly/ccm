@@ -2911,6 +2911,25 @@ model_id = "upstream-y"
         .await;
         assert_eq!(by_model.iter().map(|d| d.id).collect::<Vec<_>>(), vec![2]);
 
+        // Explicit limit on the disk branch keeps the most recent N.
+        let limited = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    since: Some(0),
+                    limit: Some(2),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            limited.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![2, 3],
+            "limit keeps the newest records"
+        );
+
         // Client composes with the time filter on disk reads.
         let composed = decisions_from(
             control_decisions(
