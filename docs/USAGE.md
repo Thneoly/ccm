@@ -428,12 +428,24 @@ cost        = 1 / (1 + max(cost_weight, 0))（静态，来自模型元数据）
 quality     = quality_weight，截断到 [0,1]
 ```
 
-### 5.3 模型的 cost / quality 权重
+### 5.3 模型的 cost / quality 权重与定价表
 
 `ccm add model` 的 `--cost-weight` / `--quality-weight`（默认各 `1.0`）：
 
 - `cost_weight` 是**相对成本**，越小越便宜：`lowest-cost` 直接按它升序，`weighted` 里它得分更高。样例配置给 glm 设 0.25、claude 设 1.0，即"glm 约便宜 4 倍"。
 - `quality_weight` 是**相对质量**（0~1），只影响 `weighted` 策略的质量分量。
+
+两者都只是**路由元数据**，和钱无关。要算真实花费，给模型加一张手填的每百万 token 定价表（v0.4 M6，直接编辑 `config.toml`）：
+
+```toml
+[models.glm.pricing]
+input = 3.0        # 每百万输入 token 的美元单价
+output = 15.0      # 每百万输出 token
+cache_read = 0.3   # 每百万缓存命中（读）token
+cache_write = 3.75 # 每百万缓存写入 token
+```
+
+费用按 `Σ tokens/1e6 × 单价` 计算，单价快照随记录落盘（改价不影响已记的账）。没填定价表的模型按"无价"记账——`cost_usd` 是 `null`，**绝不猜一个数**；聚合视图里单独计数（见 6.4）。
 
 ### 5.4 熔断与 fallback 行为
 
@@ -514,7 +526,7 @@ fallback = ["glm"]
 |---|---|
 | `ccm doctor` | 本地体检：PATH、目标解析、配置链、凭据在不在、端点通不通（见 3.4） |
 | `ccm health <model-or-profile>` | 发真实请求验证"鉴权 + 模型名"是否可用 |
-| `ccm history decisions\|metrics\|circuit` | 离线查看持久化的决策 / 指标快照 / 熔断转换（见 6.3，代理停着也能查） |
+| `ccm history decisions\|metrics\|circuit\|cost` | 离线查看持久化的决策 / 指标快照 / 熔断转换 / 按天成本（见 6.3、6.4，代理停着也能查） |
 | `/_ccm/*` 控制接口 | 代理运行时的实时观测与切换（本节） |
 
 ### 6.1 控制接口一览（默认 `http://127.0.0.1:13521`）
@@ -530,6 +542,8 @@ fallback = ["glm"]
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
 | `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
 | `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3）；`?limit=` 限制返回条数、保留最新 N（内存/磁盘两条路径都生效，磁盘查询缺省 1000），无运行中的 history 存储时该组合返回 400 |
+| `GET /_ccm/usage` | 最近 100 条使用量记录（见 6.4）；过滤参数与 `/_ccm/decisions` 完全一致（`?client=` / `?since=&until=&model=` / `?limit=`，无 history 存储时过滤查询同样 400） |
+| `GET /_ccm/cost` | 按 UTC 日聚合的使用量与成本（见 6.4）：`?day=YYYY-MM-DD`（缺省今天），`?client=<id>` 缩小到该客户端；始终读磁盘历史，无 history 存储时 400 |
 | `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
@@ -593,9 +607,10 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 
 | 文件 | 内容 |
 |---|---|
-| `decisions.jsonl` | 每条路由决策（与 `/_ccm/decisions` 记录同结构；计费用的 `usage.jsonl` 在 M6 加入） |
+| `decisions.jsonl` | 每条路由决策（与 `/_ccm/decisions` 记录同结构） |
 | `metrics.jsonl` | 全模型指标快照，默认每 30 秒一条（原始计数，比率在读取时计算） |
 | `circuit.jsonl` | 熔断状态转换（CLOSED / OPEN / HALF_OPEN + 原因） |
+| `usage.jsonl` | 每个被接受的 2xx 响应一条使用量记录（见 6.4；`decision_id` 关联到 decisions.jsonl） |
 
 行为要点：
 
@@ -615,9 +630,11 @@ ccm history decisions --model glm --limit 20
 ccm history decisions --since 1759300000000 --until 1759399999999 --client term1
 ccm history metrics            # 最新一次快照（--limit 5 看最近 5 次）
 ccm history circuit --model glm
+ccm history cost               # 今天（UTC）按模型聚合的花费（--day 2025-10-03 指定日）
 
 # 控制接口（代理运行中；unix-ms 含边界；与 ?client= 可组合）
 Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1759300000000&model=glm"
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?day=2025-10-03&client=term1"
 ```
 
 HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——查询按最新优先扫描文件、凑够条数即停，读取代价随 limit 而不是历史总量增长，运行中的代理不会被一次全量反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
@@ -634,6 +651,31 @@ metrics_snapshot_interval_secs = 30
 ```
 
 `ccm doctor` 增加一行历史目录状态：`✓ history: N file(s) at <dir>`，目录为空或已禁用时是 `!` 提示（非致命）。
+
+### 6.4 使用量捕获与成本核算（v0.4 M6）
+
+代理在每个**被接受的 2xx 响应体**外面包一层增量扫描器：字节流原样透传（不缓冲整个流），边流边认出 Anthropic 的 usage 帧，流结束时落一条使用量记录。关键语义：
+
+- **一条决策一条记录**：记录的 `decision_id` 关联 `decisions.jsonl` 里的决策，`model` 是别名（账目按别名键），`client` 有会话 id 时带上——按会话算成本是免费的。
+- **token 合并**：流式响应里 `message_start` 带输入/缓存 token、`message_delta` 带输出 token，逐字段合并、后到者覆盖。翻译流（openai-compatible）的 `message_start` 是诚实的零占位，真实数字随最后一个 delta 到达。`message_start` 没有 usage 字段（v0.3 的 mock 就这样）也容忍，字段保持 0 直到后续帧补上。
+- **`complete: false` 的三种情况**：客户端中途断开（记录照出，已见 token 保留）、传输错误、或上游在 200 流里发过 `error` 帧——最后一种补上了 v0.4 的一个盲区：指标在响应头时刻就把流式失败计成了成功，扫描器在这里把它如实记为不完整。
+- **错误透传不记账**：终态 429/5xx 透传（无"被接受的响应体"）不产生使用量记录。
+- **扫描有界**：单行超过 64 KiB（如 base64 工具输出）整行丢弃、下一行重新同步；非流式 JSON 体积超 16 MiB 按 0 token 诚实记账，不无限耗内存。
+
+成本查询：
+
+```powershell
+# 代理运行中：按 UTC 日聚合（缺省 ?day= 是今天）
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost"           # 全局
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?client=term1" # 某个会话
+
+# 代理停了也能查（离线读 usage.jsonl）
+ccm history cost --day 2025-10-03
+```
+
+`cost` 视图按模型给出 requests / complete / 四类 token / `cost_usd`（模型名排序），外加合计与**无价请求数**（没配 `[pricing]` 表的模型——它们的成本未知而非零，合计不会虚报）。`/_ccm/usage` 则是逐条记录视图，参数语义与 `/_ccm/decisions` 完全一致。
+
+> 边界声明：这是**代理侧计量**，不是账单真相。token 数来自上游上报（native 流或翻译流），单价是手填的；只能用于相对比较与异常发现（比如某会话今天烧了 10 倍于平时的 input token），不能对账。
 
 ---
 
@@ -755,6 +797,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm history decisions` | 离线查看持久化决策（JSONL，旧→新） | `--since`、`--until`（unix-ms，含边界）、`--model`、`--client`、`--limit`（保留最新 N） |
 | `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit` |
 | `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit` |
+| `ccm history cost` | 离线查看按 UTC 日聚合的使用量与成本表（见 6.4） | `--day`（`YYYY-MM-DD`，缺省今天）、`--client` |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
 | `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |
 | `ccm list` | 列出模型与路由（`*` = 当前） | — |

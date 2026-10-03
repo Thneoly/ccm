@@ -433,11 +433,13 @@ GET  /_ccm/circuits
 GET  /_ccm/metrics
 GET  /_ccm/scores
 GET  /_ccm/decisions
+GET  /_ccm/usage
+GET  /_ccm/cost
 GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — newest-first and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running).
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — newest-first and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed).
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
@@ -501,7 +503,7 @@ Why did CCM fallback?
 Which model finally produced the returned upstream response?
 ```
 
-Attempt traces stay intentionally in-memory (last 100, proxy lifetime). Routing decisions persist to JSONL history since v0.4 M5 (see the Control API section).
+Attempt traces stay intentionally in-memory (last 100, proxy lifetime). Routing decisions persist to JSONL history since v0.4 M5 (see the Control API section). Since v0.4 M6, accepted responses also persist one usage record each (`usage.jsonl`), joined to their decision id: `/_ccm/usage` lists records, `/_ccm/cost?day=YYYY-MM-DD` and `ccm history cost` aggregate tokens and USD cost by model against the hand-entered `[models.<name>.pricing]` tables (unpriced models count separately, never guessed).
 
 ## Mock Provider integration coverage
 
@@ -533,7 +535,7 @@ committed-stream failure -> error event, zero requests to the fallback (no mid-s
 HALF_OPEN probe release on translate failure
 ```
 
-All five integration tests mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) and serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring. The disk-query test for `/_ccm/decisions` uses an explicit history directory and needs no env lock.
+The six integration tests that mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring. The disk-query tests (`/_ccm/decisions`, `/_ccm/usage`, `/_ccm/cost`) use explicit history directories and need no env lock.
 
 Run them with:
 
@@ -607,6 +609,7 @@ ccm clients [--proxy-url URL]
 ccm history decisions [--since MS] [--until MS] [--model M] [--client ID] [--limit N]
 ccm history metrics [--limit N]
 ccm history circuit [--model M] [--limit N]
+ccm history cost [--day YYYY-MM-DD] [--client ID]
 ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
 ccm auth set <provider>
 ccm auth delete <provider>
@@ -719,6 +722,11 @@ GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-late
   circuit transitions persist under `$CCM_HOME/history/` with rotation,
   14-day retention, and a single-writer lock; offline `ccm history` reads
   and disk-backed `/_ccm/decisions?since=&until=&model=` queries
+- usage capture and cost accounting (v0.4): one usage record per accepted
+  response, joined to its decision id and tagged with the client id;
+  per-MTok pricing tables hand-entered per model; `/_ccm/usage`,
+  `/_ccm/cost?day=`, and offline `ccm history cost` aggregate tokens and
+  USD by model (unpriced models counted separately, never guessed)
 - no mid-stream failover
 
 ## License

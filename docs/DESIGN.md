@@ -557,6 +557,8 @@ src/integrate.rs   Claude Skill installation
 src/health.rs      authenticated provider check
 src/history.rs     JSONL observability history engine (writer + readers)
 src/history_cli.rs `ccm history` offline presentation
+src/usage.rs       usage scanner + UsageRecord + cost aggregation (v0.4 M6)
+src/date.rs        UTC calendar-day math for the cost views (Hinnant)
 src/doctor.rs      local environment diagnosis
 src/translate.rs   pure anthropic<->openai translation engine (no IO)
 src/proxy.rs       forward() + HTTP path + mock integration tests
@@ -693,6 +695,13 @@ restart from zero — deliberate, so stale history never distorts
 healthiest/weighted ordering — and the attempt-trace ring stays
 in-memory-only (last 100) by design.
 
+v0.4 M6 extends the same store with `usage.jsonl`: one usage record per
+accepted 2xx response (decision-id joined, client tagged, priced against
+a snapshot of the hand-entered `[models.<name>.pricing]` table; unpriced
+models record `cost_usd: null`, never a guess). Queries: `/_ccm/usage`
+(same dual-branch parameter contract as decisions), `/_ccm/cost?day=`
+(UTC-day aggregation, shared core with `ccm history cost`).
+
 ### 18.5 Query strings
 
 Proxy forwarding currently focuses on `/v1/messages`.
@@ -740,3 +749,9 @@ unauthenticated control API (§13 security note). Scoped switches stay
 runtime-only (8): per-client entries live in proxy memory only, proxy
 restart falls back to the global target, and `ccm use` / `state.toml` are
 untouched (9).
+
+Note on usage capture (v0.4 M6): the usage scanner wraps accepted bodies
+chunk-by-chunk with a 64 KiB per-line cap and never buffers the stream
+(6, same reasoning as runtime metrics). Cost accounting is proxy-side
+measurement, not bill truth: token counts come from upstream-reported
+usage and prices are hand-entered.
