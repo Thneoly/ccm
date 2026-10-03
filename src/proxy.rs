@@ -2832,13 +2832,18 @@ model_id = "upstream-y"
 
         let mut state = integration_proxy_state();
         state.history = store;
-        // The in-memory ring holds a DIFFERENT record so the branch choice is
+        // The in-memory ring holds DIFFERENT records so the branch choice is
         // observable from what comes back.
         state
             .decisions
             .write()
             .await
             .push_back(record(99, 9_999, "ring-only", None));
+        state
+            .decisions
+            .write()
+            .await
+            .push_back(record(100, 9_999, "ring-only", None));
 
         // No history filters: the in-memory ring, exactly as v0.3.
         let ring = decisions_from(
@@ -2847,7 +2852,7 @@ model_id = "upstream-y"
         .await;
         assert_eq!(
             ring.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![99],
+            vec![99, 100],
             "no filters -> the in-memory ring"
         );
         // A client-only filter also stays in memory.
@@ -2863,6 +2868,25 @@ model_id = "upstream-y"
         )
         .await;
         assert!(ring_client.is_empty(), "client filter, still in-memory");
+
+        // A limit without history filters stays in memory and keeps the
+        // newest N (it is not silently ignored).
+        let ring_limit = decisions_from(
+            control_decisions(
+                State(state.clone()),
+                Query(DecisionParams {
+                    limit: Some(1),
+                    ..DecisionParams::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            ring_limit.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![100],
+            "limit alone truncates the in-memory view to the newest N"
+        );
 
         // since=0: the full disk history, oldest first.
         let disk = decisions_from(

@@ -529,7 +529,7 @@ fallback = ["glm"]
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
 | `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
-| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3），`?limit=` 限制返回条数（保留最新 N，默认 1000），无运行中的 history 存储时该组合返回 400 |
+| `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3）；`?limit=` 限制返回条数、保留最新 N（内存/磁盘两条路径都生效，磁盘查询缺省 1000），无运行中的 history 存储时该组合返回 400 |
 | `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |

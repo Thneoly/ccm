@@ -524,8 +524,9 @@ not just the response: files are walked newest-first and parsing stops once
 `?limit=` matches are held — default 1000 when absent — so the cost scales
 with the limit rather than the retained history. `?client=` still applies
 on that branch, and a history filter with no running history store is a 400
-naming the likely causes. Without any of since/until/model the endpoint is
-byte-identical to the v0.3 in-memory behavior.
+naming the likely causes. Without any of since/until/model the endpoint
+serves the v0.3 in-memory ring; an explicit `?limit=` alone truncates that
+view to the newest N.
 
 Control API is currently unauthenticated and intended for localhost use.
 

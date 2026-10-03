@@ -33,10 +33,11 @@ pub(crate) struct ClientParams {
 
 /// `/_ccm/decisions` query (v0.4 M5): `?client=` as before, plus disk-backed
 /// history filters `?since=&until=&model=` and `?limit=`. Without any of
-/// since/until/model the handler keeps the exact in-memory behavior (last
-/// 100 decisions). Disk reads keep the most recent `limit` records and the
-/// read itself is bounded — files are walked newest-first and parsing stops
-/// once `limit` matches are held (default 1000 when `limit` is absent).
+/// since/until/model the handler serves the in-memory ring (last 100
+/// decisions); `?limit=` applies on that branch too, truncating to the most
+/// recent N. Disk reads keep the most recent `limit` records and the read
+/// itself is bounded — files are walked newest-first and parsing stops once
+/// `limit` matches are held (default 1000 when `limit` is absent).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct DecisionParams {
     pub(crate) client: Option<String>,
@@ -371,9 +372,12 @@ pub(crate) async fn control_decisions(
     Query(params): Query<DecisionParams>,
 ) -> impl IntoResponse {
     // No history filters: the in-memory ring, byte-identical to the v0.3
-    // behavior (last 100, newest last, `?client=` filter).
+    // behavior (last 100, newest last, `?client=` filter) — except that an
+    // explicit `?limit=` truncates the view to the most recent N, so a
+    // paginating caller gets the same parameter semantics on both branches
+    // instead of a silently ignored value.
     if params.since.is_none() && params.until.is_none() && params.model.is_none() {
-        let decisions: Vec<RoutingDecision> = state
+        let mut decisions: Vec<RoutingDecision> = state
             .decisions
             .read()
             .await
@@ -381,6 +385,11 @@ pub(crate) async fn control_decisions(
             .filter(|decision| client_matches(params.client.as_deref(), &decision.client))
             .cloned()
             .collect();
+        if let Some(limit) = params.limit {
+            if decisions.len() > limit {
+                decisions.drain(..decisions.len() - limit);
+            }
+        }
         return Json(decisions).into_response();
     }
     // Any of since/until/model: a disk read over the persisted history
