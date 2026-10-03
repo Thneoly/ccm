@@ -729,7 +729,17 @@ impl Stream for TranslatedSseStream {
             match this.upstream.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(chunk))) => match this.translator.feed(&chunk) {
-                    Ok(events) => this.push_events(events),
+                    Ok(events) => {
+                        this.push_events(events);
+                        if this.translator.is_done() {
+                            // The translator ended the event stream (a `[DONE]`
+                            // close or a terminal error event). End the client
+                            // body now instead of waiting for upstream EOF — a
+                            // gateway holding the connection open must not
+                            // hang an already-complete response.
+                            this.finished = true;
+                        }
+                    }
                     Err(err) => this.push_error(err.to_string()),
                 },
                 // Mid-stream transport break: error event, never a faked clean close.
@@ -951,6 +961,9 @@ mod tests {
         // 200 + text/event-stream with scriptable raw SSE bytes (the
         // openai-compatible upstream contract).
         OpenaiSse(String),
+        // Same, but the body never ends after the scripted bytes — a gateway
+        // holding the connection open after its final frame.
+        OpenaiSseHeldOpen(String),
         // 200 + application/json body (a complete OpenAI chat completion).
         OpenaiJson(String),
         // status + application/json body (OpenAI-shaped error envelope).
@@ -997,6 +1010,13 @@ mod tests {
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::from(raw))
+                .unwrap(),
+            MockBehavior::OpenaiSseHeldOpen(raw) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(HeldOpenStream {
+                    body: Some(Bytes::from(raw)),
+                }))
                 .unwrap(),
             MockBehavior::OpenaiJson(body) => Response::builder()
                 .status(StatusCode::OK)
@@ -1422,6 +1442,27 @@ open_ms = 30
         std::fs::write(root.join("config.toml"), raw).unwrap();
     }
 
+    /// Test-only stream that yields the scripted bytes once, then stays open
+    /// forever (never EOF) — an upstream gateway holding the connection after
+    /// its final SSE frame.
+    struct HeldOpenStream {
+        body: Option<Bytes>,
+    }
+
+    impl Stream for HeldOpenStream {
+        type Item = Result<Bytes, Infallible>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(bytes) = self.body.take() {
+                return Poll::Ready(Some(Ok(bytes)));
+            }
+            Poll::Pending
+        }
+    }
+
     /// Parse client-visible SSE text into (event name, data JSON) pairs.
     fn parse_client_sse(text: &str) -> Vec<(String, Value)> {
         text.split("\n\n")
@@ -1685,6 +1726,27 @@ open_ms = 30
         // No mid-stream failover: the anthropic fallback mock received zero
         // requests after the response was committed.
         assert_eq!(native.requests.lock().unwrap().len(), native_before);
+
+        // Terminal-event termination: a gateway that HOLDS the 200 connection
+        // open after its final frame must not hang the client response — the
+        // body ends as soon as the translator reaches its terminal state.
+        let held_partial = format!(
+            "data: {}\n\n",
+            json!({"id": "chatcmpl-held",
+                   "choices": [{"index": 0, "delta": {"content": "partial"}}]})
+        );
+        let held_error = json!({"error": {"message": "held open", "type": "server_error"}});
+        *openai.behavior.write().await =
+            MockBehavior::OpenaiSseHeldOpen(format!("{held_partial}data: {held_error}\n\n"));
+        let response = forward(state.clone(), openai_integration_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let held_sse = tokio::time::timeout(Duration::from_secs(5), body_text(response))
+            .await
+            .expect("client body completes without upstream EOF");
+        assert!(held_sse.contains("event: error"));
+        assert!(!held_sse.contains("message_stop"));
 
         // HALF_OPEN probe release on translate failure: a request the
         // translator rejects must release an in-flight probe and record the

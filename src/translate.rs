@@ -746,6 +746,15 @@ impl SseTranslator {
         }
     }
 
+    /// True once the translator reached a terminal state: after `[DONE]`
+    /// closed the stream, or after any error ended it. The proxy wiring
+    /// uses this to end the client response body immediately — a gateway
+    /// that holds the 200 connection open after its final frame must not
+    /// hang the client while the event stream is already complete.
+    pub fn is_done(&self) -> bool {
+        self.errored || self.closed
+    }
+
     /// Feed raw upstream bytes; returns translated events for every complete
     /// data frame received so far.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, TranslateError> {
