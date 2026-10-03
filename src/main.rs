@@ -5,6 +5,7 @@ mod credential;
 mod doctor;
 mod health;
 mod history;
+mod history_cli;
 mod integrate;
 mod launcher;
 mod manage;
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
             let name = config.resolve_target(&target)?;
             health::check(&config, &name).await?;
         }
+        Command::History { command } => history_cli::run(command)?,
     }
 
     Ok(())

@@ -64,6 +64,10 @@ pub enum Command {
     Health {
         target: String,
     },
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,4 +139,44 @@ pub enum IntegrateCommand {
 pub enum AuthCommand {
     Set { provider: String },
     Delete { provider: String },
+}
+
+/// `ccm history` — offline views over `$CCM_HOME/history/` (v0.4 M5). Reads
+/// the JSONL files directly, so it works while the proxy runs and after it
+/// exits; no lock is taken.
+#[derive(Debug, Subcommand)]
+pub enum HistoryCommand {
+    /// Print persisted routing decisions as JSONL (oldest first).
+    Decisions {
+        /// Inclusive unix-ms lower bound on timestamp_ms.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Inclusive unix-ms upper bound on timestamp_ms.
+        #[arg(long)]
+        until: Option<u64>,
+        /// Only decisions whose selected or attempted model matches.
+        #[arg(long)]
+        model: Option<String>,
+        /// Only decisions tagged with exactly this client id.
+        #[arg(long)]
+        client: Option<String>,
+        /// Keep only the newest N matching records.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Print persisted metric snapshots as tables (default: the latest one).
+    Metrics {
+        /// Print the newest N snapshots instead of only the latest.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Print persisted circuit-breaker transitions (oldest first).
+    Circuit {
+        /// Only transitions for this model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Keep only the newest N matching transitions.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
