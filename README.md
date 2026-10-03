@@ -323,6 +323,17 @@ Inspect metrics:
 curl http://127.0.0.1:13521/_ccm/metrics
 ```
 
+The same runtime is exported in the Prometheus text format at
+`GET /metrics` (v0.4) — on the proxy's single loopback-only listener, no
+second port. Families cover request/attempt outcomes (by target and model),
+a fixed-bucket header-latency histogram alongside the EWMA gauge,
+decision duration, circuit state, tokens, and cost in integer micro-USD.
+`[observability] prometheus_enabled = false` removes the route entirely.
+
+```bash
+curl -s http://127.0.0.1:13521/metrics | grep ccm_
+```
+
 ## Fallback policy
 
 Each route can configure:
@@ -425,6 +436,7 @@ Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run
 
 ```text
 GET  /health
+GET  /metrics
 GET  /_ccm/status
 GET  /_ccm/models
 GET  /_ccm/routes
@@ -439,7 +451,7 @@ GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — newest-first and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed).
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — newest-first and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed). `/metrics` (v0.4 M7) is the Prometheus text exposition — same listener, so the loopback-only bind guard covers it; `prometheus_enabled = false` unregisters the route.
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
@@ -727,6 +739,10 @@ GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-late
   per-MTok pricing tables hand-entered per model; `/_ccm/usage`,
   `/_ccm/cost?day=`, and offline `ccm history cost` aggregate tokens and
   USD by model (unpriced models counted separately, never guessed)
+- Prometheus `/metrics` (v0.4): hand-rendered text exposition on the same
+  loopback-only listener — request/attempt outcomes, dual-track latency
+  (fixed-bucket histogram + EWMA gauge), decision duration, circuit state,
+  tokens, and micro-USD cost; `prometheus_enabled` config flag, default on
 - no mid-stream failover
 
 ## License

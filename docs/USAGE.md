@@ -534,6 +534,7 @@ fallback = ["glm"]
 | 端点 | 用途 / 返回要点 |
 |---|---|
 | `GET /health` | 存活检查，返回字面量 `ok` |
+| `GET /metrics` | Prometheus 文本格式导出（v0.4 M7，见 6.5）：与全部 `/_ccm/*` 共用同一个仅回环的监听端口，`[observability] prometheus_enabled = false` 时该路由不存在（404） |
 | `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、`kind`（与 provider 平级的顶层字段）、fallback 列表、完整 policy；`?client=<id>` 查询该客户端的生效目标（未切过的客户端会标注跟随全局） |
 | `GET /_ccm/models` | 模型清单：model_id、provider、`kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`；模型引用了未配置的 provider 时为 `unknown`）、cost_weight、quality_weight |
 | `GET /_ccm/routes` | 路由清单 + `active` 标记（哪条是当前内存目标） |
@@ -648,6 +649,7 @@ retention_days = 14
 max_records_per_file = 50000
 max_bytes_per_file = 8388608      # 8 MiB
 metrics_snapshot_interval_secs = 30
+prometheus_enabled = true         # 关掉后 /metrics 路由整个不存在（404）
 ```
 
 `ccm doctor` 增加一行历史目录状态：`✓ history: N file(s) at <dir>`，目录为空或已禁用时是 `!` 提示（非致命）。
@@ -676,6 +678,43 @@ ccm history cost --day 2025-10-03
 `cost` 视图按模型给出 requests / complete / 四类 token / `cost_usd`（模型名排序），外加合计与**无价请求数**（没配 `[pricing]` 表的模型——它们的成本未知而非零，合计不会虚报）。`/_ccm/usage` 则是逐条记录视图，参数语义与 `/_ccm/decisions` 完全一致。
 
 > 边界声明：这是**代理侧计量**，不是账单真相。token 数来自上游上报（native 流或翻译流），单价是手填的；只能用于相对比较与异常发现（比如某会话今天烧了 10 倍于平时的 input token），不能对账。
+
+### 6.5 Prometheus `/metrics`（v0.4 M7）
+
+`GET /metrics`（默认 `http://127.0.0.1:13521/metrics`）输出 Prometheus 文本格式（`text/plain; version=0.0.4`），可以直接喂给 Prometheus / Grafana / VictoriaMetrics 抓取：
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:13521/metrics
+```
+
+```sh
+curl -s http://127.0.0.1:13521/metrics | grep ccm_
+```
+
+指标族（全部 `ccm_` 前缀）：
+
+| 指标 | 类型 / 标签 | 含义 |
+|---|---|---|
+| `ccm_up` | gauge | 代理在服务即 1 |
+| `ccm_process_start_time_seconds` | gauge | 代理开始监听的时间（用于算 uptime / 重启告警） |
+| `ccm_proxy_requests_total` | counter `{target,outcome}` | 每个请求的最终裁决；`outcome` 只有 `success`（被接受的 2xx）和 `error` 两种 |
+| `ccm_attempts_total` | counter `{model,outcome}` | 每次上游尝试；五个互斥 outcome（success / http_error / rate_limited / timeout / request_error），已结算的尝试加和 = attempts（进行中或中途夭折的等待只体现在 `/_ccm/metrics` 的 attempts 里） |
+| `ccm_header_latency_seconds` | histogram `{model}` | 响应头延迟，固定桶 5ms…10s |
+| `ccm_latency_ewma_ms` | gauge `{model}` | 进程内 EWMA（首条采样前不出线） |
+| `ccm_decision_duration_seconds` | histogram `{target}` | 一次请求从到达到终态裁决的全程耗时（含 fallback 链） |
+| `ccm_circuit_open` | gauge `{model}` | 熔断正在跳过该模型时为 1（OPEN 冷却中或 HALF_OPEN 探测占用中） |
+| `ccm_circuit_consecutive_failures` | gauge `{model}` | 熔断当前连续失败计数 |
+| `ccm_tokens_total` | counter `{model,kind}` | 被接受响应上报的 token（kind：input / output / cache_read / cache_write；零值 kind 不出线） |
+| `ccm_cost_micro_usd_total` | counter `{model}` | 累计成本，整数微美元（没配定价表的模型不出线——成本未知而非零） |
+| `ccm_history_dropped_total` | counter | 历史写入队列满/停而丢弃的记录数 |
+
+要点与边界：
+
+- **同端口、仅回环**：`/metrics` 与 `/_ccm/*`、`/v1/messages` 共用同一个监听器，回环绑定保护对它同样生效——没有第二个端口。想彻底关掉导出：`[observability] prometheus_enabled = false`。
+- **双轨延迟**：直方图（固定桶）让 Prometheus 侧能对任意抓取窗口做 `histogram_quantile`（含跨代理重启，每次抓取导出的是累计桶）；EWMA gauge 保留给不接 Prometheus 时的快速浏览。
+- **与 `/_ccm/metrics` 同源**：`ccm_attempts_total` 渲染时从同一份每模型计数推导（429 只记进 `rate_limited`，不重复计入 `http_error`），两个观测面不会打架。
+- **重启清零**：所有运行时计数器随代理重启归零（counter 语义，Prometheus 侧靠 `increase()`/`rate()` 自然处理）；跨天的账要查 6.3/6.4 的磁盘历史。
+- 成本/token 的口径与 6.4 完全一致：只统计被接受的 2xx 响应，代理侧计量、手填单价，不能对账。
 
 ---
 

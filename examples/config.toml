@@ -102,3 +102,11 @@ backoff_ms = 200
 enabled = true
 failure_threshold = 3
 open_ms = 30000
+
+# Observability (v0.4): JSONL history under <CCM_HOME>/history/ plus the
+# Prometheus /metrics exposition on the proxy's loopback-only listener.
+# All defaults — the section may be omitted entirely.
+[observability]
+history_enabled = true
+retention_days = 14
+prometheus_enabled = true

@@ -366,7 +366,42 @@ Current health score:
 health_score = success_rate * 100
 ```
 
-No persistence is planned for v0.3.
+### Prometheus export (v0.4 M7)
+
+The same counters are exported in the Prometheus text format at
+`GET /metrics` on the proxy's ONE listener — the loopback bind guard covers
+it; there is no second port. Hand-rendered exposition (~150 lines), no
+exporter crate. `[observability] prometheus_enabled = false` (default true)
+removes the route entirely.
+
+Families:
+
+```text
+ccm_up                                   gauge      1 while serving
+ccm_process_start_time_seconds           gauge      pinned at serve()
+ccm_proxy_requests_total{target,outcome} counter    outcome: success = accepted 2xx
+ccm_attempts_total{model,outcome}        counter    5 disjoint outcomes; sum = attempts once every counted attempt has settled (in-flight or aborted header-waits exist only in /_ccm/metrics)
+ccm_header_latency_seconds{model}        histogram  fixed 5ms..10s buckets
+ccm_latency_ewma_ms{model}               gauge      the in-memory EWMA track
+ccm_decision_duration_seconds{target}    histogram  arrival → terminal verdict
+ccm_circuit_open{model}                  gauge      1 while the breaker skips the model
+ccm_circuit_consecutive_failures{model}  gauge
+ccm_tokens_total{model,kind}             counter    kind: input|output|cache_read|cache_write
+ccm_cost_micro_usd_total{model}          counter    integer micro-USD at export
+ccm_history_dropped_total                counter    dropped history records
+```
+
+Latency is deliberately dual-track: the fixed-bucket histogram lets a
+Prometheus server compute `histogram_quantile` over any scrape window
+(including across proxy restarts — the buckets are cumulative at each
+scrape), while the EWMA gauge stays for a glance without a server.
+
+`ccm_attempts_total` is DERIVED at render time from the same per-model
+metrics map `/_ccm/metrics` serves (429 counts once, under `rate_limited`),
+so the two surfaces cannot disagree. Honest boundaries, same as the
+`/_ccm/cost` view: token/cost counters cover only accepted 2xx responses,
+prices are hand-entered, cost is proxy-side measurement (not bill truth),
+and all runtime counters reset on proxy restart — history queries read disk.
 
 ## 9. Routing Decision Trace
 
@@ -499,6 +534,7 @@ Current endpoints:
 
 ```text
 GET  /health
+GET  /metrics
 GET  /_ccm/status
 GET  /_ccm/models
 GET  /_ccm/routes
@@ -507,9 +543,16 @@ GET  /_ccm/circuits
 GET  /_ccm/metrics
 GET  /_ccm/scores
 GET  /_ccm/decisions
+GET  /_ccm/usage
+GET  /_ccm/cost
 GET  /_ccm/clients
 POST /_ccm/switch/{target}
 ```
+
+`GET /metrics` (v0.4 M7) serves the Prometheus text exposition
+(`text/plain; version=0.0.4`) on this same listener — the loopback-only
+bind guard covers it; see §8 for the families. `[observability]
+prometheus_enabled = false` unregisters the route (404).
 
 Client scoping (v0.4): `POST /_ccm/switch/{target}?client=<id>` switches
 only that client's in-memory target (invalid id charset → 400; charset
@@ -559,6 +602,7 @@ src/history.rs     JSONL observability history engine (writer + readers)
 src/history_cli.rs `ccm history` offline presentation
 src/usage.rs       usage scanner + UsageRecord + cost aggregation (v0.4 M6)
 src/date.rs        UTC calendar-day math for the cost views (Hinnant)
+src/prometheus.rs  hand-rendered text-format exporter: counters + render (v0.4 M7)
 src/doctor.rs      local environment diagnosis
 src/translate.rs   pure anthropic<->openai translation engine (no IO)
 src/proxy.rs       forward() + HTTP path + mock integration tests
@@ -701,6 +745,12 @@ a snapshot of the hand-entered `[models.<name>.pricing]` table; unpriced
 models record `cost_usd: null`, never a guess). Queries: `/_ccm/usage`
 (same dual-branch parameter contract as decisions), `/_ccm/cost?day=`
 (UTC-day aggregation, shared core with `ccm history cost`).
+
+v0.4 M7 adds the export side: `GET /metrics` on the same listener (see
+§8) hands the runtime counters to a monitoring system, which closes the
+"everything dies with the proxy" gap for live signals too — histograms
+are cumulative per scrape, so a Prometheus server sees across restarts
+even though the proxy's own counters reset.
 
 ### 18.5 Query strings
 
