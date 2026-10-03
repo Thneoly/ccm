@@ -120,6 +120,9 @@ pub async fn serve(bind: &str) -> Result<()> {
             }
         }
     } else {
+        // Explicit config choice — still worth one stderr line so the
+        // missing `History:` startup line has a visible explanation.
+        eprintln!("ccm: history disabled by [observability] config (history_enabled = false)");
         (History::disabled(), 1)
     };
 

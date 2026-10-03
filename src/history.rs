@@ -664,18 +664,41 @@ fn rotated_sort_key(suffix: &str) -> Option<(u64, u64)> {
     }
 }
 
-/// Iterate complete lines of a JSONL file. A torn final line (crash
-/// mid-write) and non-JSON lines are skipped by the callers' parse — this
-/// helper only guarantees line iteration over lossy UTF-8.
+/// Iterate complete lines of a JSONL file, lossily. A torn final line
+/// (crash mid-write) and non-JSON lines are skipped by the callers' parse;
+/// a line that is not valid UTF-8 decodes with replacement characters and
+/// then fails that parse — one foreign line (an operator note appended in
+/// the wrong encoding, say) must not hide every record after it in the
+/// same file. A hard IO error still ends the iteration. Hand-rolled over
+/// `read_until` because `BufRead::lines()` offers no skip-and-continue
+/// error mode (`map_while` stops at the first bad line; `filter_map` runs
+/// forever on a persistently erroring reader).
 fn jsonl_lines(path: &Path) -> Vec<String> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .collect()
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    loop {
+        let mut bytes = Vec::new();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(_) => {
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+                let line = String::from_utf8_lossy(&bytes);
+                if !line.trim().is_empty() {
+                    lines.push(line.into_owned());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    lines
 }
 
 fn parse_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -1272,16 +1295,18 @@ mod tests {
         );
     }
 
-    // 12. a metrics line missing fields (schema drift) is skipped, not fatal
+    // 12. a metrics line missing fields (schema drift) is skipped, not
+    //     fatal — and so is a line that is not valid UTF-8: one foreign
+    //     line never hides the records after it
     #[test]
     fn foreign_lines_are_skipped_not_fatal() {
         let dir = TempDir::new("foreign");
         fs::create_dir_all(dir.path()).unwrap();
-        fs::write(
-            dir.path().join("metrics.jsonl"),
-            "{\"timestamp_ms\":1}\nnot json at all\n{\"timestamp_ms\":2,\"models\":{}}\n",
-        )
-        .unwrap();
+        let mut bytes = b"{\"timestamp_ms\":1}\n".to_vec();
+        // invalid UTF-8 (e.g. a UTF-16 note appended by the wrong tool)
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, b'x', b'\n']);
+        bytes.extend_from_slice(b"not json at all\n{\"timestamp_ms\":2,\"models\":{}}\n");
+        fs::write(dir.path().join("metrics.jsonl"), bytes).unwrap();
         let snapshots = read_metrics_snapshots(dir.path(), None);
         assert_eq!(snapshots.len(), 1, "only the well-formed record parses");
         assert_eq!(snapshots[0].timestamp_ms, 2);
