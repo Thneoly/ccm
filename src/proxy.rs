@@ -2102,6 +2102,7 @@ open_ms = 30
             })
             .to_string(),
         );
+        let usage_before = state.usage.lock().unwrap().len();
         let response = forward(state.clone(), openai_integration_request())
             .await
             .unwrap();
@@ -2118,6 +2119,30 @@ open_ms = 30
         let message: Value = serde_json::from_str(&body_text(response).await).unwrap();
         assert_eq!(message["type"], "message");
         assert_eq!(message["content"][0]["text"], "whole body reply");
+        // The usage record on this buffered path carries the REAL token
+        // counts (prompt 5 / completion 3), not honest zeros: scanner mode
+        // follows the actual response content-type, so a JSON body answering
+        // a stream:true request is read by the JSON scanner. Pins the M6-era
+        // backlog note (V0.4_PLAN section 11) as verified-not-a-defect — it
+        // described the pre-6e58889 dispatch that fed JSON bodies to the
+        // SSE line scanner. No [pricing] table on this model: cost stays
+        // unknown, never guessed.
+        let records = state.usage.lock().unwrap().clone();
+        assert_eq!(records.len(), usage_before + 1);
+        let record = records.back().unwrap();
+        assert_eq!(record.model, "openai");
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens
+            ),
+            (5, 3, 0, 0)
+        );
+        assert!(record.complete);
+        assert_eq!(record.pricing, None);
+        assert_eq!(record.cost_usd, None);
 
         // A 200 body carrying an error (misbehaving gateways): status kept,
         // upstream type and message preserved through the envelope
