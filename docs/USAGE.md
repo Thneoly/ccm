@@ -685,7 +685,7 @@ Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1790985600000&mod
 Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?day=2026-10-03&client=term1"
 ```
 
-HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——查询按最新优先扫描文件、凑够条数即停，读取代价随 limit 而不是历史总量增长，运行中的代理不会被一次全量反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
+HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——查询按最新优先扫描文件、凑够条数即停，读取代价随 limit 而不是历史总量增长，运行中的代理不会被一次全量反序列化拖住；CLI 的 `--limit` 默认不设上限（N ≥ 1，传 `0` 会被直接拒绝——空选择几乎总是失误），离线分析不受影响。
 
 `[observability]` 配置节（全部有默认值，v0.4 之前的配置文件不用改；任一阈值填 0 会在加载时报错）：
 
@@ -880,9 +880,9 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm use <target>` | 设持久默认（写 state.toml） | — |
 | `ccm switch <target>` | 运行时切换代理目标（全局或某客户端） | `--proxy-url`（`CCM_PROXY_URL` > `http://127.0.0.1:13521`）、`--client <id>`（`CCM_CLIENT_ID` > 全局）、`--global`（强制全局，与 `--client` 互斥） |
 | `ccm clients` | 列出代理各客户端的运行时目标与请求计数 | `--proxy-url`（同 `switch`） |
-| `ccm history decisions` | 离线查看持久化决策（JSONL，旧→新） | `--since`、`--until`（unix-ms，含边界）、`--model`、`--client`、`--limit`（保留最新 N） |
-| `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit` |
-| `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit` |
+| `ccm history decisions` | 离线查看持久化决策（JSONL，旧→新） | `--since`、`--until`（unix-ms，含边界）、`--model`、`--client`、`--limit`（保留最新 N，N ≥ 1） |
+| `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit`（N ≥ 1） |
+| `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit`（N ≥ 1） |
 | `ccm history cost` | 离线查看按 UTC 日聚合的使用量与成本表（见 6.4） | `--day`（`YYYY-MM-DD`，缺省今天）、`--client` |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
 | `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |

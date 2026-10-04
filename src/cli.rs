@@ -160,14 +160,17 @@ pub enum HistoryCommand {
         /// Only decisions tagged with exactly this client id.
         #[arg(long)]
         client: Option<String>,
-        /// Keep only the newest N matching records.
-        #[arg(long)]
+        /// Keep only the newest N matching records (N >= 1; 0 selects
+        /// nothing, so it is rejected here rather than silently emptying
+        /// the output).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
     },
     /// Print persisted metric snapshots as tables (default: the latest one).
     Metrics {
-        /// Print the newest N snapshots instead of only the latest.
-        #[arg(long)]
+        /// Print the newest N snapshots instead of only the latest
+        /// (N >= 1; see `decisions --limit` for why 0 is rejected).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
     },
     /// Print persisted circuit-breaker transitions (oldest first).
@@ -175,8 +178,9 @@ pub enum HistoryCommand {
         /// Only transitions for this model.
         #[arg(long)]
         model: Option<String>,
-        /// Keep only the newest N matching transitions.
-        #[arg(long)]
+        /// Keep only the newest N matching transitions (N >= 1; see
+        /// `decisions --limit` for why 0 is rejected).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
     },
     /// Aggregate usage and cost by model for one UTC day (v0.4 M6).
@@ -188,4 +192,30 @@ pub enum HistoryCommand {
         #[arg(long)]
         client: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    /// `--limit 0` is rejected at parse time on every `ccm history`
+    /// subcommand that takes the flag: an empty selection is almost always
+    /// a mistake (unset shell variable, or assuming 0 means unlimited), and
+    /// the reader layer deliberately treats it as "select nothing" — so the
+    /// CLI says so instead of printing an empty view that looks like the
+    /// store were empty.
+    #[test]
+    fn history_limit_zero_is_rejected_at_parse_time() {
+        for sub in ["decisions", "metrics", "circuit"] {
+            let error = Cli::try_parse_from(["ccm", "history", sub, "--limit", "0"])
+                .expect_err("--limit 0 must not parse");
+            let message = error.to_string();
+            assert!(message.contains("invalid value"), "{sub}: {message}");
+            assert!(message.contains('0'), "{sub}: {message}");
+
+            let parsed = Cli::try_parse_from(["ccm", "history", sub, "--limit", "1"]);
+            assert!(parsed.is_ok(), "{sub}: --limit 1 must still parse");
+        }
+    }
 }
