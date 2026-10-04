@@ -4,16 +4,16 @@ A fast local model manager and control plane for AI coding CLIs, starting with C
 
 CCM manages providers, models, profiles, routes, route policies, runtime switching, fallback execution, circuit breaking, metrics, and dynamic model selection locally.
 
-User guide (中文): `docs/USAGE.md`.
+User guide (中文): [docs/USAGE.md](docs/USAGE.md).
 
 ## Agent handoff
 
 For implementation continuation and release stabilization, read:
 
-- `docs/DESIGN.md` — architecture, routing semantics, invariants, module responsibilities, known design debt.
-- `docs/V0.4_PLAN.md` — v0.4 scope, milestones, landing records, and the post-v0.4 backlog (v0.4.0 released 2026-10-03).
-- `docs/V0.3_PLAN.md` — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
-- `docs/USAGE.md` — task-oriented user guide (Chinese).
+- [docs/DESIGN.md](docs/DESIGN.md) — architecture, routing semantics, invariants, module responsibilities, known design debt.
+- [docs/V0.4_PLAN.md](docs/V0.4_PLAN.md) — v0.4 scope, milestones, landing records, and the post-v0.4 backlog (v0.4.0 released 2026-10-03).
+- [docs/V0.3_PLAN.md](docs/V0.3_PLAN.md) — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
+- [docs/USAGE.md](docs/USAGE.md) — task-oriented user guide (Chinese).
 
 Current status:
 
@@ -707,7 +707,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-GitHub Actions CI runs the release gate (`.github/workflows/ci.yml`, ubuntu-latest + windows-latest) on every push to `main` and via manual `workflow_dispatch`.
+GitHub Actions CI runs the release gate ([.github/workflows/ci.yml](.github/workflows/ci.yml), ubuntu-latest + windows-latest) on every push to `main` and via manual `workflow_dispatch`.
 
 ## Current scope
 
