@@ -2,7 +2,7 @@
 
 CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
 
-本文是操作手册。架构背景见 `docs/DESIGN.md`，v0.4 的规划与逐里程碑落地记录见 `docs/V0.4_PLAN.md`（v0.3 的发布与验证记录见 `docs/V0.3_PLAN.md`）。
+本文是操作手册。架构背景见 [docs/DESIGN.md](DESIGN.md)，v0.4 的规划与逐里程碑落地记录见 [docs/V0.4_PLAN.md](V0.4_PLAN.md)（v0.3 的发布与验证记录见 [docs/V0.3_PLAN.md](V0.3_PLAN.md)）。
 
 ---
 

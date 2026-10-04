@@ -661,7 +661,7 @@ macOS    aarch64-apple-darwin       not claimed for v0.4 (no host to verify)
 macOS    x86_64-apple-darwin        not claimed for v0.4 (no host to verify)
 ```
 
-See `docs/V0.3_PLAN.md` §3 for the decision record and macOS re-entry criteria.
+See [docs/V0.3_PLAN.md](V0.3_PLAN.md) §3 for the decision record and macOS re-entry criteria.
 
 Repository verification scripts:
 
