@@ -4,9 +4,11 @@
 //!
 //! Layout: `<kind>.jsonl` is the active append target; when it reaches its
 //! record or byte cap the writer closes it, renames it to
-//! `<kind>-<unix_ms>.jsonl`, and reopens a fresh active file. Rotated files
-//! older than the retention window are deleted by mtime. A torn tail line
-//! (crash mid-write) is skipped by every reader.
+//! `<kind>-<unix_ms>.jsonl`, and reopens a fresh active file. A record too
+//! large for even a fresh file (a byte cap below the record size) is dropped
+//! and counted rather than written. Rotated files older than the retention
+//! window are deleted by mtime. A torn tail line (crash mid-write) is
+//! skipped by every reader.
 //!
 //! Write path: producers `try_send` pre-serialized lines into a bounded
 //! channel; a dedicated writer thread batches, appends, and flushes. A full
@@ -184,10 +186,11 @@ impl HistoryEvent {
 struct HistoryInner {
     dir: PathBuf,
     sender: SyncSender<HistoryEvent>,
-    /// Records dropped because the channel was full or the writer had
-    /// already stopped. Surfaced by [`HistoryInner::dropped_records`] when
-    /// the last handle drops.
-    dropped: AtomicU64,
+    /// Records dropped because the channel was full, the writer had
+    /// already stopped, or the record exceeded the per-file byte cap
+    /// (writer side). Shared with the writer thread; surfaced by
+    /// [`HistoryInner::dropped_records`] when the last handle drops.
+    dropped: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     /// Joined exactly once, by [`HistoryInner::stop_and_join`].
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -214,9 +217,10 @@ impl History {
         self.inner.is_some()
     }
 
-    /// Records dropped over this store's lifetime (full writer queue or a
-    /// stopped writer) — the input of `ccm_history_dropped_total`. Zero for
-    /// a disabled store (nothing was ever enqueued to drop).
+    /// Records dropped over this store's lifetime (full writer queue,
+    /// stopped writer, or a record too large for `max_bytes_per_file`) —
+    /// the input of `ccm_history_dropped_total`. Zero for a disabled store
+    /// (nothing was ever enqueued to drop).
     pub(crate) fn dropped_count(&self) -> u64 {
         self.inner
             .as_ref()
@@ -285,8 +289,9 @@ impl History {
 }
 
 impl HistoryInner {
-    /// Total records dropped over this store's lifetime (full queue or a
-    /// writer that had already stopped).
+    /// Total records dropped over this store's lifetime (full queue, a
+    /// writer that had already stopped, or oversized records skipped by
+    /// the writer).
     fn dropped_records(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -319,7 +324,7 @@ impl Drop for HistoryInner {
         let dropped = self.dropped_records();
         if dropped > 0 {
             eprintln!(
-                "ccm: history: {dropped} records were dropped (writer queue full or writer stopped)"
+                "ccm: history: {dropped} records were dropped (writer queue full or stopped, or record exceeded max_bytes_per_file)"
             );
         }
     }
@@ -346,15 +351,16 @@ pub(crate) fn open_history(
     sweep_retention(&dir, Duration::from_millis(limits.retention_ms));
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<HistoryEvent>(capacity);
+    let dropped = Arc::new(AtomicU64::new(0));
     let inner = Arc::new(HistoryInner {
         dir: dir.clone(),
         sender,
-        dropped: AtomicU64::new(0),
+        dropped: Arc::clone(&dropped),
         stop: Arc::new(AtomicBool::new(false)),
         worker: Mutex::new(None),
         _lock: lock,
     });
-    let worker = spawn_writer(dir, limits, receiver, Arc::clone(&inner.stop));
+    let worker = spawn_writer(dir, limits, receiver, Arc::clone(&inner.stop), dropped);
     *inner.worker.lock().unwrap() = Some(worker);
 
     Ok(History { inner: Some(inner) })
@@ -395,9 +401,10 @@ fn spawn_writer(
     limits: HistoryLimits,
     receiver: Receiver<HistoryEvent>,
     stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut files = StreamFiles::new(dir, limits);
+        let mut files = StreamFiles::new(dir, limits, dropped);
         loop {
             match receiver.recv_timeout(WRITER_POLL) {
                 Ok(event) => {
@@ -457,16 +464,24 @@ struct StreamFiles {
     writers: [Option<BufWriter<File>>; 4],
     records: [u64; 4],
     bytes: [u64; 4],
+    /// Drop counter shared with the producer side (`ccm_history_dropped_total`
+    /// reads the same number).
+    dropped: Arc<AtomicU64>,
+    /// Set with the first oversized-line drop: the warning prints once per
+    /// writer, not once per record.
+    oversize_warned: bool,
 }
 
 impl StreamFiles {
-    fn new(dir: PathBuf, limits: HistoryLimits) -> Self {
+    fn new(dir: PathBuf, limits: HistoryLimits, dropped: Arc<AtomicU64>) -> Self {
         Self {
             dir,
             limits,
             writers: [None, None, None, None],
             records: [0; 4],
             bytes: [0; 4],
+            dropped,
+            oversize_warned: false,
         }
     }
 
@@ -479,13 +494,28 @@ impl StreamFiles {
         }
     }
 
-    /// Append one line, rotating first when the active file is at capacity
-    /// (so a file never exceeds either cap by more than nothing — the check
-    /// runs before the write).
+    /// Append one line, rotating first when the active file is at capacity —
+    /// the check runs before the write, so no file exceeds either cap. The
+    /// one exception is a line that cannot fit even a fresh file (a byte cap
+    /// below the record size): it is dropped and counted here, BEFORE any
+    /// rotation, because writing it would leave every file over the cap
+    /// forever and rotate once per record — pure churn with nothing gained.
     fn write(&mut self, event: HistoryEvent) -> std::io::Result<()> {
         let stream = event.stream();
         let slot = Self::slot(stream);
         let line = event.line();
+
+        if line.len() as u64 + 1 > self.limits.max_bytes_per_file {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.oversize_warned {
+                self.oversize_warned = true;
+                eprintln!(
+                    "ccm: history: record larger than max_bytes_per_file ({} bytes) cannot be persisted; dropping oversized records (total dropped so far: {dropped})",
+                    self.limits.max_bytes_per_file
+                );
+            }
+            return Ok(());
+        }
 
         if self.writers[slot].is_none() {
             self.open_active(stream, slot)?;
@@ -1123,6 +1153,90 @@ mod tests {
         }
     }
 
+    // 2b. a line that cannot fit even a fresh file (byte cap below the
+    //     record size) is dropped and counted BEFORE rotation — the old
+    //     behavior rotated once per oversized record, manufacturing a
+    //     rotated file per record and leaving every file over the cap
+    #[test]
+    fn oversized_lines_are_dropped_without_rotation_churn() {
+        let dir = TempDir::new("oversize");
+        let limits = HistoryLimits {
+            max_bytes_per_file: 300,
+            max_records_per_file: 10,
+            retention_ms: 14 * 24 * 60 * 60 * 1000,
+        };
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut files = StreamFiles::new(dir.path().to_path_buf(), limits, Arc::clone(&dropped));
+
+        // boundary: cap-1 payload bytes + the newline == the cap exactly,
+        // so the largest storable record still lands in a fresh file
+        files
+            .write(HistoryEvent::Decision("y".repeat(299)))
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert!(dir.path().join("decisions.jsonl").exists());
+
+        // one byte over: cannot fit any file — dropped, counted, and never
+        // rotated for (three oversized writes must not create rotated files)
+        for _ in 0..3 {
+            files
+                .write(HistoryEvent::Decision("z".repeat(300)))
+                .unwrap();
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        files.flush().unwrap();
+        let rotated = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| is_rotated_name(&e.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(rotated, 0, "no rotated file for oversized lines");
+        let active = dir.path().join("decisions.jsonl");
+        assert_eq!(jsonl_lines(&active).len(), 1, "only the boundary record");
+    }
+
+    // 2c. writer-side oversized drops surface through the same counter the
+    //     queue-full path uses (ccm_history_dropped_total reads it)
+    #[test]
+    fn oversized_drops_surface_in_dropped_count() {
+        let limits = HistoryLimits {
+            max_bytes_per_file: 300,
+            ..HistoryLimits::default()
+        };
+        let (dir, history) = store_with("oversize-count", limits);
+        // a snapshot with a 600-char model key serializes far over 300
+        // bytes; a normal one stays well under
+        let fat = MetricsSnapshot {
+            timestamp_ms: 1,
+            models: BTreeMap::from([("m".repeat(600), ModelMetrics::default())]),
+        };
+        let normal = MetricsSnapshot {
+            timestamp_ms: 2,
+            models: BTreeMap::from([("glm".to_string(), ModelMetrics::default())]),
+        };
+        history.record_metrics_snapshot(&fat);
+        history.record_metrics_snapshot(&normal);
+
+        // The writer drains asynchronously (a cloned probe would keep it
+        // alive without joining it), so wait for the FIFO consequence —
+        // the normal snapshot landing on disk. The fat record was judged,
+        // and counted, before it (channel order).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while read_metrics_snapshots(dir.path(), Some(10)).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never persisted the normal snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(history.dropped_count(), 1);
+
+        drop(history);
+        let snapshots = read_metrics_snapshots(dir.path(), Some(10));
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].timestamp_ms, 2);
+    }
+
     // 3. retention deletes rotated files older than the window (by mtime)
     //    and never touches the active file or .lock
     #[test]
@@ -1222,7 +1336,7 @@ mod tests {
             inner: Some(Arc::new(HistoryInner {
                 dir: dir.path().to_path_buf(),
                 sender,
-                dropped: AtomicU64::new(0),
+                dropped: Arc::new(AtomicU64::new(0)),
                 stop: Arc::new(AtomicBool::new(true)),
                 worker: Mutex::new(None),
                 _lock: File::create(dir.path().join(".lock")).unwrap(),

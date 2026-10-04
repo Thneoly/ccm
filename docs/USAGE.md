@@ -662,7 +662,7 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 
 行为要点：
 
-- **轮转与保留**：单文件满 5 万条或 8 MiB 即轮转成 `<kind>-<unix_ms>.jsonl`，已轮转文件默认保留 14 天（按修改时间清理；活跃文件与 `.lock` 永不清理）。
+- **轮转与保留**：单文件满 5 万条或 8 MiB 即轮转成 `<kind>-<unix_ms>.jsonl`，已轮转文件默认保留 14 天（按修改时间清理；活跃文件与 `.lock` 永不清理）。单条记录大到连空文件都装不下（`max_bytes_per_file` 配得比一条记录还小）时，该条直接丢弃并计数（见下），不会为它轮转出超限文件。
 - **绝不阻塞请求**：写入走有界队列，队列满就丢弃并计数（stderr 提示一次）；磁盘 IO 失败也只是停写历史，路由不受影响。
 - **退出语义**：代理正常退出时排空队列、落盘最后一批记录并汇总丢弃计数；被强杀（Ctrl+C）则没有最终落盘，依赖周期性写入和 torn-tail 容忍。
 - **单写者规则**：同一 `CCM_HOME` 只允许一个代理写历史（目录里的 OS 文件锁）。第二个代理照常路由，只是历史禁用并打印一条警告。
@@ -753,7 +753,7 @@ curl -s http://127.0.0.1:13521/metrics | grep ccm_
 | `ccm_circuit_consecutive_failures` | gauge `{model}` | 熔断当前连续失败计数 |
 | `ccm_tokens_total` | counter `{model,kind}` | 被接受响应上报的 token（kind：input / output / cache_read / cache_write；零值 kind 不出线） |
 | `ccm_cost_micro_usd_total` | counter `{model}` | 累计成本，整数微美元（没配定价表的模型不出线——成本未知而非零） |
-| `ccm_history_dropped_total` | counter | 历史写入队列满/停而丢弃的记录数 |
+| `ccm_history_dropped_total` | counter | 历史丢弃的记录数（写入队列满/写者已停，或单条超过 `max_bytes_per_file` 被丢弃） |
 
 要点与边界：
 
