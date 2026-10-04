@@ -60,10 +60,6 @@ pub(crate) const CHANNEL_CAPACITY: usize = 1024;
 /// notice the stop flag.
 const WRITER_POLL: Duration = Duration::from_millis(500);
 
-/// Tail window read when recovering the decision id sequence: enough to hold
-/// many maximum-size decisions while staying cheap at startup.
-const SEQ_TAIL_BYTES: u64 = 64 * 1024;
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -957,9 +953,18 @@ pub(crate) fn read_circuit_transitions(
     transitions
 }
 
-/// Next decision id for a fresh proxy run: `max(id)` across persisted
-/// decision tails, plus one; 1 on an empty store. Ids therefore stay unique
+/// Next decision id for a fresh proxy run: `max(id)` across all persisted
+/// decisions, plus one; 1 on an empty store. Ids therefore stay unique
 /// across restarts that share a history directory.
+///
+/// File order is COMPLETION order, not id order: ids are allocated when a
+/// request starts building its decision but persisted only at the terminal
+/// verdict, so under concurrent requests the highest id can append well
+/// before the file's end (and a single line larger than any fixed window
+/// hides everything before it). Recovery therefore scans each decisions
+/// file in full — every file is bounded by the rotation caps, and
+/// `open_active` already streams the whole active file at startup, so the
+/// extra cost is one Value parse per line, once, before the listener binds.
 ///
 /// Parses each line as raw JSON and reads only `id` (not as a
 /// `RoutingDecision`), so future additive schema changes do not silently
@@ -967,7 +972,7 @@ pub(crate) fn read_circuit_transitions(
 pub(crate) fn recover_decision_seq(dir: &Path) -> u64 {
     let mut max: u64 = 0;
     for path in kind_files(dir, HistoryStream::Decisions) {
-        for line in tail_lines(&path, SEQ_TAIL_BYTES) {
+        for line in jsonl_lines(&path) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
                     max = max.max(id);
@@ -976,29 +981,6 @@ pub(crate) fn recover_decision_seq(dir: &Path) -> u64 {
         }
     }
     max.saturating_add(1)
-}
-
-/// Last `cap` bytes of `path` as complete-ish lines. The first line may be a
-/// torn fragment from the seek window; it fails the callers' parse and is
-/// skipped, which is exactly the torn-tail policy.
-fn tail_lines(path: &Path, cap: u64) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
-        return Vec::new();
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = len.saturating_sub(cap);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&buf)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 // ===========================================================================
@@ -1200,6 +1182,30 @@ mod tests {
 
         let empty = TempDir::new("seq-empty");
         assert_eq!(recover_decision_seq(empty.path()), 1);
+    }
+
+    // 5b. the max id can sit anywhere in the file, not only near the end:
+    //     appends are completion-ordered, so a fast-completing high-id
+    //     request may precede 64+ KiB of slower lower-id ones
+    #[test]
+    fn decision_seq_recovery_scans_beyond_the_tail_window() {
+        let dir = TempDir::new("seq-window");
+        let active = dir.path().join("decisions.jsonl");
+        // first line carries the true max id; the lines after it total
+        // more than the 64 KiB a tail-window recovery used to read
+        let mut contents = String::from(r#"{"id": 1000, "timestamp_ms": 1}"#);
+        for id in 1..=120u64 {
+            contents.push_str(&format!(
+                "\n{{\"id\": {id}, \"timestamp_ms\": {id}, \"pad\": \"{}\"}}",
+                "x".repeat(600)
+            ));
+        }
+        fs::write(&active, contents).unwrap();
+        assert!(
+            fs::metadata(&active).unwrap().len() > 64 * 1024,
+            "fixture must exceed a 64 KiB tail window"
+        );
+        assert_eq!(recover_decision_seq(dir.path()), 1001);
     }
 
     // 6. a full channel drops and counts instead of blocking (a blocking
