@@ -40,3 +40,30 @@ pub(crate) fn health_score(metrics: &ModelMetrics) -> Option<f64> {
         Some(success_rate(metrics) * 100.0)
     }
 }
+
+/// Unit tests for the metric helpers (moved from proxy.rs's test module in
+/// the v0.4 M0 split cleanup — they exercise this module, not the
+/// forwarding path).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_ewma_tracks_recent_samples() {
+        let mut metrics = ModelMetrics::default();
+        update_latency_ewma(&mut metrics, 100.0);
+        update_latency_ewma(&mut metrics, 200.0);
+        assert_eq!(metrics.latency_ewma_ms, Some(120.0));
+    }
+
+    #[test]
+    fn success_rate_uses_real_attempts() {
+        let metrics = ModelMetrics {
+            attempts: 4,
+            successes: 3,
+            ..ModelMetrics::default()
+        };
+        assert_eq!(success_rate(&metrics), 0.75);
+        assert_eq!(health_score(&metrics), Some(75.0));
+    }
+}

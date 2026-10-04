@@ -179,3 +179,30 @@ pub(crate) fn selection_name(selection: &SelectionStrategy) -> &'static str {
         SelectionStrategy::Weighted => "weighted",
     }
 }
+
+/// Unit tests for the scoring helpers (moved from proxy.rs's test module in
+/// the v0.4 M0 split cleanup — they exercise this module, not the
+/// forwarding path).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weighted_score_uses_model_metadata() {
+        let config = AppConfig::starter();
+        let weights = SelectionWeights::default();
+        let score = weighted_score(&config, None, "glm", &weights);
+        assert!(score > 0.0);
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn healthiest_waits_for_minimum_samples() {
+        let metrics = ModelMetrics {
+            attempts: 2,
+            successes: 0,
+            ..ModelMetrics::default()
+        };
+        assert_eq!(candidate_health_rank(Some(&metrics)), 1.0);
+    }
+}

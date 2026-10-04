@@ -1094,12 +1094,9 @@ mod tests {
     use super::*;
     use crate::control::api::{
         apply_switch, control_clients, control_decisions, control_status, control_switch,
-        control_traces, status_view, ClientParams, DecisionParams,
+        control_traces, ClientParams, DecisionParams,
     };
-    use crate::route::SelectionWeights;
     use crate::routing::decision::{now_ms, DecisionCandidate};
-    use crate::routing::metrics::{health_score, success_rate, update_latency_ewma};
-    use crate::routing::select::{candidate_health_rank, weighted_score};
     use axum::extract::{Path, Query};
     use axum::{routing::post, Router};
     use serde_json::json;
@@ -1121,19 +1118,6 @@ mod tests {
         let output = rewrite_model(input, "new-model").unwrap();
         let value: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["model"], "new-model");
-    }
-
-    #[test]
-    fn builds_route_status_view() {
-        let config = AppConfig::starter();
-        let status = status_view(&config, "coding-route").unwrap();
-        assert_eq!(status.target, "coding-route");
-        assert_eq!(status.primary, "claude");
-        assert_eq!(status.fallback, vec!["glm"]);
-        assert_eq!(status.policy.header_timeout_ms, 30_000);
-        assert_eq!(status.policy.selection, "ordered");
-        assert_eq!(status.policy.weights.reliability, 0.4);
-        assert!(status.policy.circuit_breaker.enabled);
     }
 
     #[test]
@@ -1173,44 +1157,6 @@ mod tests {
     async fn serve_refuses_non_loopback_before_loading_config() {
         let error = serve("0.0.0.0:13521").await.unwrap_err();
         assert!(error.to_string().contains("loopback"));
-    }
-
-    #[test]
-    fn latency_ewma_tracks_recent_samples() {
-        let mut metrics = ModelMetrics::default();
-        update_latency_ewma(&mut metrics, 100.0);
-        update_latency_ewma(&mut metrics, 200.0);
-        assert_eq!(metrics.latency_ewma_ms, Some(120.0));
-    }
-
-    #[test]
-    fn success_rate_uses_real_attempts() {
-        let metrics = ModelMetrics {
-            attempts: 4,
-            successes: 3,
-            ..ModelMetrics::default()
-        };
-        assert_eq!(success_rate(&metrics), 0.75);
-        assert_eq!(health_score(&metrics), Some(75.0));
-    }
-
-    #[test]
-    fn weighted_score_uses_model_metadata() {
-        let config = AppConfig::starter();
-        let weights = SelectionWeights::default();
-        let score = weighted_score(&config, None, "glm", &weights);
-        assert!(score > 0.0);
-        assert!(score < 1.0);
-    }
-
-    #[test]
-    fn healthiest_waits_for_minimum_samples() {
-        let metrics = ModelMetrics {
-            attempts: 2,
-            successes: 0,
-            ..ModelMetrics::default()
-        };
-        assert_eq!(candidate_health_rank(Some(&metrics)), 1.0);
     }
 
     #[derive(Clone)]

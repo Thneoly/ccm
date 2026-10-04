@@ -760,3 +760,25 @@ fn provider_kind_name(config: &AppConfig, provider_name: &str) -> String {
         .map(|provider| provider.kind.as_str().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
+
+/// Unit tests for the pure view builders (moved from proxy.rs's test module
+/// in the v0.4 M0 split cleanup — they exercise this module, not the
+/// forwarding path). The handler behavior lives in proxy.rs's integration
+/// tests, which drive these views through the real Router.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_route_status_view() {
+        let config = AppConfig::starter();
+        let status = status_view(&config, "coding-route").unwrap();
+        assert_eq!(status.target, "coding-route");
+        assert_eq!(status.primary, "claude");
+        assert_eq!(status.fallback, vec!["glm"]);
+        assert_eq!(status.policy.header_timeout_ms, 30_000);
+        assert_eq!(status.policy.selection, "ordered");
+        assert_eq!(status.policy.weights.reliability, 0.4);
+        assert!(status.policy.circuit_breaker.enabled);
+    }
+}
