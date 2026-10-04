@@ -2,7 +2,7 @@
 
 CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
 
-本文是操作手册。架构背景见 `docs/DESIGN.md`，当前版本规划见 `docs/V0.4_PLAN.md`（v0.3 的发布与验证记录见 `docs/V0.3_PLAN.md`）。
+本文是操作手册。架构背景见 `docs/DESIGN.md`，v0.4 的规划与逐里程碑落地记录见 `docs/V0.4_PLAN.md`（v0.3 的发布与验证记录见 `docs/V0.3_PLAN.md`）。
 
 ---
 
@@ -35,9 +35,56 @@ CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方
 
 ## 2. 安装
 
-前置条件：Rust 工具链（三种方式都要 `cargo build --release`）、Claude Code 已安装（终端里 `claude --version` 可用）。
+两种方式：**预编译二进制**（v0.4.0 起随发布提供，无需 Rust 工具链，推荐）或**源码构建**（需要 Rust 工具链 + 仓库）。两种方式都要求 Claude Code 已安装（终端里 `claude --version` 可用）。
 
-### Windows（PowerShell，仓库根目录）
+### 2.1 预编译二进制
+
+从 [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) 下载对应平台产物（版本号以发布页为准；每次发布附带 `checksums.txt`）：
+
+| 平台 | 产物文件名 |
+|---|---|
+| Windows x64 | `ccm-v<版本>-x86_64-pc-windows-msvc.exe` |
+| Linux x64 | `ccm-v<版本>-x86_64-unknown-linux-gnu` |
+
+macOS 没有预编译产物（macOS 本就不在支持声明内，见 2.2 末尾）。
+
+**完整性校验**（建议）：下载同一发布的 `checksums.txt` 后对照 SHA-256——
+
+```powershell
+# Windows PowerShell（以 v0.4.0 为例）
+Get-FileHash .\ccm-v0.4.0-x86_64-pc-windows-msvc.exe -Algorithm SHA256
+```
+
+```sh
+# Linux（只校验你下载的那一行；checksums.txt 列出了两个平台的产物）
+grep x86_64-unknown-linux-gnu checksums.txt | sha256sum -c
+```
+
+输出的哈希与 `checksums.txt` 中对应行一致才继续安装。
+
+**放入 PATH**：
+
+```powershell
+# Windows：装进用户程序目录（install.ps1 默认也装这里；确认该目录在用户
+# PATH 里，不在就手动加入——加完需要新开终端）
+mkdir $env:LOCALAPPDATA\Programs\ccm -Force
+Copy-Item .\ccm-v0.4.0-x86_64-pc-windows-msvc.exe $env:LOCALAPPDATA\Programs\ccm\ccm.exe
+```
+
+```sh
+# Linux：重命名为 ccm 后放进 ~/.local/bin（确认该目录在 PATH 中）
+chmod +x ccm-v*-x86_64-unknown-linux-gnu
+mkdir -p ~/.local/bin
+mv ccm-v*-x86_64-unknown-linux-gnu ~/.local/bin/ccm
+```
+
+> Linux 产物在 Ubuntu 24.04 上构建，要求 **glibc ≥ 2.39**——Debian 12 / Ubuntu 22.04 及更早的发行版无法直接运行，请改用源码构建（2.2；产物链接的是构建机自己的 glibc，适应性更广）。
+
+### 2.2 源码构建
+
+前置条件：Rust 工具链、本仓库（`git clone` 或发布页的源码包）。
+
+#### Windows（PowerShell，仓库根目录）
 
 ```powershell
 .\scripts\install.ps1
@@ -49,7 +96,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 
 **注意：装完后需要新开一个终端**，当前会话看不到 PATH 变更。
 
-### Linux / macOS（sh，仓库根目录）
+#### Linux / macOS（sh，仓库根目录）
 
 ```sh
 ./scripts/install.sh
@@ -59,9 +106,7 @@ CCM_INSTALL_DIR=/usr/local/bin ./scripts/install.sh
 
 默认装到 `~/.local/bin`（请确认该目录在你的 PATH 中），同样先构建、后用 `ccm --version` 验证。
 
-**注意：v0.4 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
-
-### 手动构建
+#### 手动构建（两平台通用）
 
 ```powershell
 cargo build --release
@@ -73,7 +118,9 @@ cargo build --release
 cp target/release/ccm ~/.local/bin/
 ```
 
-### 验证
+**注意：v0.4 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
+
+### 2.3 验证
 
 ```powershell
 ccm --version
@@ -575,7 +622,7 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 ```json
 {
   "id": 12,
-  "timestamp_ms": 1759300000000,
+  "timestamp_ms": 1790985600000,
   "target": "coding-route",
   "selection": "ordered",
   "configured_candidates": ["glm", "minimax"],
@@ -592,7 +639,7 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
     }
   ],
   "attempts": [
-    { "model": "glm", "circuit": "OPEN", "result": "skipped: circuit OPEN until 1759300030000", "fallback": true },
+    { "model": "glm", "circuit": "OPEN", "result": "skipped: circuit OPEN until 1790985630000", "fallback": true },
     { "model": "minimax", "circuit": "CLOSED", "result": "HTTP 200", "fallback": false }
   ],
   "selected": "minimax",
@@ -604,7 +651,7 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 
 ### 6.3 历史持久化（v0.4）
 
-代理运行时把三类记录追加写入 `$CCM_HOME/history/`（默认 `~/.ccm/history/`）：
+代理运行时把四类记录追加写入 `$CCM_HOME/history/`（默认 `~/.ccm/history/`）：
 
 | 文件 | 内容 |
 |---|---|
@@ -628,14 +675,14 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 ```powershell
 # CLI 离线查询（代理停着也能用）
 ccm history decisions --model glm --limit 20
-ccm history decisions --since 1759300000000 --until 1759399999999 --client term1
+ccm history decisions --since 1790985600000 --until 1791071999999 --client term1
 ccm history metrics            # 最新一次快照（--limit 5 看最近 5 次）
 ccm history circuit --model glm
-ccm history cost               # 今天（UTC）按模型聚合的花费（--day 2025-10-03 指定日）
+ccm history cost               # 今天（UTC）按模型聚合的花费（--day 2026-10-03 指定日）
 
 # 控制接口（代理运行中；unix-ms 含边界；与 ?client= 可组合）
-Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1759300000000&model=glm"
-Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?day=2025-10-03&client=term1"
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/decisions?since=1790985600000&model=glm"
+Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?day=2026-10-03&client=term1"
 ```
 
 HTTP 磁盘查询默认返回最新 **1000 条**（`?limit=` 可调）——查询按最新优先扫描文件、凑够条数即停，读取代价随 limit 而不是历史总量增长，运行中的代理不会被一次全量反序列化拖住；CLI 的 `--limit` 默认不设上限，离线分析不受影响。
@@ -672,7 +719,7 @@ Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost"           # 全局
 Invoke-RestMethod "http://127.0.0.1:13521/_ccm/cost?client=term1" # 某个会话
 
 # 代理停了也能查（离线读 usage.jsonl）
-ccm history cost --day 2025-10-03
+ccm history cost --day 2026-10-03
 ```
 
 `cost` 视图按模型给出 requests / complete / 四类 token / `cost_usd`（模型名排序），外加合计与**无价请求数**（没配 `[pricing]` 表的模型——它们的成本未知而非零，合计不会虚报）。`/_ccm/usage` 则是逐条记录视图，参数语义与 `/_ccm/decisions` 完全一致。
@@ -855,7 +902,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | 文件 / 端点 | 说明 |
 |---|---|
 | `~/.ccm/config.toml`、`~/.ccm/state.toml` | 声明式配置 / 持久默认（可用 `CCM_HOME` 重定位） |
-| `~/.ccm/history/` | 观测历史 JSONL：decisions / metrics / circuit（见 6.3；`CCM_HOME` 同样生效） |
+| `~/.ccm/history/` | 观测历史 JSONL：decisions / metrics / circuit / usage（见 6.3、6.4；`CCM_HOME` 同样生效） |
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
 | `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |
 | `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST；`?client=<id>` 只切该客户端） |

@@ -31,6 +31,16 @@ model_id = "glm-5.3"
 cost_weight = 0.25
 quality_weight = 0.85
 
+# Optional per-MTok pricing table (v0.4): enables cost accounting for this
+# model — usage records store a price snapshot, so later price edits never
+# rewrite past records. A model without a [pricing] table is recorded as
+# unpriced (cost_usd null, never guessed).
+[models.glm.pricing]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+
 [models.deepseek-chat]
 provider = "deepseek"
 model_id = "deepseek-chat"

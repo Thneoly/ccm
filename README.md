@@ -11,7 +11,7 @@ User guide (中文): `docs/USAGE.md`.
 For implementation continuation and release stabilization, read:
 
 - `docs/DESIGN.md` — architecture, routing semantics, invariants, module responsibilities, known design debt.
-- `docs/V0.4_PLAN.md` — v0.4 scope, milestones, risks, and owner decisions (current work).
+- `docs/V0.4_PLAN.md` — v0.4 scope, milestones, landing records, and the post-v0.4 backlog (v0.4.0 released 2026-10-03).
 - `docs/V0.3_PLAN.md` — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
 - `docs/USAGE.md` — task-oriented user guide (Chinese).
 
@@ -23,7 +23,9 @@ New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on 
 
 ## Install
 
-Build the release binary and install it onto your PATH:
+Download a prebuilt binary from the [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) page (v0.4.0 and later): Windows x64 `ccm-v<ver>-x86_64-pc-windows-msvc.exe` and Linux x64 `ccm-v<ver>-x86_64-unknown-linux-gnu` (built on Ubuntu 24.04, needs glibc ≥ 2.39), with SHA-256 hashes in `checksums.txt`. Drop the binary into a directory on your PATH.
+
+Or build the release binary from source and install it onto your PATH:
 
 ```powershell
 # Windows PowerShell
