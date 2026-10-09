@@ -68,6 +68,21 @@ pub enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    /// Suggest cost_weight values from realized spend (v0.5 M1). Read-only:
+    /// prints a table, a paste-only TOML fragment, and the honesty
+    /// caveats — never writes config.
+    Advise {
+        /// Analysis window in days.
+        #[arg(long, default_value_t = crate::advise::DEFAULT_WINDOW_DAYS, value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
+        window: u64,
+        /// Minimum analyzed (complete + priced) requests before a
+        /// suggestion is offered for a model.
+        #[arg(long, default_value_t = crate::advise::DEFAULT_MIN_SAMPLES, value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
+        min_samples: u64,
+        /// Narrow the analysis to one configured model alias.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

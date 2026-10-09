@@ -1,3 +1,4 @@
+mod advise;
 mod cli;
 mod config;
 mod control;
@@ -177,6 +178,18 @@ async fn main() -> Result<()> {
             health::check(&config, &name).await?;
         }
         Command::History { command } => history_cli::run(command)?,
+        Command::Advise {
+            window,
+            min_samples,
+            model,
+        } => {
+            let options = advise::AdviseOptions {
+                window_days: window,
+                min_samples,
+                model,
+            };
+            advise::run(&options)?;
+        }
     }
 
     Ok(())

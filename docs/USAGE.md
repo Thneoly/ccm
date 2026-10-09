@@ -482,7 +482,7 @@ quality     = quality_weight，截断到 [0,1]
 - `cost_weight` 是**相对成本**，越小越便宜：`lowest-cost` 直接按它升序，`weighted` 里它得分更高。样例配置给 glm 设 0.25、claude 设 1.0，即"glm 约便宜 4 倍"。
 - `quality_weight` 是**相对质量**（0~1），只影响 `weighted` 策略的质量分量。
 
-两者都只是**路由元数据**，和钱无关。要算真实花费，给模型加一张手填的每百万 token 定价表（v0.4 M6，直接编辑 `config.toml`）：
+两者都只是**路由元数据**，和钱无关。想看手填的权重离真实花费多远：`ccm advise`（见 6.6）。要算真实花费，给模型加一张手填的每百万 token 定价表（v0.4 M6，直接编辑 `config.toml`）：
 
 ```toml
 [models.glm.pricing]
@@ -574,6 +574,7 @@ fallback = ["glm"]
 | `ccm doctor` | 本地体检：PATH、目标解析、配置链、凭据在不在、端点通不通（见 3.4） |
 | `ccm health <model-or-profile>` | 发真实请求验证"鉴权 + 模型名"是否可用 |
 | `ccm history decisions\|metrics\|circuit\|cost` | 离线查看持久化的决策 / 指标快照 / 熔断转换 / 按天成本（见 6.3、6.4，代理停着也能查） |
+| `ccm advise` | 从已落盘的使用量重算 `cost_weight` 建议并打印（只读不写配置，见 6.6） |
 | `/_ccm/*` 控制接口 | 代理运行时的实时观测与切换（本节） |
 
 ### 6.1 控制接口一览（默认 `http://127.0.0.1:13521`）
@@ -763,6 +764,48 @@ curl -s http://127.0.0.1:13521/metrics | grep ccm_
 - **重启清零**：所有运行时计数器随代理重启归零（counter 语义，Prometheus 侧靠 `increase()`/`rate()` 自然处理）；跨天的账要查 6.3/6.4 的磁盘历史。
 - 成本/token 的口径与 6.4 完全一致：只统计被接受的 2xx 响应，代理侧计量、手填单价，不能对账。
 
+### 6.6 `ccm advise`：cost_weight 建议（v0.5 M1）
+
+`cost_weight` 是手填的先验（5.3），v0.4 M6 又已把每请求四类 token 落了盘——`ccm advise` 把两边接起来：按**当前**定价表对窗口内使用量重算每模型真实 USD/请求，归一化成建议权重。**只打印，绝不写配置**（TOML 片段是给你粘贴的）。
+
+```powershell
+ccm advise                     # 最近 7 天，min-samples 20
+ccm advise --window 30         # 30 天窗口
+ccm advise --min-samples 50    # 更保守的样本门槛
+ccm advise --model glm         # 只看一个模型
+```
+
+输出示例（合成数据）：
+
+```text
+== ccm advise — cost_weight suggestions from realized spend
+   window: last 7 day(s) (since 2026-10-02T12:37:22Z), min-samples: 20, prices: current [models.<name>.pricing] tables
+model                 reqs incomplete analyzed    usd/req usd/1ktok weight suggest  score  status
+claude                   6          0        0          -         -  1.000       -      -  cost unknown — never guessed
+glm                     43          3       40   0.034930  0.000406  0.250   1.000  0.500
+m3                      25          0       25   0.022080  0.001082  1.000   0.632  0.613
+anchor: glm — highest realized usd/req among analyzed candidates, maps to 1.0
+# suggested cost_weight values — paste into config.toml (ccm advise never writes config)
+
+[models.glm.routing]
+cost_weight = 1.000
+
+[models.m3.routing]
+cost_weight = 0.632
+（后接 caveats，见下）
+```
+
+规则：
+
+- **锚点归一化**：窗口内样本达标的已定价模型中，USD/请求最高的那个 → 建议 1.0（与样例配置"claude=1.0 最贵"的惯例一致），其余按相对倍数缩放。`score` 列是建议值代入 `1/(1+w)` 后的成本分（从**取整后的建议值**算——你实际会填进去的就是那个数）。
+- **重算而非重放**：费用按**当前** `[models.<name>.pricing]` 从 token 重算，不用记录里内嵌的价格快照——中途改过价不会把新旧价位混在一起（改价后重跑 advise 即得新价位下的建议；usage 记录本身不受影响，见 6.4）。
+- **窗口的上限是保留期**：已轮转的历史文件按 `[observability] retention_days`（默认 14 天，见 6.3）清理，窗口比它宽时折算只能看到还在磁盘上的部分——此时报告会打一行 note 明说，不会默默按窄窗口充数。
+- **三种行状态**：正常分析（给建议）；样本不足（`insufficient — unchanged`——贵但稀的模型不构成证据，也不能当锚点）；未定价（`cost unknown — never guessed`，模型已从 config 删掉的会标注 `model not in config.toml`）。
+- **不完整记录**（客户端断连 / 传输错误 / 上游 error 帧）计数但不进折算——token 可能是半截的。
+- 全部模型都实现 $0/请求时（比如全 0 单价），所有建议为 0.0（一样免费），不会除零。
+
+边界（每份报告都会原样打印）：per-token 数字混合各家上游自己的 tokenizer，**跨协议家族不可比**；usage 只记实际被路由到的流量，路由从没选过的模型在这里没有数据（选择偏差）；这是按手填单价做的代理侧计量，**不是账单真相**；`quality_weight` 保持手工——代理可见信号里没有诚实的推导路径。
+
 ---
 
 ## 7. 凭据与环境
@@ -884,6 +927,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit`（N ≥ 1） |
 | `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit`（N ≥ 1） |
 | `ccm history cost` | 离线查看按 UTC 日聚合的使用量与成本表（见 6.4） | `--day`（`YYYY-MM-DD`，缺省今天）、`--client` |
+| `ccm advise` | 从真实使用量建议 `cost_weight`（只打印不写配置，见 6.6） | `--window`（7 天）、`--min-samples`（20）、`--model` |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
 | `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |
 | `ccm list` | 列出模型与路由（`*` = 当前） | — |
