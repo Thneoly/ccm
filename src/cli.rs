@@ -64,6 +64,16 @@ pub enum Command {
     Health {
         target: String,
     },
+    /// List a gateway's models via GET /v1/models and register selected
+    /// ones (v0.5 M5). Read-only until you confirm the selection;
+    /// already-registered (provider, model_id) pairs are skipped, never
+    /// overwritten.
+    Discover {
+        provider: Option<String>,
+        /// Register every listed model without prompting (the script path).
+        #[arg(long)]
+        all: bool,
+    },
     History {
         #[command(subcommand)]
         command: HistoryCommand,

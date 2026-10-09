@@ -1415,7 +1415,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::control::api::{
         apply_switch, control_clients, control_decisions, control_status, control_switch,
@@ -1428,8 +1428,10 @@ mod tests {
 
     /// All five integration tests mutate process env (`CCM_HOME`,
     /// `CCM_<PROVIDER>_API_KEY`); each holds this lock for its whole duration
-    /// so they never race (V0.3_PLAN §11.2 discipline).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// so they never race (V0.3_PLAN §11.2 discipline). Shared
+    /// crate-wide: the discover integration tests mutate the same env
+    /// vars and must serialize against these, not just each other.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK

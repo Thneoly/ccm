@@ -19,7 +19,12 @@ pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
         provider.base_url.trim_end_matches('/'),
         provider.kind.upstream_path()
     );
-    let client = reqwest::Client::new();
+    // v0.5 M5: the health check is timeout-bounded like every other
+    // outbound call — an unresponsive gateway must not hang the probe.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("cannot build the health check HTTP client")?;
     // The ping body shape is identical for both protocols; only the endpoint
     // and the anthropic-version header differ.
     let builder = client.post(url).json(&serde_json::json!({
@@ -50,7 +55,14 @@ pub async fn check(config: &AppConfig, model_name: &str) -> Result<()> {
     }
 
     let body = response.text().await.unwrap_or_default();
-    anyhow::bail!("provider returned {status}: {}", truncate(&body, 300));
+    // Invariant 1 hygiene (the discover.rs verify-pass fix, applied to
+    // health's pre-existing twin): gateway error text is untrusted — a
+    // debug-mode gateway can echo the just-sent credential back — so the
+    // token is scrubbed before the body reaches the error message.
+    anyhow::bail!(
+        "provider returned {status}: {}",
+        truncate(&body.replace(&token, "***"), 300)
+    );
 }
 
 fn truncate(input: &str, max: usize) -> String {

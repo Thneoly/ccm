@@ -5,6 +5,7 @@ mod config;
 mod control;
 mod credential;
 mod date;
+mod discover;
 mod doctor;
 mod health;
 mod history;
@@ -178,6 +179,13 @@ async fn main() -> Result<()> {
             let config = load_config()?;
             let name = config.resolve_target(&target)?;
             health::check(&config, &name).await?;
+        }
+        Command::Discover { provider, all } => {
+            let mut config = load_config()?;
+            // Migration-first, same as `ccm add`: saving the config strips
+            // the legacy `current` field, so migrate up front.
+            load_state(&config)?;
+            discover::run(&mut config, provider, all).await?;
         }
         Command::History { command } => history_cli::run(command)?,
         Command::Advise {

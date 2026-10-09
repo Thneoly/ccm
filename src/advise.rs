@@ -14,7 +14,9 @@
 //!
 //! Honesty rails — everything printed, nothing written:
 //! - NEVER writes config; the TOML fragment is paste-only.
-//! - unpriced models: `cost unknown — never guessed`.
+//! - unpriced models: `cost unknown — never guessed`, with the row naming
+//!   the `[models.<alias>.pricing]` edit to make them priceable (v0.5 M5;
+//!   `ccm discover` prints the skeleton for exactly this journey).
 //! - below `--min-samples`: `insufficient — unchanged` (a thin sample is
 //!   not evidence, however expensive it looked).
 //! - incomplete records (client disconnects, transport errors, upstream
@@ -429,7 +431,13 @@ fn table_row(row: &AdviseRow, min_samples: u64) -> String {
             if row.missing_from_config {
                 "cost unknown — never guessed (model not in config.toml)".to_string()
             } else {
-                "cost unknown — never guessed".to_string()
+                // Names the config edit (v0.5 M5): no pricing CLI flag
+                // exists by policy, so the message points at the TOML
+                // table the owner must hand-enter.
+                format!(
+                    "cost unknown — never guessed (add a [models.{}.pricing] table)",
+                    row.model
+                )
             },
         ),
     };
@@ -723,6 +731,9 @@ mod tests {
         let text = render_report(&report);
         assert!(text.contains("cost unknown — never guessed"), "{text}");
         assert!(text.contains("model not in config.toml"), "{text}");
+        // v0.5 M5: the unpriced message names the config edit (no pricing
+        // CLI flag exists, by policy).
+        assert!(text.contains("add a [models.glm.pricing] table"), "{text}");
         assert!(
             text.contains("insufficient — unchanged (19 < 20)"),
             "{text}"

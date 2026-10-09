@@ -211,6 +211,8 @@ ccm add model glm --provider zai --model-id glm-5.3 --cost-weight 0.25 --quality
 
 注意：`add provider` 是 upsert，同名会**静默覆盖**。另外所有 `ccm add` 都是交互友好的，但在脚本/CI 里请把 flag 传全，避免卡在提示上。
 
+provider 配好之后，模型不用逐个手抄：网关支持 `GET /v1/models` 的话 `ccm discover` 能拉清单勾选注册（见 3.5）。
+
 ### 3.4 验证
 
 ```powershell
@@ -238,12 +240,12 @@ CCM doctor
 ✓ provider: zai
 ✓ base URL: https://api.z.ai/api/anthropic
 ✓ credential: present
-✓ endpoint: reachable (200)
+✓ discovery endpoint: /v1/models answered (200)
 
 For a full authenticated model check, run `ccm health glm`.
 ```
 
-- `endpoint` 一行是对 base_url 发起普通 GET 的状态码，因网关而异。
+- `endpoint` 一行（v0.5 起改名 discovery endpoint）对 `{base_url}/v1/models` 发起**不带凭据**、**不跟随重定向**的 GET（10 秒超时）：200 且 JSON（或无 content-type）→ `✓ answered`；200 但响应不是 JSON（登录页/兜底页也答 200）→ `!` 提示并由 `ccm discover <provider>` 确证；401/403 → `✓ exists (needs auth)`，此时带凭据的 `ccm discover <provider>`（见 3.5）能拉到清单；404/405 → `! not exposed`，该网关不支持清单发现，模型得手动加；其余状态（含 SSO 的 302）→ `! answered ({status})`。
 - `Claude Code` 一行解析 `claude --version` 输出并带版本号；低于 2.1.227 时追加一行警告——该版本起才支持 `ANTHROPIC_CUSTOM_HEADERS`（ccm 注入的客户端身份头），更早的版本客户端身份只能走 `ccm-local-<id>` token 通道。
 - 当前目标属于 openai-compatible provider 时，会多一行 `! current target: openai-compatible models are proxy-only (...)`——该目标只能走代理模式（见 4.2 / 5.5）。
 - `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键（含 `ANTHROPIC_CUSTOM_HEADERS`，会顶掉 ccm 注入的客户端身份头）会覆盖 ccm 的注入（见 FAQ）。
@@ -260,6 +262,60 @@ healthy: minimax / MiniMax-M3
 ```
 
 注意 `health` 只接受**模型名或 profile 名，不接受路由名**（`use` / `switch` / `proxy` 三者才接受路由名）。常见报错：401/403 → `provider reachable but authentication failed (401)`；名字拼错 → `unknown model/profile `...``（解析发生在发请求之前）。
+
+### 3.5 从网关发现模型清单：`ccm discover`（v0.5）
+
+`ccm discover [provider]` 拉取网关的 `GET /v1/models`，列出全部模型供你勾选注册——省去从网关控制台逐个手抄 `model_id`（手抄路径 `ccm add model` 依然可用，且仍是覆盖/upsert 路径）。
+
+```powershell
+ccm discover zai          # 指定 provider
+ccm discover              # 交互选择已配置的 provider
+ccm discover zai --all    # 非交互全选（脚本/CI 友好）
+```
+
+输出形如：
+
+```text
+== ccm discover — provider zai (anthropic-compatible) @ https://api.z.ai/api/anthropic
+   1. glm-4.5  GLM-4.5
+   2. glm-4.5-air  GLM-4.5-Air
+   ...
+   9. glm-5.3  GLM-5.3
+  10. glm-5.3-flash  GLM-5.3-Flash
+  11. glm-5.3-flashx  GLM-5.3-FlashX
+11 listed, 1 already registered
+Register which? (numbers like 1,3-5, `all`, or Enter for none): 9,10
+Skipped glm-5.3 — already registered as `glm`
+Saved model glm-5-3-flash
+
+# hand-enter prices to make `ccm advise` useful — paste into config.toml:
+# [models.glm-5-3-flash.pricing]
+# input = 0.0        # USD per 1M input tokens
+# output = 0.0       # USD per 1M output tokens
+# cache_read = 0.0   # USD per 1M cache-read tokens
+# cache_write = 0.0  # USD per 1M cache-write tokens
+```
+
+行为要点：
+
+- **拉清单是只读的**：确认选择之前不写任何配置；注册只写 config.toml（新模型路由权重 1.0/1.0）。
+- **skip 不覆盖**：同 provider 下已注册的 `model_id` 跳过并提示——手工调过的权重和定价永不被 discover 动到（想覆盖走 `ccm add model`）。
+- **别名** = 规范化的 model_id（非 `[A-Za-z0-9_-]` 字符替换成 `-`；与现有配置里的名字冲突——**含其他 provider 的模型别名和 profile 名**——或同批内冲突时，加 `-2`/`-3` 后缀避开，绝不覆盖已有条目）。
+- **定价是手填事实，不由 CLI 代填**：新注册模型不带定价表，discover 为每个选中的未定价模型打印注释掉的 `[models.<alias>.pricing]` 骨架。填好价格，`ccm advise`（6.6）才有依据——discover → 手填价 → advise 是设计好的闭环（见 5.3）。
+- **分页**：anthropic 类 `has_more` 游标分页自动跟进（上限 10 页，触顶提示清单可能不完整）；z.ai 这类不分页的网关一次拉完。清单行带 `display_name`（anthropic 类）或 `(owned by ...)`（openai 类）时一并显示。
+- **鉴权**：按 provider 的 `auth` 配置注入凭据（anthropic 类附 `anthropic-version: 2023-06-01`），单请求 10 秒超时；凭据只发给配置的网关主机——**不跟随重定向**（302 按原状态报错），错误文案里引用的网关响应体会先抹掉凭据本身（网关把 key 回显进错误体也打印不出来）。清单形状与声明的 `kind` 明显不符时（如 openai 类网关返回 anthropic 形状）会先打一行警告，请求仍按声明的 kind 走。
+
+降级路径（直接报错退出，不写配置）：
+
+| 网关应答 | 行为 |
+|---|---|
+| 404 / 405 | 网关不暴露 /v1/models——退回手动路径（`ccm add provider` / `ccm add model`），报错文案里写明 |
+| 401 / 403 | 网关可达但鉴权失败（`provider reachable but authentication failed (...)`）——先 `ccm auth set <provider>` |
+| 3xx 重定向 | **不跟随**——凭据不出配置主机；302 等按原状态报错（通常是 base_url 该更新） |
+| 200 但响应体没有 `data` 数组 | 不是模型清单——报错原样引用网关原话（如 z.ai 对无效 key 返回 200 + `{"code":401,"msg":"token expired or incorrect"}`，鉴权失败不会伪装成"0 个模型"） |
+| 凭据未配置 | 与 health 相同的凭据缺失提示（`CCM_<PROVIDER>_API_KEY` 或 `ccm auth set`） |
+
+**诚实边界**：清单是便利，不是契约——列出的 id 真正请求时可能 400，没列出的模型也可能可用；注册后拿 `ccm health <模型>` 验证（见 3.4）。另外：provider 的 base_url 指向**另一个 ccm 代理**时，今天会得到 404 路径（ccm 代理不服务 /v1/models），此时按手动路径配置即可。
 
 ---
 
@@ -487,7 +543,7 @@ quality     = quality_weight，截断到 [0,1]
 - `cost_weight` 是**相对成本**，越小越便宜：`lowest-cost` 直接按它升序，`weighted` 里它得分更高。样例配置给 glm 设 0.25、claude 设 1.0，即"glm 约便宜 4 倍"。
 - `quality_weight` 是**相对质量**（0~1），只影响 `weighted` 策略的质量分量。
 
-两者都只是**路由元数据**，和钱无关。想看手填的权重离真实花费多远：`ccm advise`（见 6.6）。要算真实花费，给模型加一张手填的每百万 token 定价表（v0.4 M6，直接编辑 `config.toml`）：
+两者都只是**路由元数据**，和钱无关。想看手填的权重离真实花费多远：`ccm advise`（见 6.6）。要算真实花费，给模型加一张手填的每百万 token 定价表（v0.4 M6，直接编辑 `config.toml`；`ccm discover` 注册的模型会顺手打印这张表的注释骨架，见 3.5）：
 
 ```toml
 [models.glm.pricing]
@@ -578,6 +634,7 @@ fallback = ["glm"]
 |---|---|
 | `ccm doctor` | 本地体检：PATH、目标解析、配置链、凭据在不在、端点通不通（见 3.4） |
 | `ccm health <model-or-profile>` | 发真实请求验证"鉴权 + 模型名"是否可用 |
+| `ccm discover [provider]` | 拉取网关 `/v1/models` 模型清单并勾选注册（见 3.5；skip 不覆盖已有模型） |
 | `ccm history decisions\|metrics\|circuit\|cost` | 离线查看持久化的决策 / 指标快照 / 熔断转换 / 按天成本（见 6.3、6.4，代理停着也能查） |
 | `ccm advise` | 从已落盘的使用量重算 `cost_weight` 建议并打印（只读不写配置，见 6.6） |
 | `/_ccm/*` 控制接口 | 代理运行时的实时观测与切换（本节） |
@@ -790,7 +847,7 @@ ccm advise --model glm         # 只看一个模型
 == ccm advise — cost_weight suggestions from realized spend
    window: last 7 day(s) (since 2026-10-02T12:37:22Z), min-samples: 20, prices: current [models.<name>.pricing] tables
 model                 reqs incomplete analyzed    usd/req usd/1ktok weight suggest  score  status
-claude                   6          0        0          -         -  1.000       -      -  cost unknown — never guessed
+claude                   6          0        0          -         -  1.000       -      -  cost unknown — never guessed (add a [models.claude.pricing] table)
 glm                     43          3       40   0.034930  0.000406  0.250   1.000  0.500
 m3                      25          0       25   0.022080  0.001082  1.000   0.632  0.613
 anchor: glm — highest realized usd/req among analyzed candidates, maps to 1.0
@@ -809,7 +866,7 @@ cost_weight = 0.632
 - **锚点归一化**：窗口内样本达标的已定价模型中，USD/请求最高的那个 → 建议 1.0（与样例配置"claude=1.0 最贵"的惯例一致），其余按相对倍数缩放。`score` 列是建议值代入 `1/(1+w)` 后的成本分（从**取整后的建议值**算——你实际会填进去的就是那个数）。
 - **重算而非重放**：费用按**当前** `[models.<name>.pricing]` 从 token 重算，不用记录里内嵌的价格快照——中途改过价不会把新旧价位混在一起（改价后重跑 advise 即得新价位下的建议；usage 记录本身不受影响，见 6.4）。
 - **窗口的上限是保留期**：已轮转的历史文件按 `[observability] retention_days`（默认 14 天，见 6.3）清理，窗口比它宽时折算只能看到还在磁盘上的部分——此时报告会打一行 note 明说，不会默默按窄窗口充数。
-- **三种行状态**：正常分析（给建议）；样本不足（`insufficient — unchanged`——贵但稀的模型不构成证据，也不能当锚点）；未定价（`cost unknown — never guessed`，模型已从 config 删掉的会标注 `model not in config.toml`）。
+- **三种行状态**：正常分析（给建议）；样本不足（`insufficient — unchanged`——贵但稀的模型不构成证据，也不能当锚点）；未定价（`cost unknown — never guessed`，并注明要补的 `[models.<name>.pricing]` 表；模型已从 config 删掉的会标注 `model not in config.toml`）。
 - **不完整记录**（客户端断连 / 传输错误 / 上游 error 帧）计数但不进折算——token 可能是半截的。
 - 全部模型都实现 $0/请求时（比如全 0 单价），所有建议为 0.0（一样免费），不会除零。
 
@@ -960,6 +1017,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm current` | 显示持久默认目标 | — |
 | `ccm doctor` | 本地体检 | — |
 | `ccm health <target>` | 真实请求探测（模型/Profile 名） | — |
+| `ccm discover [provider]` | 拉取并勾选注册网关模型清单（见 3.5） | `--all`（非交互全选） |
 | `ccm integrate claude` | 安装/移除 `/switch` skill | `--remove` |
 
 | 环境变量 | 作用 |

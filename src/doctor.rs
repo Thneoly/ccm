@@ -66,8 +66,35 @@ pub async fn run(config: &AppConfig) -> Result<()> {
         ),
     }
 
-    match reqwest::Client::new().get(&provider.base_url).send().await {
-        Ok(response) => println!("✓ endpoint: reachable ({})", response.status()),
+    // v0.5 M5: the endpoint line probes `GET /v1/models` (unauthenticated)
+    // instead of a bare GET of base_url — "does this gateway support
+    // discovery at all" is now an explicit fact, not "status varies by
+    // gateway". 401/403 still prove the endpoint exists. The probe
+    // follows NO redirects (verify-pass fix): an SSO ingress's
+    // 302-to-login must surface as its real status, not a followed 200,
+    // and a bare 200 is downgraded when the content-type is not JSON —
+    // catch-all servers and login pages also answer 200.
+    let models_url = format!("{}/v1/models", provider.base_url.trim_end_matches('/'));
+    let probe = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map(|client| client.get(models_url));
+    match probe {
+        Ok(request) => match request.send().await {
+            Ok(response) => {
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                println!(
+                    "{}",
+                    discovery_verdict(response.status().as_u16(), content_type, &model.provider)
+                );
+            }
+            Err(error) => println!("✗ endpoint: {error}"),
+        },
         Err(error) => println!("✗ endpoint: {error}"),
     }
 
@@ -76,6 +103,34 @@ pub async fn run(config: &AppConfig) -> Result<()> {
         route.primary
     );
     Ok(())
+}
+
+/// The endpoint-line verdict for one probe answer (v0.5 M5). Pure so the
+/// 200-content-type and redirect-status cases stay pinned without HTTP.
+/// A 200 with a JSON (or absent) content-type is a checkmark; a 200 with
+/// anything else (an HTML login page, a catch-all SPA fallback) is a `!`
+/// naming `ccm discover` as the confirmation — "answered" must never
+/// affirm a listing the endpoint does not actually serve.
+fn discovery_verdict(status: u16, content_type: &str, provider: &str) -> String {
+    match status {
+        200 => {
+            let content_type = content_type.trim().to_ascii_lowercase();
+            if content_type.contains("json") || content_type.is_empty() {
+                "✓ discovery endpoint: /v1/models answered (200)".to_string()
+            } else {
+                format!(
+                    "! discovery endpoint: /v1/models answered (200, `{content_type}`) — likely not a models listing; `ccm discover {provider}` confirms"
+                )
+            }
+        }
+        401 | 403 => format!(
+            "✓ discovery endpoint: /v1/models exists ({status}, needs auth — `ccm discover {provider}`)"
+        ),
+        404 | 405 => format!(
+            "! discovery endpoint: /v1/models not exposed ({status}) — add models manually"
+        ),
+        status => format!("! discovery endpoint: /v1/models answered ({status})"),
+    }
 }
 
 // v0.4 M5: an informative look at the observability history store. Non-fatal
@@ -224,6 +279,32 @@ fn anthropic_env_overrides(value: &serde_json::Value) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn discovery_verdict_covers_the_probe_answers() {
+        // JSON or absent content-type: the checkmark (z.ai/minimax shape).
+        assert_eq!(
+            discovery_verdict(200, "application/json", "zai"),
+            "✓ discovery endpoint: /v1/models answered (200)"
+        );
+        assert_eq!(
+            discovery_verdict(200, "", "zai"),
+            "✓ discovery endpoint: /v1/models answered (200)"
+        );
+        // A bare 200 proves only that SOMETHING answered: an HTML login
+        // page or catch-all fallback is a `!`, with discover as the
+        // confirmation.
+        let html = discovery_verdict(200, "text/html; charset=utf-8", "zai");
+        assert!(html.starts_with('!'), "{html}");
+        assert!(html.contains("text/html"), "{html}");
+        assert!(html.contains("ccm discover zai"), "{html}");
+        // Redirects are not followed — an SSO 302 lands in the catch-all
+        // `!` arm with its real status.
+        assert!(discovery_verdict(302, "text/html", "zai").starts_with('!'));
+        assert!(discovery_verdict(302, "text/html", "zai").contains("302"));
+        assert!(discovery_verdict(401, "", "zai").contains("needs auth"));
+        assert!(discovery_verdict(404, "", "zai").contains("not exposed"));
+    }
 
     #[test]
     fn detects_anthropic_env_overrides() {

@@ -140,6 +140,47 @@ Important invariant:
 
 CCM strips inbound `x-api-key` and `Authorization` before forwarding and then injects the configured provider credential. For `openai-compatible` providers, the inbound `anthropic-version` header is also stripped (it is meaningless upstream).
 
+#### Provider discovery (v0.5 M5)
+
+`ccm discover [provider]` lists a gateway's `GET {base_url}/v1/models`
+(kind-appropriate auth via `apply_auth`, `anthropic-version` on anthropic
+kinds, 10s timeout) and registers selected ids as models. Parsing is
+deliberately lenient across the three observed shapes — the common
+skeleton is `data[].id`; the Anthropic list shape adds `has_more`/
+`first_id`/`last_id` pagination and `display_name`; the OpenAI shape adds
+`object: "list"` / `owned_by`; every extra field is optional (z.ai omits
+pagination entirely). Cursor pagination follows `has_more` + `after_id`
+up to 10 pages, first request carries no query.
+
+Registration contract: an already-registered `(provider, model_id)` pair
+is SKIPPED with a notice, never overwritten — discovery must not clobber
+hand-tuned weights or prices (`ccm add model` remains the upsert path).
+New models land with default routing weights and `pricing = None`; a
+commented `[models.<alias>.pricing]` skeleton is printed per selected
+unpriced model (prices are hand-entered TOML facts, by policy). Alias =
+normalized model_id (`[A-Za-z0-9_-]` kept, everything else `-`),
+collision-suffixed against existing config names — model aliases and
+profile names, across providers — and within the run (a mechanical
+alias must never capture a profile target).
+
+Degradation paths are honest exits, not guesses: 404/405 → "add models
+manually"; 401/403 → the health-style auth failure text; a 200 body
+with no `data` member → "not a models list" carrying the gateway's own
+words (z.ai answers a bad key as HTTP 200 + `{"code":401,...}` — the
+auth failure must not degrade to a misleading "0 models"); a shape/kind
+mismatch (anthropic shape on an openai kind or vice versa) warns on
+stderr but requests still follow the declared kind. The discovery
+client follows NO redirects — the credential is keyed to the configured
+host (reqwest strips `Authorization` on cross-host redirects but not
+`x-api-key`), so a 302 ingress surfaces as its own status — and every
+gateway body quoted into an error is scrubbed of the sent token first
+(invariant 1: a proxy echoing `x-api-key: ...` back in a diagnostic
+body never reaches the terminal). The gateway's list
+is a convenience, not a contract: listed ids may still 400 at use time,
+and working models may be unlisted. A provider whose base_url points at
+another CCM gets the 404 path today (the proxy does not serve
+`/v1/models`).
+
 ### Model
 
 A Model binds a logical alias to one Provider and one upstream model ID.
@@ -659,6 +700,7 @@ src/credential.rs  env/keyring credential resolution
 src/launcher.rs    Claude Code process environment
 src/integrate.rs   Claude Skill installation
 src/health.rs      authenticated provider check
+src/discover.rs    /v1/models listing + selective registration (v0.5 M5)
 src/history.rs     JSONL observability history engine (writer + readers)
 src/history_cli.rs `ccm history` offline presentation
 src/usage.rs       usage scanner + UsageRecord + cost aggregation (v0.4 M6)
@@ -768,7 +810,9 @@ scope then and where each item now stands:
 - remote CCM control plane (still out of scope)
 - adaptive/self-learning routing (still out of scope)
 - real-time token billing (still out of scope)
-- provider discovery (still out of scope)
+- ~~provider discovery~~ — delivered in v0.5 M5 as `ccm discover`
+  (`GET /v1/models` listing + selective registration, skip-not-overwrite;
+  see §4 and `src/discover.rs`)
 - mid-stream failover (permanent non-goal, invariant 5)
 
 ## 18. Known Design Debt
