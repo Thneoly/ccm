@@ -11,16 +11,16 @@ User guide (中文): [docs/USAGE.md](docs/USAGE.md).
 For implementation continuation and release stabilization, read:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, routing semantics, invariants, module responsibilities, known design debt.
-- [docs/V0.5_PLAN.md](docs/V0.5_PLAN.md) — v0.5 scope, milestones, landing records, and the post-v0.5 backlog (in preparation; M1–M5 landed).
+- [docs/V0.5_PLAN.md](docs/V0.5_PLAN.md) — v0.5 scope, milestones, landing records, and the post-v0.5 backlog (v0.5.0 released 2026-10-10).
 - [docs/V0.4_PLAN.md](docs/V0.4_PLAN.md) — v0.4 scope, milestones, landing records, and the post-v0.4 backlog (v0.4.0 released 2026-10-03).
 - [docs/V0.3_PLAN.md](docs/V0.3_PLAN.md) — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
 - [docs/USAGE.md](docs/USAGE.md) — task-oriented user guide (Chinese).
 
 Current status:
 
-> **v0.4.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.4.0). v0.4 adds the `openai-compatible` provider kind with upstream protocol translation, per-client runtime switching on one proxy (multi-client routing), and persistent observability: JSONL history, usage capture with cost accounting, and Prometheus `/metrics`. v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
+> **v0.5.0 released (2026-10-10)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.5.0). v0.5 adds `ccm advise` (cost_weight suggestions from realized spend), persistent client sessions (`clients.toml`), `count_tokens` forwarding, OTLP/HTTP JSON metrics export, and provider discovery (`ccm discover`). v0.4.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.4.0). v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
 
-v0.5 feature work follows `docs/V0.5_PLAN.md` (advice, persistent client sessions, `count_tokens` forwarding, OTLP export, provider discovery); keep the CI release gate green on every push to main.
+Post-v0.5 work follows the backlog in `docs/V0.5_PLAN.md` §11; keep the CI release gate green on every push to main.
 
 ## Install
 
