@@ -11,6 +11,7 @@ User guide (中文): [docs/USAGE.md](docs/USAGE.md).
 For implementation continuation and release stabilization, read:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, routing semantics, invariants, module responsibilities, known design debt.
+- [docs/V0.5_PLAN.md](docs/V0.5_PLAN.md) — v0.5 scope, milestones, landing records, and the post-v0.5 backlog (in preparation; M1–M5 landed).
 - [docs/V0.4_PLAN.md](docs/V0.4_PLAN.md) — v0.4 scope, milestones, landing records, and the post-v0.4 backlog (v0.4.0 released 2026-10-03).
 - [docs/V0.3_PLAN.md](docs/V0.3_PLAN.md) — v0.3 verified/unverified status, Release Gate, platform checklist, security decision, handoff order.
 - [docs/USAGE.md](docs/USAGE.md) — task-oriented user guide (Chinese).
@@ -19,7 +20,7 @@ Current status:
 
 > **v0.4.0 released (2026-10-03)** — [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.4.0). v0.4 adds the `openai-compatible` provider kind with upstream protocol translation, per-client runtime switching on one proxy (multi-client routing), and persistent observability: JSONL history, usage capture with cost accounting, and Prometheus `/metrics`. v0.3.0: [GitHub Release](https://github.com/Thneoly/ccm/releases/tag/v0.3.0).
 
-New feature work follows `docs/V0.4_PLAN.md`; keep the CI release gate green on every push to main.
+v0.5 feature work follows `docs/V0.5_PLAN.md` (advice, persistent client sessions, `count_tokens` forwarding, OTLP export, provider discovery); keep the CI release gate green on every push to main.
 
 ## Install
 
@@ -47,7 +48,7 @@ macOS    ~/.local/bin
 
 Override the destination with `-Destination <dir>` (PowerShell) or `CCM_INSTALL_DIR=<dir>` (sh). Re-running the script upgrades an existing installation in place.
 
-macOS is unverified for v0.4 — there is no macOS host to run the release gate on. See [Supported release platforms](#supported-release-platforms).
+macOS is unverified for v0.5 — there is no macOS host to run the release gate on. See [Supported release platforms](#supported-release-platforms).
 
 ## Quick start
 
@@ -173,6 +174,8 @@ ccm add model glm \
 ```
 
 Existing model configs that omit `[models.<name>.routing]` remain valid and default both values to `1.0`.
+
+Instead of hand-copying `model_id`s from a gateway console, `ccm discover <provider>` (v0.5) lists the gateway's `GET /v1/models` and registers the ids you select — already-registered `(provider, model_id)` pairs are skipped, never overwritten, and each unpriced selection prints a commented `[models.<alias>.pricing]` skeleton to hand-enter prices (see the user guide §3.5).
 
 ## Route model
 
@@ -432,7 +435,7 @@ ccm switch balanced
 
 `ccm switch` changes only the running proxy's in-memory target. `ccm use` changes the persisted default in `~/.ccm/state.toml`.
 
-Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run --proxy` session carries a client id, and `ccm switch <target> --client <id>` switches only that client. `--global` moves the global target that un-switched clients follow; a bare `ccm switch` is global only outside a `ccm run --proxy` session — inside one it inherits the session's `CCM_CLIENT_ID` and stays client-scoped. `ccm clients` lists the per-client targets.
+Multiple terminals can hold different targets on one proxy (v0.4): each `ccm run --proxy` session carries a client id, and `ccm switch <target> --client <id>` switches only that client. `--global` moves the global target that un-switched clients follow; a bare `ccm switch` is global only outside a `ccm run --proxy` session — inside one it inherits the session's `CCM_CLIENT_ID` and stays client-scoped. `ccm clients` lists the per-client targets. Since v0.5, scoped client targets persist best-effort to `$CCM_HOME/clients.toml` and survive proxy restarts (revalidated against current config at startup, TTL 7 days, LRU cap 256; the per-client request counter resets — `usage.jsonl` is the durable ledger).
 
 ## Control API
 
@@ -629,6 +632,8 @@ ccm history decisions [--since MS] [--until MS] [--model M] [--client ID] [--lim
 ccm history metrics [--limit N]
 ccm history circuit [--model M] [--limit N]
 ccm history cost [--day YYYY-MM-DD] [--client ID]
+ccm advise [--window DAYS] [--min-samples N] [--model M]   (v0.5)
+ccm discover [provider] [--all]                              (v0.5)
 ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
 ccm auth set <provider>
 ccm auth delete <provider>
@@ -675,21 +680,21 @@ The repository pins the stable Rust channel and installs `rustfmt` and `clippy` 
 
 ### Supported release platforms
 
-The v0.4 release target is:
+The v0.5 release target is:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-03
-Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
+Windows  x86_64-pc-windows-msvc     verified 2026-10-10
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-10 (WSL2 Ubuntu 24.04)
 ```
 
-macOS is not claimed as supported for v0.4: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
+macOS is not claimed as supported for v0.5: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
 
 Credential storage is configured per target:
 
 ```text
 Windows → Windows Credential Manager
 Linux   → Linux keyutils + synchronous Secret Service
-macOS   → Apple Keychain (untested; macOS is not a verified v0.4 platform)
+macOS   → Apple Keychain (untested; macOS is not a verified v0.5 platform)
 ```
 
 The Linux keyring backends compile and the credential resolution path is tested with environment credentials; interactive `ccm auth set` against a desktop Secret Service has not been exercised.
@@ -750,6 +755,24 @@ GitHub Actions CI runs the release gate ([.github/workflows/ci.yml](.github/work
   loopback-only listener — request/attempt outcomes, dual-track latency
   (fixed-bucket histogram + EWMA gauge), decision duration, circuit state,
   tokens, and micro-USD cost; `prometheus_enabled` config flag, default on
+- `ccm advise` (v0.5): cost_weight suggestions derived from realized
+  spend in `usage.jsonl` recomputed against the current hand-entered
+  pricing tables — analysis printed, never written back to config
+- persistent client sessions (v0.5): scoped per-client targets survive
+  proxy restarts via best-effort `clients.toml` (TTL 7 days, LRU cap
+  256, revalidated at startup; `persist = false` restores memory-only)
+- `POST /v1/messages/count_tokens` forwarding (v0.5): side-effect-free
+  target resolution, primary-only single attempt, status+body
+  passthrough with a dedicated 10s timeout; openai-compatible primaries
+  answer an honest 404 envelope
+- OTLP/HTTP JSON metrics export (v0.5): the same 12 metric families
+  pushed to a collector (`[observability.otlp]`, cumulative
+  temporality, failed pushes not retried, credentials via
+  `OTEL_EXPORTER_OTLP_HEADERS` env only)
+- `ccm discover` (v0.5): list a gateway's `GET /v1/models` and register
+  selected ids as models — lenient two-shape parsing, skip-not-overwrite
+  on registered pairs, alias collision-suffixing, pricing skeleton
+  printout for the advise journey
 - no mid-stream failover
 
 ## License

@@ -2,7 +2,7 @@
 
 CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
 
-本文是操作手册。架构背景见 [docs/DESIGN.md](DESIGN.md)，v0.4 的规划与逐里程碑落地记录见 [docs/V0.4_PLAN.md](V0.4_PLAN.md)（v0.3 的发布与验证记录见 [docs/V0.3_PLAN.md](V0.3_PLAN.md)）。
+本文是操作手册。架构背景见 [docs/DESIGN.md](DESIGN.md)，v0.5 的规划与逐里程碑落地记录见 [docs/V0.5_PLAN.md](V0.5_PLAN.md)（v0.4/v0.3 的发布与验证记录见 [docs/V0.4_PLAN.md](V0.4_PLAN.md)、[docs/V0.3_PLAN.md](V0.3_PLAN.md)）。
 
 ---
 
@@ -53,8 +53,8 @@ macOS 没有预编译产物（macOS 本就不在支持声明内，见 2.2 末尾
 **完整性校验**（建议）：下载同一发布的 `checksums.txt` 后对照 SHA-256——
 
 ```powershell
-# Windows PowerShell（以 v0.4.0 为例）
-Get-FileHash .\ccm-v0.4.0-x86_64-pc-windows-msvc.exe -Algorithm SHA256
+# Windows PowerShell（以 v0.5.0 为例）
+Get-FileHash .\ccm-v0.5.0-x86_64-pc-windows-msvc.exe -Algorithm SHA256
 ```
 
 ```sh
@@ -70,7 +70,7 @@ grep x86_64-unknown-linux-gnu checksums.txt | sha256sum -c
 # Windows：装进用户程序目录（install.ps1 默认也装这里；确认该目录在用户
 # PATH 里，不在就手动加入——加完需要新开终端）
 mkdir $env:LOCALAPPDATA\Programs\ccm -Force
-Copy-Item .\ccm-v0.4.0-x86_64-pc-windows-msvc.exe $env:LOCALAPPDATA\Programs\ccm\ccm.exe
+Copy-Item .\ccm-v0.5.0-x86_64-pc-windows-msvc.exe $env:LOCALAPPDATA\Programs\ccm\ccm.exe
 ```
 
 ```sh
@@ -120,7 +120,7 @@ cargo build --release
 cp target/release/ccm ~/.local/bin/
 ```
 
-**注意：v0.4 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
+**注意：v0.5 只声称支持 Windows 和 Linux**（Linux 在 WSL2 Ubuntu 24.04 上验证）。macOS 没有可用主机跑验证，**不声称支持**——`install.sh` 是通用 POSIX sh，理论上可跑，但未经确认。
 
 ### 2.3 验证
 
@@ -128,7 +128,7 @@ cp target/release/ccm ~/.local/bin/
 ccm --version
 ```
 
-输出 `ccm 0.4.0`。
+输出 `ccm 0.5.0`。
 
 ---
 
@@ -397,7 +397,7 @@ ccm route=coding-route attempt=2 model=minimax result=HTTP 200
 
 `--bind` 可改监听地址，但**只允许回环地址**（默认 `127.0.0.1:13521`，`[::1]` 也可以；`0.0.0.0`、局域网 IP、`[::]` 一律拒绝），原因见 FAQ。
 
-代理转发 `/v1/messages` 和 `/v1/messages/count_tokens`（v0.5 起转发后者）。v0.5 之前该端点返回 404——实测接近上下文窗口时（约 190k 估算 token）Claude Code 会重试 count_tokens 多达 17 次，这正是转发它的动机。count 请求按当前目标解析（含 scoped 客户端条目，读取无副作用——不刷新计数器与 `last_seen`），只发往**主模型**、单次尝试、不进 fallback，整个上游调用（响应头 + 响应体）受 10 秒超时约束；计数流量对决策、指标、用量统计完全不可见。openai-compatible 主模型没有计数端点，返回 404 Anthropic 错误信封（实测 Claude Code 容忍 404；不做本地估算）。部分网关的 count_tokens 是存根——实测 z.ai 对任意输入返回 `input_tokens:0`，代理原样透传，仅在大请求（>8KiB）收到 0 计数时向 stderr 打一次进程级警告。其余端点（`/v1/models` 等）仍不转发——实测 Claude Code 从不调用 `/v1/models`。
+代理转发 `/v1/messages` 和 `/v1/messages/count_tokens`（v0.5 起转发后者）。v0.5 之前该端点返回 404——实测接近上下文窗口时（约 190k 估算 token）Claude Code 会重试 count_tokens 多达 17 次，这正是转发它的动机。count 请求按当前目标解析（含 scoped 客户端条目，读取无副作用——不刷新计数器与 `last_seen`），只发往**主模型**、单次尝试、不进 fallback，整个上游调用（响应头 + 响应体）受 10 秒超时约束；计数流量对决策、指标、用量统计完全不可见。openai-compatible 主模型没有计数端点，返回 404 Anthropic 错误信封（实测 Claude Code 容忍 404；不做本地估算）。部分网关的 count_tokens 是存根——实测 z.ai 对任意输入返回 `input_tokens:0`，代理原样透传，仅在大请求（>8KiB）收到 0 计数时向 stderr 打一次进程级警告。**近窗口边界（v0.5 发布前 E2E 实测）**：Claude Code 的 "Prompt is too long" 预检门由它自己的本地估算驱动，不咨询服务端计数——同一个超限 body 在 z.ai 存根 0 计数与 minimax 真实计数（约 151k，低于有效窗口）下同样被 1 秒内本地拒绝、从未发送。转发修复的是上下文计量表与 404 重试风暴，**不会**放行被本地估算拒绝的近窗口发送；真被放行的发送若超模型实际上限，溢出仍在发送时由网关报错。其余端点（`/v1/models` 等）仍不转发——实测 Claude Code 从不调用 `/v1/models`。
 
 ### 4.4 `use` vs `switch`（持久默认 vs 运行时切换）
 

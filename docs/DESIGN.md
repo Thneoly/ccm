@@ -756,13 +756,13 @@ failover), and HALF_OPEN probe release on translate failure.
 
 ## 16. Cross-platform Release Target
 
-Target platforms and v0.4 claim status:
+Target platforms and v0.5 claim status:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-03
-Linux    x86_64-unknown-linux-gnu   verified 2026-10-03 (WSL2 Ubuntu 24.04)
-macOS    aarch64-apple-darwin       not claimed for v0.4 (no host to verify)
-macOS    x86_64-apple-darwin        not claimed for v0.4 (no host to verify)
+Windows  x86_64-pc-windows-msvc     verified 2026-10-10
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-10 (WSL2 Ubuntu 24.04)
+macOS    aarch64-apple-darwin       not claimed for v0.5 (no host to verify)
+macOS    x86_64-apple-darwin        not claimed for v0.5 (no host to verify)
 ```
 
 See [docs/V0.3_PLAN.md](V0.3_PLAN.md) §3 for the decision record and macOS re-entry criteria.
