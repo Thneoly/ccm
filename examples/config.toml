@@ -121,6 +121,15 @@ history_enabled = true
 retention_days = 14
 prometheus_enabled = true
 
+# OTLP/HTTP JSON push (v0.5): POST the same 12 metric families to an OTLP
+# collector every interval_secs. Section absent = push entirely off; it is
+# independent of prometheus_enabled (OTLP-on + scrape-off keeps /metrics
+# off). Auth headers, if ever needed, come from the OTEL_EXPORTER_OTLP_
+# HEADERS env var ONLY — never this file.
+# [observability.otlp]
+# endpoint = "http://localhost:4318"
+# interval_secs = 30
+
 # Persistent client sessions (v0.5): scoped `ccm switch --client` targets
 # are written to <CCM_HOME>/clients.toml so they survive proxy restarts.
 # All defaults — persist = false restores v0.4 memory-only semantics.

@@ -372,7 +372,47 @@ The same counters are exported in the Prometheus text format at
 `GET /metrics` on the proxy's ONE listener — the loopback bind guard covers
 it; there is no second port. Hand-rendered exposition (~150 lines), no
 exporter crate. `[observability] prometheus_enabled = false` (default true)
-removes the route entirely.
+removes the `/metrics` ROUTE entirely. Since v0.5 M4 the route is keyed on
+`prometheus_enabled` ALONE, while the exporter state behind it exists
+whenever EITHER export surface is on — an OTLP-only proxy (push on, scrape
+off) keeps the counters alive for its push loop with the route still
+unregistered.
+
+### OTLP/HTTP JSON push export (v0.5 M4)
+
+The second exit for the same counters: `src/otlp.rs` (the
+dependency-discipline extension of `prometheus.rs` — hand-rolled
+ExportMetricsServiceRequest JSON, zero new dependencies) renders the very
+same `Snapshot` the `/metrics` handler serves — `assemble_snapshot` in
+`control/api.rs` is the ONE shared input, so the two surfaces cannot
+disagree — and a `serve()` push task POSTs it to
+`{[observability.otlp].endpoint}/v1/metrics` (application/json) every
+`interval_secs` (default 30; section absent = entirely off).
+
+Wire shape: resource attributes `service.name=ccm`, `service.version`, and
+`service.instance.id` = a stable 16-hex FNV-1a hash of `CCM_HOME`
+(distinguishes multiple homes pushing to one collector without leaking the
+path); counters → monotonic CUMULATIVE integer sums (int64 as decimal
+strings per the protobuf JSON mapping); gauges → `asDouble`; the two
+histograms → 11 `explicitBounds` in SECONDS and 12 per-bucket DELTA
+`bucketCounts`, differenced from PromState's cumulative buckets (whose +Inf
+bucket is the histogram `count`). Same honesty rules as the text format:
+non-finite cost emits no point, EWMA only after the first sample, and count
+traffic stays invisible to every family (the M3 boundary — an SRE dashboard
+under-counts requests relative to upstream bills).
+
+Failure isolation: CUMULATIVE temporality means every interval re-sends the
+full state — a failed POST is not retried (nothing is lost) and failures
+throttle-warn to stderr. The push client is dedicated and timeout-bounded
+(3s connect / 5s total, the control-CLI precedent) so a stuck collector
+never accumulates stuck tasks. Push failure can never affect routing: the
+loop only reads state through `assemble_snapshot`. Credentials boundary
+(invariant 1): the payload carries metric names, label values, and counts
+only; collector auth headers, if ever needed, come from the
+`OTEL_EXPORTER_OTLP_HEADERS` env var ONLY — never config.toml, never
+logged, never in the payload. Metrics-only by design — traces stay out
+(they would need new JSONL fields and duplicate what `decisions.jsonl`
+already persists).
 
 Families:
 
@@ -552,7 +592,9 @@ POST /_ccm/switch/{target}
 `GET /metrics` (v0.4 M7) serves the Prometheus text exposition
 (`text/plain; version=0.0.4`) on this same listener — the loopback-only
 bind guard covers it; see §8 for the families. `[observability]
-prometheus_enabled = false` unregisters the route (404).
+prometheus_enabled = false` unregisters the route (404). The OTLP push
+loop (v0.5 M4, §8) shares the same exporter state but adds no listener —
+it is outbound-only and gated on `[observability.otlp]`, not on this route.
 
 The data-plane forward routes share the listener: `POST /v1/messages`
 (the full routing pipeline) and `POST /v1/messages/count_tokens`
@@ -622,6 +664,7 @@ src/history_cli.rs `ccm history` offline presentation
 src/usage.rs       usage scanner + UsageRecord + cost aggregation (v0.4 M6)
 src/date.rs        UTC calendar-day math for the cost views (Hinnant)
 src/prometheus.rs  hand-rendered text-format exporter: counters + render (v0.4 M7)
+src/otlp.rs        hand-rolled OTLP/HTTP JSON push: render_otel + push_once (v0.5 M4)
 src/doctor.rs      local environment diagnosis
 src/translate.rs   pure anthropic<->openai translation engine (no IO)
 src/proxy.rs       forward() + HTTP path + mock integration tests

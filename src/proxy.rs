@@ -79,10 +79,16 @@ pub(crate) struct ProxyState {
     /// inside `poll_next`/`Drop` on the response body, where awaiting is
     /// impossible.
     pub(crate) usage: Arc<Mutex<VecDeque<UsageRecord>>>,
-    /// Prometheus exporter state (v0.4 M7). `None` = `prometheus_enabled =
-    /// false` — the `/metrics` route is then not registered and every hook
-    /// above is a no-op, mirroring how a disabled `History` works.
+    /// Prometheus exporter state (v0.4 M7; the OTLP push loop shares it
+    /// since v0.5 M4). `None` = both exports off — every hook above is a
+    /// no-op, mirroring how a disabled `History` works. The `/metrics`
+    /// ROUTE is keyed on [`Self::prom_route`] alone, not on this field: an
+    /// OTLP-only proxy (push on, scrape off) keeps this state alive for
+    /// its push loop while the route stays unregistered.
     pub(crate) prom: Option<Arc<crate::prometheus::PromState>>,
+    /// Whether the `/metrics` scrape route is registered (v0.5 M4):
+    /// `prometheus_enabled` alone — deliberately NOT `prom.is_some()`.
+    pub(crate) prom_route: bool,
 }
 
 /// One client's runtime switch state. `requests` / `last_seen_ms` are usage
@@ -148,9 +154,20 @@ pub async fn serve(bind: &str) -> Result<()> {
 
     // Pin the process-start gauge before the listener exists (v0.4 M7).
     crate::prometheus::note_process_start();
-    let prom = observability
-        .prometheus_enabled
+    // Exporter state exists when EITHER export surface is on (v0.5 M4): the
+    // OTLP push loop renders from the same PromState the /metrics handler
+    // serves. The ROUTE registration stays keyed on prometheus_enabled
+    // alone (see ProxyState::prom_route) — OTLP-on + scrape-off keeps the
+    // route off.
+    let prom = (observability.prometheus_enabled || observability.otlp.is_some())
         .then(|| Arc::new(crate::prometheus::PromState::new()));
+    if let Some(otlp) = &observability.otlp {
+        println!(
+            "OTLP: pushing metrics to {} every {}s",
+            crate::otlp::metrics_url(&otlp.endpoint),
+            otlp.interval_secs
+        );
+    }
 
     // Persistent client sessions (v0.5 M2): load BEFORE the state exists so
     // restored entries seed the map. Every problem degrades to a dropped
@@ -186,6 +203,7 @@ pub async fn serve(bind: &str) -> Result<()> {
             crate::usage::USAGE_CAPACITY,
         ))),
         prom,
+        prom_route: observability.prometheus_enabled,
     };
 
     // Periodic whole-state metric snapshots (v0.4 M5). Skipped while the
@@ -245,6 +263,70 @@ pub async fn serve(bind: &str) -> Result<()> {
                 }
             }
         });
+    }
+
+    // OTLP/HTTP JSON push (v0.5 M4): every interval, render the SAME
+    // snapshot the /metrics handler serves (assemble_snapshot is the one
+    // shared input) and POST it to `{endpoint}/v1/metrics` on a dedicated
+    // timeout-bounded client. Cumulative temporality means a failed POST
+    // is never retried — the next interval re-sends the full state — so
+    // failures only throttle-warn. No idle-skip, unlike the history
+    // snapshot task: an idle proxy still reports `ccm_up` and its
+    // process-start gauge. Otherwise the metrics-snapshot task's
+    // conventions: config read once at startup, throttled warn-on-failure,
+    // no exit-time claims. Auth headers come from
+    // `OTEL_EXPORTER_OTLP_HEADERS` env ONLY — never config, never logged.
+    if let Some(otlp) = observability.otlp.clone() {
+        match crate::otlp::push_client() {
+            Ok(client) => {
+                let headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
+                    .map(|raw| crate::otlp::headers_from_env(&raw))
+                    .unwrap_or_default();
+                let resource = crate::otlp::OtlpResource::for_this_process();
+                let push_state = state.clone();
+                let interval = Duration::from_secs(otlp.interval_secs);
+                tokio::spawn(async move {
+                    let mut warned = false;
+                    loop {
+                        sleep(interval).await;
+                        let Some(snapshot) =
+                            crate::control::api::assemble_snapshot(&push_state).await
+                        else {
+                            // Unreachable while this task exists (prom state
+                            // is constructed whenever otlp is configured);
+                            // kept honest anyway.
+                            if !warned {
+                                eprintln!("ccm: OTLP push skipped: exporter state unavailable");
+                                warned = true;
+                            }
+                            continue;
+                        };
+                        match crate::otlp::push_once(
+                            &client,
+                            &otlp.endpoint,
+                            &headers,
+                            &snapshot,
+                            &resource,
+                            now_ms(),
+                        )
+                        .await
+                        {
+                            Ok(()) => warned = false,
+                            Err(err) => {
+                                if !warned {
+                                    eprintln!(
+                                        "ccm: OTLP push to {} failed: {err:#} (warning shown once per failure streak)",
+                                        crate::otlp::metrics_url(&otlp.endpoint)
+                                    );
+                                    warned = true;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            Err(err) => eprintln!("ccm: OTLP push disabled: {err:#}"),
+        }
     }
 
     let app = control_router(state);
@@ -1554,6 +1636,10 @@ mod tests {
             // Exporter on in the integration harness so /metrics and the
             // request hooks are exercised by the wire-level tests.
             prom: Some(Arc::new(crate::prometheus::PromState::new())),
+            // Scrape route follows exporter presence in the default
+            // harness; the OTLP-on + scrape-off shape constructs its own
+            // state (prom alive, route off).
+            prom_route: true,
         }
     }
 
@@ -3494,6 +3580,7 @@ model_id = "upstream-y"
                 crate::usage::USAGE_CAPACITY,
             ))),
             prom: Some(Arc::new(crate::prometheus::PromState::new())),
+            prom_route: true,
         };
 
         let (primary_addr, primary, primary_task) = spawn_mock(MockBehavior::OkStream).await;
@@ -3868,9 +3955,12 @@ model_id = "upstream-y"
         router_task.abort();
 
         // 3. disabled exporter: the route is not registered — 404, the
-        //    documented off state for `prometheus_enabled = false`.
+        //    documented off state for `prometheus_enabled = false`. Since
+        //    v0.5 M4 the route keys on `prom_route`, so BOTH the exporter
+        //    state and the flag must be off for this shape.
         let mut disabled = state.clone();
         disabled.prom = None;
+        disabled.prom_route = false;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router_task = tokio::spawn(async move {
@@ -3880,6 +3970,32 @@ model_id = "upstream-y"
         });
         let response = http.get(format!("{base}/metrics")).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        router_task.abort();
+
+        // 4. OTLP-on + scrape-off (v0.5 M4): exporter state ALIVE (the push
+        //    loop needs it) but the route stays keyed off — the plan's
+        //    decoupling, pinned at the wire.
+        let mut push_only = state.clone();
+        push_only.prom_route = false;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router_task = tokio::spawn(async move {
+            axum::serve(listener, control_router(push_only))
+                .await
+                .unwrap();
+        });
+        let response = http.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "scrape stays off");
+        let response = http
+            .get(format!("{base}/_ccm/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "control views unaffected"
+        );
         router_task.abort();
 
         primary_task.abort();

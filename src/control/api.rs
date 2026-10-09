@@ -232,13 +232,16 @@ pub(crate) fn control_router(state: ProxyState) -> Router {
         // Auxiliary Anthropic endpoint (v0.5 M3): registered with `any` so
         // the handler itself mirrors /v1/messages's 405 for non-POSTs.
         .route("/v1/messages/count_tokens", any(forward_count_tokens));
-    // The exporter route exists only when the exporter is on (v0.4 M7):
+    // The exporter route exists only when the SCRAPE side is on (v0.4 M7):
     // `prometheus_enabled = false` removes `/metrics` from the listener
-    // entirely. It shares the ONE guarded listener — no second port
+    // entirely. OTLP push (v0.5 M4) is deliberately NOT this gate — an
+    // OTLP-only proxy keeps PromState alive for the push loop while this
+    // route stays off. It shares the ONE guarded listener — no second port
     // (invariant 11).
-    let router = match state.prom {
-        Some(_) => router.route("/metrics", get(control_metrics_exposition)),
-        None => router,
+    let router = if state.prom_route {
+        router.route("/metrics", get(control_metrics_exposition))
+    } else {
+        router
     };
     router.with_state(state)
 }
@@ -376,21 +379,13 @@ async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetri
     Json(views)
 }
 
-/// `GET /metrics` — the Prometheus text exposition (v0.4 M7), hand-rendered
-/// from a snapshot of the exporter counters plus the runtime views the
-/// `/_ccm` endpoints serve (attempts derive from the same per-model metrics
-/// map, so the two surfaces agree on every SETTLED attempt; an attempt
-/// still in flight exists only in `/_ccm/metrics`, as it always has).
-/// Content type per the text format 0.0.4 convention.
-pub(crate) async fn control_metrics_exposition(State(state): State<ProxyState>) -> Response<Body> {
-    let Some(prom) = state.prom.as_deref() else {
-        // Unreachable through the router (the route is registered only when
-        // the exporter exists); kept honest for direct calls.
-        return control_error(
-            StatusCode::NOT_FOUND,
-            anyhow::anyhow!("metrics export disabled"),
-        );
-    };
+/// Assemble the render-side [`crate::prometheus::Snapshot`] from the proxy
+/// state — the ONE shared input of both export surfaces (v0.5 M4): the
+/// `/metrics` text handler and the OTLP push loop render the same snapshot,
+/// so the two cannot disagree. `None` when no exporter state exists (the
+/// both-exports-off case; handlers treat it as disabled).
+pub(crate) async fn assemble_snapshot(state: &ProxyState) -> Option<crate::prometheus::Snapshot> {
+    let prom = state.prom.as_deref()?;
     let now = now_ms();
     let mut models: Vec<(String, ModelMetrics)> = state
         .metrics
@@ -421,13 +416,31 @@ pub(crate) async fn control_metrics_exposition(State(state): State<ProxyState>) 
         .collect();
     circuits.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let text = crate::prometheus::render(&crate::prometheus::Snapshot {
+    Some(crate::prometheus::Snapshot {
         process_start_seconds: crate::prometheus::process_start_seconds(),
         history_dropped: state.history.dropped_count(),
         prom: prom.snapshot(),
         models,
         circuits,
-    });
+    })
+}
+
+/// `GET /metrics` — the Prometheus text exposition (v0.4 M7), hand-rendered
+/// from a snapshot of the exporter counters plus the runtime views the
+/// `/_ccm` endpoints serve (attempts derive from the same per-model metrics
+/// map, so the two surfaces agree on every SETTLED attempt; an attempt
+/// still in flight exists only in `/_ccm/metrics`, as it always has).
+/// Content type per the text format 0.0.4 convention.
+pub(crate) async fn control_metrics_exposition(State(state): State<ProxyState>) -> Response<Body> {
+    let Some(snapshot) = assemble_snapshot(&state).await else {
+        // Unreachable through the router (the route is registered only when
+        // the scrape exporter exists); kept honest for direct calls.
+        return control_error(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("metrics export disabled"),
+        );
+    };
+    let text = crate::prometheus::render(&snapshot);
     (
         [(
             axum::http::header::CONTENT_TYPE,

@@ -78,6 +78,11 @@ pub struct ObservabilityConfig {
     /// already covers it; this knob exists for owners who want nothing
     /// exported at all.
     pub prometheus_enabled: bool,
+    /// OTLP/HTTP JSON push export (v0.5 M4). Section absent = entirely
+    /// off; independent of `prometheus_enabled` (push-on + scrape-off
+    /// keeps `/metrics` off). Auth headers, if ever needed, come from the
+    /// `OTEL_EXPORTER_OTLP_HEADERS` env var ONLY — never this file.
+    pub otlp: Option<OtlpConfig>,
 }
 
 impl Default for ObservabilityConfig {
@@ -89,8 +94,24 @@ impl Default for ObservabilityConfig {
             max_bytes_per_file: 8 * 1024 * 1024,
             metrics_snapshot_interval_secs: 30,
             prometheus_enabled: true,
+            otlp: None,
         }
     }
+}
+
+/// `[observability.otlp]` — the OTLP/HTTP JSON push receiver (v0.5 M4).
+/// `endpoint` is the collector base URL (e.g. `http://localhost:4318`);
+/// `/v1/metrics` is appended at push time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtlpConfig {
+    pub endpoint: String,
+    /// Push interval; must be > 0.
+    #[serde(default = "default_otlp_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_otlp_interval_secs() -> u64 {
+    30
 }
 
 impl AppConfig {
@@ -262,6 +283,14 @@ impl AppConfig {
         }
         if observability.metrics_snapshot_interval_secs == 0 {
             bail!("[observability] metrics_snapshot_interval_secs must be greater than 0");
+        }
+        if let Some(otlp) = &observability.otlp {
+            if otlp.endpoint.trim().is_empty() {
+                bail!("[observability.otlp] endpoint must not be empty");
+            }
+            if otlp.interval_secs == 0 {
+                bail!("[observability.otlp] interval_secs must be greater than 0");
+            }
         }
         Ok(())
     }

@@ -703,6 +703,10 @@ max_records_per_file = 50000
 max_bytes_per_file = 8388608      # 8 MiB
 metrics_snapshot_interval_secs = 30
 prometheus_enabled = true         # 关掉后 /metrics 路由整个不存在（404）
+
+# [observability.otlp]            # v0.5：OTLP/HTTP JSON 主动推送（节缺省 = 关闭，见 6.7）
+# endpoint = "http://localhost:4318"
+# interval_secs = 30
 ```
 
 `ccm doctor` 增加一行历史目录状态：`✓ history: N file(s) at <dir>`，目录为空或已禁用时是 `!` 提示（非致命）。
@@ -811,6 +815,22 @@ cost_weight = 0.632
 
 边界（每份报告都会原样打印）：per-token 数字混合各家上游自己的 tokenizer，**跨协议家族不可比**；usage 只记实际被路由到的流量，路由从没选过的模型在这里没有数据（选择偏差）；这是按手填单价做的代理侧计量，**不是账单真相**；`quality_weight` 保持手工——代理可见信号里没有诚实的推导路径。
 
+### 6.7 OTLP 推送导出（v0.5 M4）
+
+不想为一台代理单独跑 Prometheus 抓取时，可以让 ccm 主动把同一套指标推给任何 OTLP/HTTP JSON 收集器（otelcol、Grafana Alloy、SigNoz 等，默认接收端口 4318）：
+
+```toml
+[observability.otlp]
+endpoint = "http://localhost:4318"   # 收集器地址；/v1/metrics 由 ccm 拼接（恰好一次）
+interval_secs = 30                    # 推送间隔，默认 30
+```
+
+- **同一份状态、两个出口**：推送循环与 `/metrics`（6.5）渲染完全相同的 12 个指标族快照，两个观测面不会打架。`[observability.otlp]` 与 `prometheus_enabled` 相互独立——只开推送时 `/metrics` 路由仍然关闭（404），只开抓取时没有任何推送。
+- **口径与边界同 6.5**：token/成本只统计被接受的 2xx 响应、代理侧计量、不能对账；count_tokens 流量对所有指标族不可见（SRE 面板会低估请求数）。直方图按 OTLP 规范输出 11 个秒制桶界 + 12 个桶增量，计数器为 CUMULATIVE 累计语义（累计值随推送全量重发，重启归零由收集器侧按 counter 语义处理）。
+- **失败隔离**：每次推送都是全量重发，失败的 POST **不重试**——只按失败连击向 stderr 打一条警告，下个周期自然补齐；收集器挂掉完全不影响代理路由。推送客户端自带 3s 连接 / 5s 总超时，卡住的收集器不会堆积卡住的任务。
+- **凭据边界**：负载里只有指标名、标签值和计数。收集器若要认证头，用标准环境变量 `OTEL_EXPORTER_OTLP_HEADERS`（`k1=v1,k2=v2` 形式，代理启动时读取一次）——**永不写入 config.toml、永不打印、永不进负载**。
+- `service.instance.id` 是 `CCM_HOME` 路径的稳定 16 位哈希：多个 ccm 实例推给同一收集器时可以区分，且哈希不泄漏原始路径。
+
 ---
 
 ## 7. 凭据与环境
@@ -845,6 +865,7 @@ keyring 条目：service 名固定为 `ccm`，条目名 = provider 名。Windows
 | `CCM_HOME` | 重定位 `config.toml` 和 `state.toml`（默认 `~/.ccm`） |
 | `CCM_PROXY_URL` | `ccm switch` / `ccm clients` 的默认代理地址（`--proxy-url` flag 可覆盖；最终默认 `http://127.0.0.1:13521`。注意 `ccm run --proxy` 不读它，只认 `--proxy-url` flag）；代理模式下会传给 claude 子进程 |
 | `CCM_CLIENT_ID` | `ccm switch` / `ccm run --proxy` 的默认 client id（`--client` flag 可覆盖；`switch` 里 `--global` 优先于它）；代理模式下会传给 claude 子进程，会话内 `/switch` 靠它保持本会话作用域（见 4.6） |
+| `OTEL_EXPORTER_OTLP_HEADERS` | OTLP 推送的收集器认证头（`k1=v1,k2=v2`，仅 `[observability.otlp]` 开启时读取；见 6.7。只认环境变量——凭据永不入 config.toml） |
 
 ### 7.4 无头场景（CI / 容器）
 
@@ -946,6 +967,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `CCM_HOME` | 重定位 config.toml / state.toml |
 | `CCM_PROXY_URL` | switch / clients 的默认代理地址（run --proxy 只认 `--proxy-url` flag）；代理模式下传给 claude |
 | `CCM_CLIENT_ID` | switch / run --proxy 的默认 client id；代理模式下传给 claude（`/switch` 靠它保持会话作用域） |
+| `OTEL_EXPORTER_OTLP_HEADERS` | OTLP 推送收集器认证头（仅环境变量，见 6.7） |
 | `CCM_<PROVIDER>_API_KEY` | provider 凭据（优先于 keyring），如 `CCM_ZAI_API_KEY` |
 
 | 文件 / 端点 | 说明 |

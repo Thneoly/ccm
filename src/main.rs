@@ -13,6 +13,7 @@ mod integrate;
 mod launcher;
 mod manage;
 mod model;
+mod otlp;
 mod prometheus;
 mod provider;
 mod proxy;

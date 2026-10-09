@@ -50,7 +50,7 @@ pub(crate) fn process_start_seconds() -> u64 {
 /// Fixed histogram upper bounds, milliseconds, shared by both histograms.
 /// Coarse on purpose: enough resolution for header-latency and
 /// decision-duration questions at a glance, tiny cardinality in memory.
-const BUCKETS_MS: [f64; 11] = [
+pub(crate) const BUCKETS_MS: [f64; 11] = [
     5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
 ];
 
@@ -87,8 +87,21 @@ impl Histogram {
         }
     }
 
-    fn bucket(&self, index: usize) -> u64 {
+    /// Cumulative count of observations `<= BUCKETS_MS[index]`. Read by the
+    /// OTLP renderer (v0.5 M4), which differences consecutive buckets into
+    /// the per-bucket deltas the OTLP wire format wants.
+    pub(crate) fn bucket(&self, index: usize) -> u64 {
         self.buckets.get(index).copied().unwrap_or(0)
+    }
+
+    /// The `+Inf` bucket: total observations.
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Total of observed values, milliseconds.
+    pub(crate) fn sum_ms(&self) -> f64 {
+        self.sum_ms
     }
 }
 
