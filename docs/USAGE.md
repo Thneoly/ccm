@@ -18,12 +18,14 @@ CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方
 
 另有 **profile**（模型别名，如 `coding` → `claude`）：凡是接受模型名的命令也接受 profile 名。
 
-三类数据的存放位置——理解这个划分能解释 90% 的"为什么找不到"：
+数据的存放位置——理解这个划分能解释 90% 的"为什么找不到"：
 
 | 位置 | 存什么 | 路径 / 形式 |
 |---|---|---|
 | `config.toml` | 声明式配置：providers、models、profiles、routes | `$CCM_HOME/config.toml`，默认 `~/.ccm/config.toml` |
 | `state.toml` | 只有一项 `current`：持久化的默认目标 | `$CCM_HOME/state.toml`，默认 `~/.ccm/state.toml` |
+| `clients.toml` | 客户端会话：scoped 条目的 id / target / last_seen_ms（只由代理写，v0.5） | `$CCM_HOME/clients.toml` |
+| `history/` | 观测历史 JSONL：decisions / metrics / circuit / usage（v0.4） | `$CCM_HOME/history/`，见 6.3 |
 | 系统凭据管理器 | 各 provider 的 API key，**永不写入任何文件** | Windows 凭据管理器（service 名为 `ccm`，条目名 = provider 名，如 `LegacyGeneric:target=zai.ccm`）；也可用环境变量 |
 
 两个直接推论：
@@ -310,6 +312,7 @@ ccm proxy
 
 ```text
 History: C:\Users\you\.ccm\history (decisions, metric snapshots, circuit transitions)
+Clients: 0 persisted session(s) from C:\Users\you\.ccm\clients.toml
 CCM proxy listening on http://127.0.0.1:13521
 Claude Code base URL: http://127.0.0.1:13521
 Runtime switch: `ccm switch <model-or-profile-or-route>`.
@@ -344,15 +347,15 @@ ccm route=coding-route attempt=2 model=minimax result=HTTP 200
 
 | | `ccm use <target>` | `ccm switch <target>` |
 |---|---|---|
-| 改什么 | state.toml 的 `current`（持久默认） | 运行中代理的内存目标 |
+| 改什么 | state.toml 的 `current`（持久默认） | 全局：运行中代理的内存目标；`--client <id>`：该客户端条目（v0.5 起持久化到 clients.toml，跨重启） |
 | 是否要求代理在运行 | 否 | 是（否则 `failed to contact CCM proxy control API`） |
-| 生效范围 | 之后的 `ccm run`、下次 `ccm proxy` 启动、`ccm doctor` 等 | 仅当前代理进程 |
+| 生效范围 | 之后的 `ccm run`、下次 `ccm proxy` 启动、`ccm doctor` 等 | 全局目标仅当前代理进程；scoped 客户端条目持久化（TTL 7 天） |
 | 客户端作用域 | — | 默认全局；`--client <id>` 只切该客户端的运行时目标 |
 | 输出 | `Selected {target} as persisted default` | 全局：`Runtime target switched to {target}`；客户端：`Runtime target for client {id} switched to {target}` |
 
 两者都接受模型 / profile / 路由名（解析顺序：路由 → 模型 → profile）。`switch` 的代理地址解析顺序：`--proxy-url` flag > `CCM_PROXY_URL` 环境变量 > `http://127.0.0.1:13521`。
 
-`switch` 的客户端作用域（v0.4）：id 解析顺序 `--client` > `CCM_CLIENT_ID` 环境变量 > 全局；`--global` 强制切全局（即使设了 `CCM_CLIENT_ID`）。ccm 代理模式启动的 claude 会话继承 `CCM_CLIENT_ID`，所以会话内 `/switch` 自动只切本会话（见 4.5 / 4.6）。从未被 scoped switch 过的客户端跟随全局目标；客户端条目只在内存里，代理重启即回全局（runtime-only，不碰 state.toml）。client id 字符集 `[A-Za-z0-9._-]{1,64}`，非法值在发出请求前就报 `invalid client id ...: must be 1-64 characters of [A-Za-z0-9._-]`（与代理侧校验同一条消息）。
+`switch` 的客户端作用域（v0.4；v0.5 起持久化）：id 解析顺序 `--client` > `CCM_CLIENT_ID` 环境变量 > 全局；`--global` 强制切全局（即使设了 `CCM_CLIENT_ID`）。ccm 代理模式启动的 claude 会话继承 `CCM_CLIENT_ID`，所以会话内 `/switch` 自动只切本会话（见 4.5 / 4.6）。从未被 scoped switch 过的客户端跟随全局目标；被切过的客户端条目**持久化到 `$CCM_HOME/clients.toml`**（v0.5 M2，只存 id / target / last_seen_ms），代理重启后自动恢复——重启时逐条对照当前 config 校验，目标已不存在的条目丢弃并打一条警告。全局切换仍然 runtime-only（不碰 state.toml）。client id 字符集 `[A-Za-z0-9._-]{1,64}`，非法值在发出请求前就报 `invalid client id ...: must be 1-64 characters of [A-Za-z0-9._-]`（与代理侧校验同一条消息）。
 
 ### 4.5 集成 Claude Code 的 `/switch`
 
@@ -409,13 +412,15 @@ ccm switch glm --global
 - **id 解析顺序**：`ccm switch` 为 `--client` > `CCM_CLIENT_ID` 环境变量 > 全局，`--global` 强制全局；`ccm run --proxy` 为 `--client` > `CCM_CLIENT_ID` > 随机短 id。id 字符集 `[A-Za-z0-9._-]{1,64}`，非法值直接报错。
 - **`ccm run --proxy <target>` 的预切换严格只作用于本会话的 client id**，永不改全局目标。
 - **`/switch` 自动按会话隔离**：skill 里执行的就是 `ccm switch`，它继承该会话的 `CCM_CLIENT_ID`，所以只切本会话。
-- 从未被 scoped switch 过的客户端跟随全局目标（不报错、不产生条目）；客户端条目只在内存里，代理重启后全部回到全局（switch 是 runtime-only，state.toml 不受影响）。
-- **查看**：`ccm clients`（或 `GET /_ccm/clients`）列出各客户端的 target / 请求计数；`/_ccm/status`、`/_ccm/traces`、`/_ccm/decisions` 支持 `?client=<id>` 过滤。
+- **条目跨重启持久**（v0.5 M2）：scoped 条目落 `$CCM_HOME/clients.toml`（只存 id / target / last_seen_ms；`requests` 计数器重启归零——按会话记账看 `ccm history cost --client <id>`）。重启时逐条对照当前 config：目标已不存在的条目丢弃并打一条警告；超过 7 天没流量的条目按 TTL 丢弃；条目上限 256，超出按最久未见淘汰。`[clients] persist = false` 恢复 v0.4 的纯内存语义。
+- **查看**：`ccm clients`（或 `GET /_ccm/clients`）列出各客户端的 target / 请求计数 / last_seen；`/_ccm/status`、`/_ccm/traces`、`/_ccm/decisions` 支持 `?client=<id>` 过滤。
 - 熔断 / 指标 / decisions 仍是**模型级共享**的：某个上游模型挂了，对所有客户端一起生效（同一上游、同一凭据）。
 - **client id 不是认证**：本地任何进程都能伪造任意 id（或裸用别人的 id），它与未鉴权的控制 API 同属回环信任域，不能当安全边界用。
 - claude < 2.1.227 不支持 `ANTHROPIC_CUSTOM_HEADERS`，客户端身份走 `ccm-local-<id>` token 通道，效果等价（`ccm doctor` 会提示版本）。
 
 **仍然可用：双代理双端口**（v0.3 的老办法，现在一般不再需要）——两个 `ccm proxy --bind 127.0.0.1:135xx` 各自独立的内存目标 / 熔断 / 指标，用 `--proxy-url` 区分。缺点依旧：电路、指标、decisions 全部割裂，还要占两个端口。
+
+> **两个代理共用一个 `CCM_HOME` 的边界**（三个文件、三种答案）：`history/.lock` 是 OS 文件锁——第二个代理写不了历史，自动降级（路由不受影响）；`state.toml` 没有锁，稳态下代理不写它（写入者是 `ccm use` 和 `ccm init`；唯一的例外是 pre-v0.4 配置首次加载时的一次性 legacy 迁移——顶层 `current` 被搬进 `state.toml`，任何命令包括代理启动都可能触发这一次）；`clients.toml` 没有锁、**后写者赢**——两个代理都会持久化自己的条目快照，互相覆盖。要用双代理就用双端口 + 各自的 `CCM_HOME`，别共享。
 
 **备选：直连模式**——两个终端各跑 `ccm run claude` / `ccm run glm`，独立进程独立环境变量。代价是没有 fallback / 熔断 / 观测，且 openai-compatible 模型不可直连（见 4.2）。
 
@@ -593,7 +598,7 @@ fallback = ["glm"]
 | `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3）；`?limit=` 限制返回条数、保留最新 N（内存/磁盘两条路径都生效，磁盘查询缺省 1000），无运行中的 history 存储时该组合返回 400 |
 | `GET /_ccm/usage` | 最近 100 条使用量记录（见 6.4）；过滤参数与 `/_ccm/decisions` 完全一致（`?client=` / `?since=&until=&model=` / `?limit=`，无 history 存储时过滤查询同样 400） |
 | `GET /_ccm/cost` | 按 UTC 日聚合的使用量与成本（见 6.4）：`?day=YYYY-MM-DD`（缺省今天），`?client=<id>` 缩小到该客户端；始终读磁盘历史，无 history 存储时 400 |
-| `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，代理重启清零） |
+| `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，v0.5 起持久化到 clients.toml 跨重启恢复，requests 计数重启归零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
 
@@ -922,7 +927,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm auth delete <provider>` | 删除 keyring 条目 | — |
 | `ccm use <target>` | 设持久默认（写 state.toml） | — |
 | `ccm switch <target>` | 运行时切换代理目标（全局或某客户端） | `--proxy-url`（`CCM_PROXY_URL` > `http://127.0.0.1:13521`）、`--client <id>`（`CCM_CLIENT_ID` > 全局）、`--global`（强制全局，与 `--client` 互斥） |
-| `ccm clients` | 列出代理各客户端的运行时目标与请求计数 | `--proxy-url`（同 `switch`） |
+| `ccm clients` | 列出代理各客户端的运行时目标、请求计数与 last_seen | `--proxy-url`（同 `switch`） |
 | `ccm history decisions` | 离线查看持久化决策（JSONL，旧→新） | `--since`、`--until`（unix-ms，含边界）、`--model`、`--client`、`--limit`（保留最新 N，N ≥ 1） |
 | `ccm history metrics` | 离线查看指标快照表格（默认最新一条） | `--limit`（N ≥ 1） |
 | `ccm history circuit` | 离线查看熔断转换（UTC 时间表） | `--model`、`--limit`（N ≥ 1） |
@@ -946,6 +951,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | 文件 / 端点 | 说明 |
 |---|---|
 | `~/.ccm/config.toml`、`~/.ccm/state.toml` | 声明式配置 / 持久默认（可用 `CCM_HOME` 重定位） |
+| `~/.ccm/clients.toml` | 客户端会话持久化：scoped 条目的 id / target / last_seen_ms，只由代理写入（见 4.6；`[clients] persist = false` 关闭） |
 | `~/.ccm/history/` | 观测历史 JSONL：decisions / metrics / circuit / usage（见 6.3、6.4；`CCM_HOME` 同样生效） |
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
 | `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |

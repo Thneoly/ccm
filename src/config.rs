@@ -28,6 +28,37 @@ pub struct AppConfig {
     pub legacy_current: Option<String>,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Persistent client sessions (v0.5 M2). Runtime state, so top-level
+    /// per the config-placement convention — telemetry stays under
+    /// `[observability]`.
+    #[serde(default)]
+    pub clients: ClientsConfig,
+}
+
+/// `[clients]` — persistent client sessions (v0.5 M2). All fields carry
+/// serde defaults, so a config.toml written before v0.5 loads unchanged
+/// with persistence ON; `persist = false` restores v0.4 memory-only
+/// semantics exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientsConfig {
+    /// Persist scoped client targets to `$CCM_HOME/clients.toml` so they
+    /// survive proxy restarts.
+    pub persist: bool,
+    /// Entries older than this (by `last_seen_ms`) are dropped at load.
+    pub ttl_days: u64,
+    /// LRU cap on the in-memory map, enforced at insert and load.
+    pub max_entries: u64,
+}
+
+impl Default for ClientsConfig {
+    fn default() -> Self {
+        Self {
+            persist: true,
+            ttl_days: 7,
+            max_entries: 256,
+        }
+    }
 }
 
 /// `[observability]` — history persistence and export knobs (v0.4 M5/M7).
@@ -167,6 +198,7 @@ impl AppConfig {
             routes,
             legacy_current: None,
             observability: ObservabilityConfig::default(),
+            clients: ClientsConfig::default(),
         }
     }
 
@@ -196,7 +228,22 @@ impl AppConfig {
         let config: AppConfig = toml::from_str(&raw).context("invalid TOML configuration")?;
         config.validate_observability()?;
         config.validate_model_pricing()?;
+        config.validate_clients()?;
         Ok(config)
+    }
+
+    /// `[clients]` sanity (v0.5 M2): a zero TTL would drop every entry at
+    /// load, a zero cap would evict every entry at insert — both are
+    /// configuration errors rather than silent no-ops (the
+    /// `validate_observability` family).
+    pub fn validate_clients(&self) -> Result<()> {
+        if self.clients.ttl_days == 0 {
+            bail!("[clients] ttl_days must be greater than 0");
+        }
+        if self.clients.max_entries == 0 {
+            bail!("[clients] max_entries must be greater than 0");
+        }
+        Ok(())
     }
 
     /// `[observability]` sanity: zero thresholds would disable rotation or
@@ -427,6 +474,37 @@ base_url = "https://api.anthropic.com"
 
         let serialized = toml::to_string(&config).unwrap();
         assert!(!serialized.contains("current ="));
+    }
+
+    #[test]
+    fn clients_defaults_and_validation() {
+        // a config written before v0.5 has no [clients] section: it loads
+        // with persistence ON (ttl 7 days, cap 256) — sessions surviving a
+        // restart is the fix v0.5 ships, so it must not require a config edit
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert!(config.clients.persist);
+        assert_eq!(config.clients.ttl_days, 7);
+        assert_eq!(config.clients.max_entries, 256);
+        config.validate_clients().unwrap();
+
+        // the v0.4 kill-switch: memory-only, byte-for-byte
+        let raw = raw.to_string() + "\n[clients]\npersist = false\n";
+        let config: AppConfig = toml::from_str(&raw).unwrap();
+        assert!(!config.clients.persist);
+        config.validate_clients().unwrap();
+
+        // zero ttl / cap are configuration errors, not silent no-ops
+        let mut config = AppConfig::starter();
+        config.clients.ttl_days = 0;
+        assert!(config.validate_clients().is_err());
+        let mut config = AppConfig::starter();
+        config.clients.max_entries = 0;
+        assert!(config.validate_clients().is_err());
     }
 
     #[test]

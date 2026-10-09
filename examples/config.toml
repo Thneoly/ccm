@@ -120,3 +120,11 @@ open_ms = 30000
 history_enabled = true
 retention_days = 14
 prometheus_enabled = true
+
+# Persistent client sessions (v0.5): scoped `ccm switch --client` targets
+# are written to <CCM_HOME>/clients.toml so they survive proxy restarts.
+# All defaults — persist = false restores v0.4 memory-only semantics.
+[clients]
+persist = true
+ttl_days = 7
+max_entries = 256

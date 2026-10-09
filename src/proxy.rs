@@ -50,11 +50,17 @@ use crate::{
 pub(crate) struct ProxyState {
     pub(crate) client: Client,
     pub(crate) target: Arc<RwLock<String>>,
-    /// Per-client runtime targets (v0.4 M3): in-memory only, never written to
-    /// any file, cleared on restart (invariant 8). Entries are created ONLY by
-    /// a scoped switch — an unknown client id follows the global target and
-    /// never materializes an entry.
+    /// Per-client runtime targets (v0.4 M3). Entries are created ONLY by a
+    /// scoped switch — an unknown client id follows the global target and
+    /// never materializes an entry. Since v0.5 M2 the map is seeded from
+    /// `clients.toml` at startup and persisted best-effort at scoped
+    /// switches and by the refresh task (invariant 8, reworded: the GLOBAL
+    /// switch stays runtime-only; scoped entries persist to clients.toml —
+    /// never state.toml).
     pub(crate) clients: Arc<RwLock<HashMap<String, ClientEntry>>>,
+    /// Persistence for those entries (v0.5 M2). `persist = false` makes
+    /// every save/load a no-op — v0.4 memory-only semantics.
+    pub(crate) clients_store: Arc<crate::clients_store::ClientsStore>,
     pub(crate) traces: Arc<RwLock<VecDeque<AttemptTrace>>>,
     pub(crate) circuits: Arc<RwLock<HashMap<String, CircuitState>>>,
     pub(crate) metrics: Arc<RwLock<HashMap<String, ModelMetrics>>>,
@@ -143,10 +149,30 @@ pub async fn serve(bind: &str) -> Result<()> {
         .prometheus_enabled
         .then(|| Arc::new(crate::prometheus::PromState::new()));
 
+    // Persistent client sessions (v0.5 M2): load BEFORE the state exists so
+    // restored entries seed the map. Every problem degrades to a dropped
+    // entry with one stderr note — persistence must never prevent routing.
+    let clients_store = Arc::new(crate::clients_store::ClientsStore::from_config(&config)?);
+    let sessions = clients_store.load(&config, now_ms());
+    for note in &sessions.notes {
+        eprintln!("ccm: {note}");
+    }
+    let mut restored_clients = sessions.clients;
+    // A hand-grown file over the cap trims to the cap here too.
+    clients_store.enforce_cap(&mut restored_clients);
+    if clients_store.is_enabled() {
+        println!(
+            "Clients: {} persisted session(s) from {}",
+            restored_clients.len(),
+            clients_store.path().display()
+        );
+    }
+
     let state = ProxyState {
         client: Client::new(),
         target: Arc::new(RwLock::new(target)),
-        clients: Arc::new(RwLock::new(HashMap::new())),
+        clients: Arc::new(RwLock::new(restored_clients)),
+        clients_store: clients_store.clone(),
         traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
         circuits: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -179,6 +205,41 @@ pub async fn serve(bind: &str) -> Result<()> {
                         timestamp_ms: now_ms(),
                         models: models.into_iter().collect(),
                     });
+            }
+        });
+    }
+
+    // Periodic clients.toml refresh (v0.5 M2): rewrite the file with the
+    // map's CURRENT state so traffic-bumped `last_seen_ms` values land on
+    // disk. Those values are persisted UNCHANGED — this task never stamps
+    // now() (that would make the TTL dead code; the switch path stamps at
+    // real switch events, the hot path at real requests). Idle-skip while
+    // the map is empty; `persist` serializes against the switch path's
+    // writes and skips a byte-identical body, so idle ticks touch no
+    // disk. Throttled warn-on-failure, no exit-time write — the
+    // metrics-snapshot task's conventions.
+    if clients_store.is_enabled() {
+        let refresh_state = state.clone();
+        let refresh_store = clients_store.clone();
+        let interval = Duration::from_secs(crate::clients_store::REFRESH_INTERVAL_SECS);
+        tokio::spawn(async move {
+            let mut warned = false;
+            loop {
+                sleep(interval).await;
+                if refresh_state.clients.read().await.is_empty() {
+                    continue;
+                }
+                match refresh_store.persist(&refresh_state.clients).await {
+                    Ok(()) => warned = false,
+                    Err(err) => {
+                        if !warned {
+                            eprintln!(
+                                "ccm: clients.toml write failed: {err:#} (warning shown once per failure streak)"
+                            );
+                            warned = true;
+                        }
+                    }
+                }
             }
         });
     }
@@ -1295,6 +1356,9 @@ mod tests {
             client: Client::new(),
             target: Arc::new(RwLock::new("test-route".to_string())),
             clients: Arc::new(RwLock::new(HashMap::new())),
+            // Memory-only store: integration tests keep v0.4 semantics
+            // unless a test builds its own persisting store.
+            clients_store: Arc::new(crate::clients_store::ClientsStore::disabled()),
             traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
             circuits: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -2823,6 +2887,184 @@ model_id = "upstream-y"
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // v0.5 M2 acceptance: a scoped switch survives a proxy restart. The
+    // "restart" is the exact seed serve() performs — load, revalidate, cap,
+    // fresh state — against the file the switch itself persisted. Also pins:
+    // the requests counter restarts from 0, a no-id request still follows
+    // the global target, state.toml stays byte-identical (invariant 9), the
+    // file carries no credential material (invariant 1), and a refresh-style
+    // save persists last_seen values UNCHANGED (idle entries keep their
+    // stamp — never now()), which keeps the TTL meaningful.
+    #[allow(clippy::await_holding_lock)] // see note on the v0.3 test above
+    #[tokio::test]
+    async fn scoped_switches_survive_a_restart_via_clients_toml() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-clients-restart-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PX_API_KEY", "x-secret");
+        std::env::set_var("CCM_PY_API_KEY", "y-secret");
+
+        let (x_addr, x_mock, x_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (y_addr, y_mock, y_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_multi_client_config(
+            &root,
+            &format!("http://{x_addr}"),
+            &format!("http://{y_addr}"),
+        );
+        // invariant 9's pinned artifact: state.toml is never touched by a
+        // scoped switch, before or after the restart.
+        std::fs::write(root.join("state.toml"), "current = \"modelx\"\n").unwrap();
+        let state_toml_before = std::fs::read(root.join("state.toml")).unwrap();
+
+        // "proxy A": the default-enabled store; two scoped switches.
+        let config = AppConfig::load().unwrap();
+        let store_a = crate::clients_store::ClientsStore::from_config(&config).unwrap();
+        assert!(store_a.is_enabled());
+        let mut state_a = integration_proxy_state();
+        state_a.clients_store = Arc::new(store_a.clone());
+        apply_switch(&state_a, "modely", Some("term1"))
+            .await
+            .unwrap();
+        apply_switch(&state_a, "modelx", Some("term2"))
+            .await
+            .unwrap();
+        let switch_stamp_term2 = state_a
+            .clients
+            .read()
+            .await
+            .get("term2")
+            .unwrap()
+            .last_seen_ms;
+
+        // The switch path persisted synchronously: both entries on disk.
+        let file_text = std::fs::read_to_string(root.join("clients.toml")).unwrap();
+        assert!(file_text.contains("id = \"term1\""), "{file_text}");
+        assert!(file_text.contains("target = \"modely\""), "{file_text}");
+        assert!(!file_text.contains("x-secret") && !file_text.contains("y-secret"));
+
+        // kill -9 equivalent: everything from proxy A is dropped. The
+        // restart seeds the map exactly the way serve() does.
+        drop(state_a);
+        let config = AppConfig::load().unwrap();
+        let store_b = crate::clients_store::ClientsStore::from_config(&config).unwrap();
+        let sessions = store_b.load(&config, now_ms());
+        assert!(sessions.notes.is_empty(), "{:?}", sessions.notes);
+        let mut restored = sessions.clients;
+        store_b.enforce_cap(&mut restored);
+        let mut state_b = integration_proxy_state();
+        state_b.clients = Arc::new(RwLock::new(restored));
+        state_b.clients_store = Arc::new(store_b.clone());
+        *state_b.target.write().await = "modelx".to_string();
+
+        // both entries restored; the requests counter restarted from 0
+        {
+            let clients = state_b.clients.read().await;
+            let term1 = clients.get("term1").unwrap();
+            assert_eq!(term1.target, "modely");
+            assert_eq!(term1.requests, 0);
+            assert_eq!(clients.get("term2").unwrap().target, "modelx");
+        }
+
+        // one request with the id routes to the SCOPED target (mock Y); the
+        // no-id request still follows the global target (mock X)
+        let x_before = x_mock.requests.lock().unwrap().len();
+        let y_before = y_mock.requests.lock().unwrap().len();
+        let response = forward(state_b.clone(), client_tagged_request(Some("term1"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 1);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before);
+        let response = forward(state_b.clone(), integration_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), x_before + 1);
+
+        // A refresh-style persist (what the periodic task does) persists
+        // the map's CURRENT last_seen values UNCHANGED: the traffic-bumped
+        // term1 carries its bumped stamp, the idle term2 keeps its switch
+        // stamp exactly — nothing is re-stamped with now().
+        store_b.persist(&state_b.clients).await.unwrap();
+        let file_text = std::fs::read_to_string(root.join("clients.toml")).unwrap();
+        let idle_stamp_line = format!("last_seen_ms = {switch_stamp_term2}");
+        assert!(
+            file_text.contains(&idle_stamp_line),
+            "idle entry keeps its stamp: {file_text}"
+        );
+        assert!(
+            !file_text.contains(&format!("last_seen_ms = {}", now_ms())),
+            "no now()-stamping on refresh: {file_text}"
+        );
+        assert!(!file_text.contains("x-secret") && !file_text.contains("y-secret"));
+
+        // /_ccm/clients shape after restart: requests counted from 0, one
+        // routed request on term1
+        let clients = control_clients(State(state_b.clone())).await.0;
+        let term1_row = clients.iter().find(|row| row.client == "term1").unwrap();
+        assert_eq!(term1_row.requests, 1);
+
+        assert_eq!(
+            state_toml_before,
+            std::fs::read(root.join("state.toml")).unwrap()
+        );
+
+        x_task.abort();
+        y_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PX_API_KEY");
+        std::env::remove_var("CCM_PY_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // `[clients] persist = false` restores v0.4 memory-only semantics: the
+    // entry exists in memory, no clients.toml is ever created.
+    #[allow(clippy::await_holding_lock)] // see note on the v0.3 test above
+    #[tokio::test]
+    async fn persist_false_restores_memory_only_semantics() {
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-clients-memonly-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        let (x_addr, _x_mock, x_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (y_addr, _y_mock, y_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_multi_client_config(
+            &root,
+            &format!("http://{x_addr}"),
+            &format!("http://{y_addr}"),
+        );
+        std::fs::write(
+            root.join("config.toml"),
+            std::fs::read_to_string(root.join("config.toml")).unwrap()
+                + "\n[clients]\npersist = false\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load().unwrap();
+        let store = crate::clients_store::ClientsStore::from_config(&config).unwrap();
+        assert!(!store.is_enabled());
+        let mut state = integration_proxy_state();
+        state.clients_store = Arc::new(store);
+        apply_switch(&state, "modely", Some("term1")).await.unwrap();
+        assert_eq!(
+            state.clients.read().await.get("term1").unwrap().target,
+            "modely"
+        );
+        assert!(!root.join("clients.toml").exists());
+
+        x_task.abort();
+        y_task.abort();
+        std::env::remove_var("CCM_HOME");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // v0.4 M5: routing decisions, metric snapshots, and circuit transitions
     // persist to $CCM_HOME/history/*.jsonl while the proxy runs, decision ids
     // stay unique, and the persisted lines never contain credential material
@@ -2852,6 +3094,7 @@ model_id = "upstream-y"
             client: Client::new(),
             target: Arc::new(RwLock::new("test-route".to_string())),
             clients: Arc::new(RwLock::new(HashMap::new())),
+            clients_store: Arc::new(crate::clients_store::ClientsStore::disabled()),
             traces: Arc::new(RwLock::new(VecDeque::with_capacity(TRACE_CAPACITY))),
             circuits: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(RwLock::new(HashMap::new())),

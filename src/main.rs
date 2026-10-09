@@ -1,5 +1,6 @@
 mod advise;
 mod cli;
+mod clients_store;
 mod config;
 mod control;
 mod credential;

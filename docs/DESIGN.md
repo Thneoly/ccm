@@ -554,11 +554,15 @@ POST /_ccm/switch/{target}
 bind guard covers it; see §8 for the families. `[observability]
 prometheus_enabled = false` unregisters the route (404).
 
-Client scoping (v0.4): `POST /_ccm/switch/{target}?client=<id>` switches
-only that client's in-memory target (invalid id charset → 400; charset
-`[A-Za-z0-9._-]{1,64}`), `GET /_ccm/clients` lists the per-client runtime
-entries (sorted by client id), and `GET /_ccm/status|/_ccm/traces|/_ccm/decisions`
-accept `?client=<id>` to filter to one client.
+Client scoping (v0.4; persistence added v0.5 M2): `POST
+/_ccm/switch/{target}?client=<id>` switches only that client's target
+(invalid id charset → 400; charset `[A-Za-z0-9._-]{1,64}`), `GET
+/_ccm/clients` lists the per-client runtime entries (sorted by client id),
+and `GET /_ccm/status|/_ccm/traces|/_ccm/decisions` accept `?client=<id>`
+to filter to one client. Scoped entries persist best-effort to
+`$CCM_HOME/clients.toml` (§19 note) so they survive restarts; the
+`requests` counter is runtime-only and resets on restart — `usage.jsonl`
+is the durable ledger.
 
 History queries (v0.4 M5): `GET /_ccm/decisions?since=&until=&model=`
 (unix-ms, inclusive) switches the endpoint from the in-memory ring to a
@@ -786,7 +790,9 @@ Do not change these without an explicit design decision:
 5. No mid-stream failover.
 6. Runtime metrics must not require buffering SSE.
 7. Provider authentication is explicit.
-8. `ccm switch` is runtime-only.
+8. `ccm switch` is runtime-only for the GLOBAL target; scoped client
+   entries persist best-effort to `clients.toml` (v0.5 rewording — never
+   `state.toml`).
 9. `ccm use` is persisted state.
 10. v0.3 routing feature set is frozen.
 11. The proxy refuses non-loopback bind addresses in v0.3.
@@ -800,13 +806,17 @@ transforms chunk-by-chunk with a 1 MiB per-frame cap and never buffers the
 whole stream (6). Exactly one credential header — resolved per kind — is
 injected upstream (7).
 
-Note on multi-client routing (v0.4): the client id is identity, not
-authentication. Any local process can forge `x-ccm-client` or the
-`ccm-local-<id>` token; it shares the trust domain of the loopback-only,
-unauthenticated control API (§13 security note). Scoped switches stay
-runtime-only (8): per-client entries live in proxy memory only, proxy
-restart falls back to the global target, and `ccm use` / `state.toml` are
-untouched (9).
+Note on multi-client routing (v0.4, amended v0.5 M2): the client id is
+identity, not authentication. Any local process can forge `x-ccm-client`
+or the `ccm-local-<id>` token; it shares the trust domain of the
+loopback-only, unauthenticated control API (§13 security note). Scoped
+entries persist best-effort to `$CCM_HOME/clients.toml` (8, reworded):
+`id` / `target` / `last_seen_ms` only, revalidated against current config
+at startup, TTL 7 days, LRU cap 256, `[clients] persist = false` restores
+memory-only. The global switch stays runtime-only, and `ccm use` /
+`state.toml` are untouched (9). Two proxies on one `CCM_HOME` are
+last-writer-wins on `clients.toml` — the scenario is already degraded for
+history (single-writer lock); `clients.toml` takes no lock by design.
 
 Note on usage capture (v0.4 M6): the usage scanner wraps accepted bodies
 chunk-by-chunk with a 64 KiB per-line cap and never buffers the stream

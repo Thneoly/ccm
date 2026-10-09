@@ -20,6 +20,10 @@ struct ClientRow {
     client: String,
     target: String,
     requests: u64,
+    /// Wall-clock ms of the entry's last switch or routed request; the API
+    /// already returned it — v0.5 M2 adds it to the printed row so a
+    /// restored-but-forgotten session is visible as stale.
+    last_seen_ms: u64,
 }
 
 /// Switch the proxy's runtime target. `client = None` moves the global
@@ -75,8 +79,11 @@ pub async fn clients(proxy_url: &str) -> Result<()> {
     }
     for row in rows {
         println!(
-            "{:16} {:16} requests={}",
-            row.client, row.target, row.requests
+            "{:16} {:16} requests={:<6} last_seen={}",
+            row.client,
+            row.target,
+            row.requests,
+            crate::date::utc_instant(row.last_seen_ms)
         );
     }
     Ok(())

@@ -689,9 +689,10 @@ pub(crate) async fn control_switch(
 
 /// Switch logic shared by the HTTP handler and the integration test. Without
 /// a client id this is the v0.3 global switch (runtime-only, invariant 8);
-/// with one it create-or-updates that client's in-memory entry — never
-/// `state.toml` (invariant 9) and never the global target. Invalid id charset
-/// and unknown targets are errors (both surface as HTTP 400).
+/// with one it create-or-updates that client's entry — persisted best-effort
+/// to `clients.toml` (v0.5 M2), never `state.toml` (invariant 9), never the
+/// global target. Invalid id charset and unknown targets are errors (both
+/// surface as HTTP 400).
 pub(crate) async fn apply_switch(
     state: &ProxyState,
     requested: &str,
@@ -706,13 +707,26 @@ pub(crate) async fn apply_switch(
     let route = config.resolve_route(requested)?;
     match client {
         Some(id) => {
-            let mut clients = state.clients.write().await;
-            let entry = clients
-                .entry(id.to_string())
-                .or_insert_with(ClientEntry::default);
-            entry.target = route.target.clone();
-            entry.last_seen_ms = now_ms();
-            // `requests` is a usage counter and survives a re-switch.
+            {
+                let mut clients = state.clients.write().await;
+                let entry = clients
+                    .entry(id.to_string())
+                    .or_insert_with(ClientEntry::default);
+                entry.target = route.target.clone();
+                entry.last_seen_ms = now_ms();
+                // `requests` is a usage counter and survives a re-switch.
+                // Bounded memory: LRU-evict beyond [clients] max_entries.
+                state.clients_store.enforce_cap(&mut clients);
+            }
+            // Persist best-effort, outside the map lock (the /v1/messages
+            // hot path shares it). `persist` snapshots the live map inside
+            // its own write gate, serialized against the refresh task — a
+            // failed write only delays convergence until the next refresh.
+            if state.clients_store.is_enabled() {
+                if let Err(err) = state.clients_store.persist(&state.clients).await {
+                    eprintln!("ccm: clients.toml write failed: {err:#}");
+                }
+            }
         }
         None => {
             *state.target.write().await = route.target.clone();
