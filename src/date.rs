@@ -30,6 +30,15 @@ pub(crate) fn utc_day_of(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a unix-ms timestamp. The shared
+/// presentation helper for every view that prints an instant (history CLI
+/// tables, advise reports, `ccm clients`) — presentation only, filtering
+/// and ordering always use the raw `timestamp_ms` numbers.
+pub(crate) fn utc_instant(ms: u64) -> String {
+    let (year, month, day, hour, minute, second) = utc_parts(ms);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Parse `YYYY-MM-DD` into that UTC day's midnight, unix ms. `None` on any
 /// malformed input — wrong shape, non-numeric fields, or an impossible date
 /// (month 13, April 31, February 30). Leap years are honored via a
@@ -168,5 +177,12 @@ mod tests {
         assert_eq!(utc_parts(951_782_400_000), (2000, 2, 29, 0, 0, 0));
         // 12:34:56 later the same leap day
         assert_eq!(utc_parts(951_827_696_000), (2000, 2, 29, 12, 34, 56));
+    }
+
+    #[test]
+    fn instant_formats_known_instants() {
+        assert_eq!(utc_instant(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_instant(951_782_400_000), "2000-02-29T00:00:00Z"); // leap day
+        assert_eq!(utc_instant(1_000_000_000_000), "2001-09-09T01:46:40Z");
     }
 }

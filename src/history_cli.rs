@@ -138,7 +138,7 @@ fn cost_row(row: &crate::usage::CostByModel) -> String {
 fn print_snapshot(snapshot: &MetricsSnapshot) {
     println!(
         "== snapshot {} ({})",
-        utc_ms(snapshot.timestamp_ms),
+        crate::date::utc_instant(snapshot.timestamp_ms),
         snapshot.timestamp_ms
     );
     println!(
@@ -174,31 +174,16 @@ fn metrics_row(model: &str, metrics: &ModelMetrics) -> String {
 fn transition_line(transition: &CircuitTransition) -> String {
     format!(
         "{:<24} {:<16} {:<22} {}",
-        utc_ms(transition.timestamp_ms),
+        crate::date::utc_instant(transition.timestamp_ms),
         transition.model,
         format!("{} -> {}", transition.from, transition.to),
         transition.reason
     )
 }
 
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a unix-ms timestamp (formatting of
-/// `date::utc_parts`). Presentation only — filtering and ordering always
-/// use the raw `timestamp_ms` numbers.
-fn utc_ms(ms: u64) -> String {
-    let (year, month, day, hour, minute, second) = crate::date::utc_parts(ms);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn utc_formats_known_instants() {
-        assert_eq!(utc_ms(0), "1970-01-01T00:00:00Z");
-        assert_eq!(utc_ms(951_782_400_000), "2000-02-29T00:00:00Z"); // leap day
-        assert_eq!(utc_ms(1_000_000_000_000), "2001-09-09T01:46:40Z");
-    }
 
     #[test]
     fn run_at_reports_missing_directory() {

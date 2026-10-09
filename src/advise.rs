@@ -316,7 +316,7 @@ pub(crate) fn render_report(report: &AdviseReport) -> String {
     out.push_str(&format!(
         "   window: last {} day(s) (since {}), min-samples: {}, prices: current [models.<name>.pricing] tables\n",
         report.window_days,
-        utc_ms(report.since_ms),
+        crate::date::utc_instant(report.since_ms),
         report.min_samples,
     ));
     if report.window_days > report.retention_days {
@@ -493,14 +493,6 @@ fn caveats() -> &'static [&'static str] {
 }
 
 const CAVEATS_JOIN: &str = "caveats:\n";
-
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a unix-ms timestamp — the
-/// `history_cli` presentation helper (formatting of `date::utc_parts`);
-/// presentation only, filtering always uses the raw numbers.
-fn utc_ms(ms: u64) -> String {
-    let (year, month, day, hour, minute, second) = crate::date::utc_parts(ms);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
 
 // ===========================================================================
 // Tests
