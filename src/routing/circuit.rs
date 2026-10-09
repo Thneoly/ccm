@@ -6,7 +6,7 @@ use crate::proxy::ProxyState;
 use crate::route::CircuitBreakerPolicy;
 use crate::routing::decision::now_ms;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CircuitState {
     pub(crate) consecutive_failures: usize,
     pub(crate) open_until_ms: Option<u64>,

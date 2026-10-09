@@ -69,6 +69,19 @@ impl ProviderKind {
             ProviderKind::OpenAICompatible => "/v1/chat/completions",
         }
     }
+
+    /// Upstream count-tokens endpoint for this kind, or `None` when the
+    /// protocol has no counting endpoint (v0.5 M3). The chat-completions
+    /// protocol offers nothing to forward a count to, so the caller
+    /// refuses with a 404 envelope instead of guessing.
+    pub fn count_tokens_path(&self) -> Option<&'static str> {
+        match self {
+            ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => {
+                Some("/v1/messages/count_tokens")
+            }
+            ProviderKind::OpenAICompatible => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +160,19 @@ auth = "bearer"
             ProviderKind::OpenAICompatible.upstream_path(),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn count_tokens_paths_follow_provider_kind() {
+        assert_eq!(
+            ProviderKind::Anthropic.count_tokens_path(),
+            Some("/v1/messages/count_tokens")
+        );
+        assert_eq!(
+            ProviderKind::AnthropicCompatible.count_tokens_path(),
+            Some("/v1/messages/count_tokens")
+        );
+        assert_eq!(ProviderKind::OpenAICompatible.count_tokens_path(), None);
     }
 
     #[test]

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::AppConfig,
     proxy::{
-        forward_messages, invalid_client_id_message, valid_client_id, ClientEntry, ProxyState,
+        forward_count_tokens, forward_messages, invalid_client_id_message, valid_client_id,
+        ClientEntry, ProxyState,
     },
     route::{CircuitBreakerPolicy, RoutePolicy, SelectionWeights},
     routing::decision::{now_ms, AttemptTrace, RoutingDecision},
@@ -227,7 +228,10 @@ pub(crate) fn control_router(state: ProxyState) -> Router {
         .route("/_ccm/cost", get(control_cost))
         .route("/_ccm/clients", get(control_clients))
         .route("/_ccm/switch/{target}", post(control_switch))
-        .route("/v1/messages", any(forward_messages));
+        .route("/v1/messages", any(forward_messages))
+        // Auxiliary Anthropic endpoint (v0.5 M3): registered with `any` so
+        // the handler itself mirrors /v1/messages's 405 for non-POSTs.
+        .route("/v1/messages/count_tokens", any(forward_count_tokens));
     // The exporter route exists only when the exporter is on (v0.4 M7):
     // `prometheus_enabled = false` removes `/metrics` from the listener
     // entirely. It shares the ONE guarded listener — no second port
@@ -378,7 +382,7 @@ async fn control_metrics(State(state): State<ProxyState>) -> Json<Vec<ModelMetri
 /// map, so the two surfaces agree on every SETTLED attempt; an attempt
 /// still in flight exists only in `/_ccm/metrics`, as it always has).
 /// Content type per the text format 0.0.4 convention.
-async fn control_metrics_exposition(State(state): State<ProxyState>) -> Response<Body> {
+pub(crate) async fn control_metrics_exposition(State(state): State<ProxyState>) -> Response<Body> {
     let Some(prom) = state.prom.as_deref() else {
         // Unreachable through the router (the route is registered only when
         // the exporter exists); kept honest for direct calls.

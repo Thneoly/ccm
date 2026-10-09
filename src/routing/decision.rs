@@ -22,7 +22,7 @@ use crate::{
 pub(crate) const TRACE_CAPACITY: usize = 100;
 pub(crate) const DECISION_CAPACITY: usize = 100;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct DecisionCandidate {
     pub(crate) rank: usize,
     pub(crate) model: String,
@@ -33,7 +33,7 @@ pub(crate) struct DecisionCandidate {
     pub(crate) weighted_score: f64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct DecisionAttempt {
     pub(crate) attempt: usize,
     pub(crate) model: String,
@@ -42,7 +42,7 @@ pub(crate) struct DecisionAttempt {
     pub(crate) fallback: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RoutingDecision {
     pub(crate) id: u64,
     pub(crate) timestamp_ms: u64,
@@ -60,7 +60,7 @@ pub(crate) struct RoutingDecision {
     pub(crate) outcome: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct AttemptTrace {
     timestamp_ms: u64,
     target: String,

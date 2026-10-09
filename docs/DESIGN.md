@@ -554,6 +554,21 @@ POST /_ccm/switch/{target}
 bind guard covers it; see §8 for the families. `[observability]
 prometheus_enabled = false` unregisters the route (404).
 
+The data-plane forward routes share the listener: `POST /v1/messages`
+(the full routing pipeline) and `POST /v1/messages/count_tokens`
+(v0.5 M3). The count forward is deliberately primitive: it resolves the
+effective target side-effect-free (no counter/last_seen bump), forwards
+to the PRIMARY model's upstream only — single attempt, no fallbacks, no
+circuit/metric/decision/trace/usage effects (count traffic is invisible
+to every metric family) — with a dedicated 10s timeout and
+status+body passthrough. An openai-compatible primary has no counting
+endpoint: 404 with an Anthropic `not_found_error` envelope, never a
+local estimate. A stub gateway answering `input_tokens:0` to a large
+request (>8 KiB) passes through unchanged with a one-time process
+warning. `/v1/models` and every other auxiliary endpoint stay
+unforwarded (M0: the client never calls `/v1/models`; 404s are
+tolerated).
+
 Client scoping (v0.4; persistence added v0.5 M2): `POST
 /_ccm/switch/{target}?client=<id>` switches only that client's target
 (invalid id charset → 400; charset `[A-Za-z0-9._-]{1,64}`), `GET
@@ -766,7 +781,9 @@ even though the proxy's own counters reset.
 
 ### 18.5 Query strings
 
-Proxy forwarding currently focuses on `/v1/messages`.
+Proxy forwarding covers `/v1/messages` and, since v0.5 M3,
+`/v1/messages/count_tokens` (primary-only, side-effect-free; see §13).
+Neither carries query-string semantics.
 
 If future Anthropic-compatible APIs depend on query strings, forwarding behavior must be reviewed.
 

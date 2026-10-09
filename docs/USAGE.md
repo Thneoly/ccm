@@ -341,7 +341,7 @@ ccm route=coding-route attempt=2 model=minimax result=HTTP 200
 
 `--bind` 可改监听地址，但**只允许回环地址**（默认 `127.0.0.1:13521`，`[::1]` 也可以；`0.0.0.0`、局域网 IP、`[::]` 一律拒绝），原因见 FAQ。
 
-代理只转发 `/v1/messages`（`count_tokens` 等其他端点不转发；实测 Claude Code 可以容忍）。
+代理转发 `/v1/messages` 和 `/v1/messages/count_tokens`（v0.5 起转发后者）。v0.5 之前该端点返回 404——实测接近上下文窗口时（约 190k 估算 token）Claude Code 会重试 count_tokens 多达 17 次，这正是转发它的动机。count 请求按当前目标解析（含 scoped 客户端条目，读取无副作用——不刷新计数器与 `last_seen`），只发往**主模型**、单次尝试、不进 fallback，整个上游调用（响应头 + 响应体）受 10 秒超时约束；计数流量对决策、指标、用量统计完全不可见。openai-compatible 主模型没有计数端点，返回 404 Anthropic 错误信封（实测 Claude Code 容忍 404；不做本地估算）。部分网关的 count_tokens 是存根——实测 z.ai 对任意输入返回 `input_tokens:0`，代理原样透传，仅在大请求（>8KiB）收到 0 计数时向 stderr 打一次进程级警告。其余端点（`/v1/models` 等）仍不转发——实测 Claude Code 从不调用 `/v1/models`。
 
 ### 4.4 `use` vs `switch`（持久默认 vs 运行时切换）
 

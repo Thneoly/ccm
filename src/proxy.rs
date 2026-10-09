@@ -3,7 +3,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     pin::Pin,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
@@ -280,6 +283,166 @@ pub(crate) async fn forward_messages(
 }
 
 // ===========================================================================
+// count_tokens forwarding (v0.5 M3 / V0.5_PLAN §3.3)
+// ===========================================================================
+
+/// How long the WHOLE count_tokens upstream call — response headers and
+/// the buffered body — may take before the proxy gives up. Counting is
+/// fast, and the shared proxy client carries no timeout of its own; the
+/// buffered passthrough has no streaming escape hatch the way /v1/messages
+/// does, so a gateway that answers headers then stalls mid-body must still
+/// hit this bound.
+const COUNT_TOKENS_TIMEOUT_SECS: u64 = 10;
+
+pub(crate) async fn forward_count_tokens(
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    match count_tokens(state, request).await {
+        Ok(response) => response,
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("CCM proxy error: {err:#}")).into_response(),
+    }
+}
+
+/// `POST /v1/messages/count_tokens`: forward the count to the PRIMARY
+/// model's upstream, single attempt, touching NOTHING else — no
+/// circuit/metric/decision/trace/usage/history side effects (a count body
+/// has no `usage` object; count traffic is deliberately invisible to
+/// every metric family — the documented boundary). The target read is
+/// side-effect-free too ([`peek_request_target`]: counters and last_seen
+/// stay generation-driven).
+async fn count_tokens(state: ProxyState, request: Request<Body>) -> Result<Response<Body>> {
+    if request.method() != Method::POST {
+        return Ok((StatusCode::METHOD_NOT_ALLOWED, "POST required").into_response());
+    }
+
+    let client_id = client_id_from_headers(request.headers());
+    let target = peek_request_target(&state, client_id.as_deref()).await;
+    let config = AppConfig::load().context("failed to reload CCM config")?;
+    let route = config.resolve_route(&target)?;
+    // PRIMARY only: a count is meaningful for the model that will
+    // actually serve generation — fallbacks never enter the picture.
+    let model = config
+        .models
+        .get(&route.primary)
+        .with_context(|| format!("route primary model `{}` is not configured", route.primary))?;
+    let provider = config
+        .providers
+        .get(&model.provider)
+        .with_context(|| format!("provider `{}` is not configured", model.provider))?;
+
+    // openai-compatible primary: the chat-completions protocol has no
+    // counting endpoint, so there is nothing to forward to. Refuse with
+    // the status the client demonstrably already tolerates (M0: today's
+    // bare 404s were survived) — never a local estimate from the wrong
+    // tokenizer.
+    let Some(count_path) = provider.kind.count_tokens_path() else {
+        return chunked_json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::to_vec(&count_tokens_refusal_body())
+                .context("failed to serialize count_tokens refusal")?,
+            None,
+        );
+    };
+
+    let token = credential::get(&model.provider)?;
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .context("failed to read request body")?;
+    // The model rewrite is protocol-agnostic and mandatory: Claude Code
+    // sends the placeholder `ccm` model name.
+    let body = rewrite_model(bytes, &model.model_id)?;
+
+    let upstream = format!("{}{}", provider.base_url.trim_end_matches('/'), count_path);
+    let mut builder = state.client.post(upstream).body(body);
+    builder = copy_request_headers(builder, &parts.headers, provider.kind);
+    builder = provider.apply_auth(builder, &token);
+
+    // The bound covers the WHOLE upstream call — headers AND the buffered
+    // body (verify-pass fix: a send-only timeout let a headers-then-stall
+    // gateway hang the handler indefinitely).
+    let (status, headers, bytes) = timeout(Duration::from_secs(COUNT_TOKENS_TIMEOUT_SECS), async {
+        let response = builder
+            .send()
+            .await
+            .context("count_tokens upstream request failed")?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read count_tokens response body")?;
+        Ok::<_, anyhow::Error>((status, headers, bytes))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("count_tokens timed out after {COUNT_TOKENS_TIMEOUT_SECS}s"))??;
+
+    // Status + body passthrough, byte-identical: a gateway that lacks the
+    // endpoint answers itself — exactly the client's pre-CCM experience.
+
+    warn_once_on_zero_count(status.is_success(), &bytes, bytes_len_of(&parts));
+
+    let mut response = Response::builder().status(status.as_u16());
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop(name.as_str()) || name == header::CONTENT_LENGTH {
+            continue;
+        }
+        response = response.header(name, value);
+    }
+    response
+        .body(Body::from(bytes))
+        .context("failed to build count_tokens response")
+}
+
+/// Anthropic error envelope for the openai-compatible count_tokens
+/// refusal — the `translation_failure_body` shape with a boundary-naming
+/// message.
+fn count_tokens_refusal_body() -> Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "not_found_error",
+            "message": "ccm: the primary model for this target is openai-compatible; its protocol has no count_tokens endpoint and no local estimate is attempted",
+        }
+    })
+}
+
+/// One process-lifetime stderr note for the stub-gateway shape (M0
+/// finding: z.ai answers `{"input_tokens":0}` to any input). A zero count
+/// on a large request passes through — indistinguishable from a legal
+/// empty-input count — but the operator should hear about it once.
+static WARNED_ZERO_COUNT: AtomicBool = AtomicBool::new(false);
+fn warn_once_on_zero_count(success: bool, response_body: &[u8], request_len: usize) {
+    if !success || WARNED_ZERO_COUNT.load(Ordering::Relaxed) {
+        return;
+    }
+    let zero = serde_json::from_slice::<Value>(response_body)
+        .ok()
+        .and_then(|value| value.get("input_tokens").and_then(Value::as_u64))
+        == Some(0);
+    // 8 KiB is comfortably above any small-prompt count body, so this
+    // only fires for genuinely large requests a stub gateway zeroed.
+    if zero && request_len > 8192 {
+        eprintln!(
+            "ccm: count_tokens upstream answered input_tokens=0 for a {request_len}-byte request — a stub gateway; the count passes through unchanged"
+        );
+        WARNED_ZERO_COUNT.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Best-effort request-body size from the original request's framing (the
+/// bytes were consumed by the rewrite; the header survives).
+fn bytes_len_of(parts: &axum::http::request::Parts) -> usize {
+    parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+// ===========================================================================
 // client identity + per-client target resolution (v0.4 M3)
 // ===========================================================================
 
@@ -345,6 +508,25 @@ async fn resolve_request_target(state: &ProxyState, client: Option<&str>) -> Str
                 None => global,
             }
         }
+        None => global,
+    }
+}
+
+/// Side-effect-free counterpart of [`resolve_request_target`] (v0.5 M3):
+/// the same client-id resolution and entry-or-global target choice, but a
+/// plain READ — `requests` and `last_seen_ms` are not bumped, because a
+/// count_tokens call is not generation traffic and the counters stay
+/// generation-driven (the shared §3.2/§3.3 decision, V0.5_PLAN §8.3).
+async fn peek_request_target(state: &ProxyState, client: Option<&str>) -> String {
+    let global = state.target.read().await.clone();
+    match client {
+        Some(id) => state
+            .clients
+            .read()
+            .await
+            .get(id)
+            .map(|entry| entry.target.clone())
+            .unwrap_or(global),
         None => global,
     }
 }
@@ -1342,6 +1524,7 @@ mod tests {
         let app = Router::new()
             .route("/v1/messages", post(mock_messages))
             .route("/v1/chat/completions", post(mock_messages))
+            .route("/v1/messages/count_tokens", post(mock_messages))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3062,6 +3245,212 @@ model_id = "upstream-y"
         x_task.abort();
         y_task.abort();
         std::env::remove_var("CCM_HOME");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // v0.5 M3: count_tokens forwarding. The count goes to the PRIMARY of
+    // the effective target (scoped entry or global), single attempt, body
+    // byte-identical except the model rewrite; the response passes through
+    // unchanged; every routing/observability map is bit-identical
+    // before/after (including the /metrics exposition); the scoped entry's
+    // counters are NOT bumped; non-POST is a 405; an openai-compatible
+    // primary gets the 404 refusal envelope without an upstream call.
+    #[allow(clippy::await_holding_lock)] // see note on the v0.3 test above
+    #[tokio::test]
+    async fn count_tokens_forwarding_covers_the_contract() {
+        use crate::control::api::control_metrics_exposition;
+
+        let _env_guard = env_guard();
+        let root = std::env::temp_dir().join(format!(
+            "ccm-count-tokens-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::env::set_var("CCM_HOME", &root);
+        std::env::set_var("CCM_PX_API_KEY", "x-secret");
+        std::env::set_var("CCM_PY_API_KEY", "y-secret");
+
+        let (x_addr, x_mock, x_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (y_addr, y_mock, y_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_multi_client_config(
+            &root,
+            &format!("http://{x_addr}"),
+            &format!("http://{y_addr}"),
+        );
+        let state = integration_proxy_state();
+        *state.target.write().await = "modelx".to_string();
+        // Scoped A -> modely (mock Y); its counters are captured BEFORE any
+        // count traffic to pin the side-effect-free read.
+        apply_switch(&state, "modely", Some("A")).await.unwrap();
+        let entry_before = state.clients.read().await.get("A").unwrap().clone();
+        let circuits_before = state.circuits.read().await.clone();
+        let metrics_before = state.metrics.read().await.clone();
+        let decisions_before = state.decisions.read().await.clone();
+        let traces_before = state.traces.read().await.clone();
+        let usage_before = state.usage.lock().unwrap().clone();
+        let prom_before = body_text(control_metrics_exposition(State(state.clone())).await).await;
+
+        *x_mock.behavior.write().await =
+            MockBehavior::OpenaiJson(r#"{"input_tokens":7}"#.to_string());
+        *y_mock.behavior.write().await =
+            MockBehavior::OpenaiJson(r#"{"input_tokens":42}"#.to_string());
+
+        let count_request = |client: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(id) = client {
+                builder = builder.header("x-ccm-client", id);
+            }
+            builder
+                .body(Body::from(
+                    r#"{"model":"ccm","messages":[{"role":"user","content":"ping"}]}"#,
+                ))
+                .unwrap()
+        };
+
+        // Scoped: A's entry target (modely -> mock Y), model rewritten,
+        // bearer credential injected, identity stripped, response
+        // byte-identical.
+        let response = forward_count_tokens(State(state.clone()), count_request(Some("A")))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, r#"{"input_tokens":42}"#);
+        {
+            let requests = y_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.path, "/v1/messages/count_tokens");
+            assert_eq!(captured.body["model"], "upstream-y");
+            assert_eq!(
+                captured
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer y-secret"
+            );
+            assert!(captured.headers.get("x-ccm-client").is_none());
+        }
+        assert_eq!(x_mock.requests.lock().unwrap().len(), 0);
+
+        // Global (no id): the global target's primary (modelx -> mock X).
+        let response = forward_count_tokens(State(state.clone()), count_request(None))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, r#"{"input_tokens":7}"#);
+        {
+            let requests = x_mock.requests.lock().unwrap();
+            let captured = requests.last().unwrap();
+            assert_eq!(captured.path, "/v1/messages/count_tokens");
+            assert_eq!(captured.body["model"], "upstream-x");
+        }
+
+        // An unknown id follows the global target, creating no entry.
+        let response = forward_count_tokens(State(state.clone()), count_request(Some("ghost")))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(x_mock.requests.lock().unwrap().len(), 2);
+        assert!(state.clients.read().await.get("ghost").is_none());
+
+        // Zero side effects: every map bit-identical, A's counters unbumped.
+        assert_eq!(*state.circuits.read().await, circuits_before);
+        assert_eq!(*state.metrics.read().await, metrics_before);
+        assert_eq!(*state.decisions.read().await, decisions_before);
+        assert_eq!(*state.traces.read().await, traces_before);
+        assert_eq!(*state.usage.lock().unwrap(), usage_before);
+        let prom_after = body_text(control_metrics_exposition(State(state.clone())).await).await;
+        assert_eq!(prom_after, prom_before, "count traffic touches no metric");
+        let entry_after = state.clients.read().await.get("A").unwrap().clone();
+        assert_eq!(entry_after.requests, entry_before.requests);
+        assert_eq!(entry_after.last_seen_ms, entry_before.last_seen_ms);
+
+        // Non-POST is the same 405 shape /v1/messages serves.
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/messages/count_tokens")
+            .body(Body::empty())
+            .unwrap();
+        let response = forward_count_tokens(State(state.clone()), get)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // An upstream that lacks the endpoint answers itself: status and
+        // body pass through unchanged (the pre-CCM client experience).
+        *x_mock.behavior.write().await = MockBehavior::Status(StatusCode::NOT_FOUND);
+        let response = forward_count_tokens(State(state.clone()), count_request(None))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_text(response).await, "mock 404 Not Found");
+
+        // The 10s bound covers the WHOLE upstream call, not just headers: a
+        // gateway that answers 200 then stalls mid-body (held-open stream,
+        // never EOF) must surface the 502 timeout instead of hanging the
+        // client indefinitely (verify-pass regression pin).
+        *x_mock.behavior.write().await =
+            MockBehavior::OpenaiSseHeldOpen(r#"{"input_tokens":1}"#.to_string());
+        let started = std::time::Instant::now();
+        let response = forward_count_tokens(State(state.clone()), count_request(None))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            body_text(response).await.contains("timed out after"),
+            "the timeout names its bound"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(COUNT_TOKENS_TIMEOUT_SECS),
+            "the bound fired on the whole call"
+        );
+
+        // openai-compatible primary: the 404 refusal envelope, no upstream
+        // call, no local estimate.
+        let (openai_addr, openai_mock, openai_task) = spawn_mock(MockBehavior::OkStream).await;
+        let (native_addr, _native_mock, native_task) = spawn_mock(MockBehavior::OkStream).await;
+        write_openai_integration_config(
+            &root,
+            &format!("http://{openai_addr}"),
+            &format!("http://{native_addr}"),
+        );
+        std::env::set_var("CCM_OPENAI_API_KEY", "openai-secret");
+        std::env::set_var("CCM_NATIVE_API_KEY", "native-secret");
+        *state.target.write().await = "test-route".to_string();
+        let response = forward_count_tokens(State(state.clone()), count_request(None))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let refusal: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(refusal["type"], "error");
+        assert_eq!(refusal["error"]["type"], "not_found_error");
+        assert!(refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("openai-compatible"));
+        assert_eq!(openai_mock.requests.lock().unwrap().len(), 0);
+        // The scoped entry also resolves through its target's primary: re-point
+        // A at the openai route (the rewritten config no longer defines its
+        // original modely target) and the refusal is identical.
+        apply_switch(&state, "test-route", Some("A")).await.unwrap();
+        let response = forward_count_tokens(State(state.clone()), count_request(Some("A")))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        x_task.abort();
+        y_task.abort();
+        openai_task.abort();
+        native_task.abort();
+        std::env::remove_var("CCM_HOME");
+        std::env::remove_var("CCM_PX_API_KEY");
+        std::env::remove_var("CCM_PY_API_KEY");
+        std::env::remove_var("CCM_OPENAI_API_KEY");
+        std::env::remove_var("CCM_NATIVE_API_KEY");
         let _ = std::fs::remove_dir_all(root);
     }
 
