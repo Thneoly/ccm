@@ -456,7 +456,7 @@ GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — newest-first and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed). `/metrics` (v0.4 M7) is the Prometheus text exposition — same listener, so the loopback-only bind guard covers it; `prometheus_enabled = false` unregisters the route.
+`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — oldest-first (chronological) and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed). `/metrics` (v0.4 M7) is the Prometheus text exposition — same listener, so the loopback-only bind guard covers it; `prometheus_enabled = false` unregisters the route.
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
@@ -552,7 +552,7 @@ committed-stream failure -> error event, zero requests to the fallback (no mid-s
 HALF_OPEN probe release on translate failure
 ```
 
-The six integration tests that mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring. The disk-query tests (`/_ccm/decisions`, `/_ccm/usage`, `/_ccm/cost`) use explicit history directories and need no env lock.
+The twelve integration tests that mutate process env (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`) serialize on a shared lock, so they cannot race. The tests isolate configuration with `CCM_HOME`, so they do not depend on a developer's real `~/.ccm` files or OS keyring. The disk-query tests (`/_ccm/decisions`, `/_ccm/usage`, `/_ccm/cost`) use explicit history directories and need no env lock.
 
 Run them with:
 

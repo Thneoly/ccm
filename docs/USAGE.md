@@ -658,6 +658,7 @@ fallback = ["glm"]
 | `GET /_ccm/clients` | 各客户端的运行时目标条目：client、target、requests、last_seen_ms（按 client 排序；条目由 scoped switch 产生，v0.5 起持久化到 clients.toml 跨重启恢复，requests 计数重启归零） |
 | `POST /_ccm/switch/{target}` | 运行时切换（`ccm switch` 即调它；未知目标返回 400）；`?client=<id>` 只切该客户端，id 非法返回 400 |
 | `POST /v1/messages` | 反向代理本体，Claude Code 的流量入口；非 POST 返回 405 `POST required` |
+| `POST /v1/messages/count_tokens` | count_tokens 转发（v0.5，见 4.3）：无副作用解析目标、只发主模型、单次尝试、10s 超时、状态与响应体原样透传；openai-compatible 主模型返回 404 信封 |
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:13521/_ccm/status
@@ -1036,4 +1037,4 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
 | `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |
 | `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST；`?client=<id>` 只切该客户端） |
-| `http://127.0.0.1:13521/v1/messages` | 反向代理入口（仅此端点被转发） |
+| `http://127.0.0.1:13521/v1/messages` | 反向代理入口（与 `/v1/messages/count_tokens` 一并转发——v0.5 起含后者；其余端点不转发） |

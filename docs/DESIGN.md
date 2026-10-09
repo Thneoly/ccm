@@ -692,6 +692,7 @@ src/main.rs        CLI orchestration
 src/cli.rs         clap definitions
 src/config.rs      declarative configuration
 src/state.rs       persisted mutable state
+src/clients_store.rs clients.toml persistence for scoped client sessions (v0.5 M2)
 src/provider.rs    provider + auth strategy + kind->endpoint mapping
 src/model.rs       model/profile definitions
 src/route.rs       route + policy definitions
@@ -705,6 +706,7 @@ src/history.rs     JSONL observability history engine (writer + readers)
 src/history_cli.rs `ccm history` offline presentation
 src/usage.rs       usage scanner + UsageRecord + cost aggregation (v0.4 M6)
 src/date.rs        UTC calendar-day math for the cost views (Hinnant)
+src/advise.rs      `ccm advise` realized-spend cost_weight analysis, never writes config (v0.5 M1)
 src/prometheus.rs  hand-rendered text-format exporter: counters + render (v0.4 M7)
 src/otlp.rs        hand-rolled OTLP/HTTP JSON push: render_otel + push_once (v0.5 M4)
 src/doctor.rs      local environment diagnosis
