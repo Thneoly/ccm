@@ -158,6 +158,9 @@ impl AppConfig {
             Model {
                 provider: "anthropic".to_string(),
                 model_id: "claude-sonnet-5-5".to_string(),
+                // claude-* ids are recognized by Claude Code, which knows
+                // their windows natively — no declaration needed.
+                context_window: None,
                 routing: ModelRouting {
                     cost_weight: 1.0,
                     quality_weight: 1.0,
@@ -172,6 +175,11 @@ impl AppConfig {
             Model {
                 provider: "zai".to_string(),
                 model_id: "glm-5.3".to_string(),
+                // GLM-5.3's documented window (z.ai): a capability fact, not
+                // a plan-dependent price. Undeclared, Claude Code would
+                // assume a small default window for the unknown id and
+                // auto-compact at roughly a sixth of the real one.
+                context_window: Some(1_000_000),
                 routing: ModelRouting {
                     cost_weight: 0.25,
                     quality_weight: 0.85,
@@ -249,6 +257,7 @@ impl AppConfig {
         let config: AppConfig = toml::from_str(&raw).context("invalid TOML configuration")?;
         config.validate_observability()?;
         config.validate_model_pricing()?;
+        config.validate_model_context_windows()?;
         config.validate_clients()?;
         Ok(config)
     }
@@ -320,6 +329,19 @@ impl AppConfig {
         Ok(())
     }
 
+    /// `[models.<name>] context_window` sanity: zero tokens is not a window.
+    /// A missing field stays legal — undeclared means "let Claude Code
+    /// assume its default window" (correct for the `claude-*` ids it
+    /// recognizes).
+    pub fn validate_model_context_windows(&self) -> Result<()> {
+        for (name, model) in &self.models {
+            if model.context_window == Some(0) {
+                bail!("model `{name}` context_window must be greater than 0 (tokens)");
+            }
+        }
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
@@ -344,6 +366,9 @@ impl AppConfig {
         }
         if model.routing.quality_weight < 0.0 {
             bail!("model routing quality_weight must be >= 0");
+        }
+        if model.context_window == Some(0) {
+            bail!("model context_window must be greater than 0 (tokens)");
         }
         self.models.insert(name, model);
         Ok(())
@@ -672,6 +697,73 @@ pricing = { input = 3.0, output = 15.0 }
     }
 
     #[test]
+    fn context_window_loads_round_trips_and_rejects_zero() {
+        // pre-feature configs load unchanged (None) and a save adds no
+        // field, so hand-edited files gain no noise.
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[models.claude]
+provider = "anthropic"
+model_id = "claude-sonnet-5-5"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.models["claude"].context_window, None);
+        config.validate_model_context_windows().unwrap();
+        assert!(!toml::to_string_pretty(&config)
+            .unwrap()
+            .contains("context_window"));
+
+        // a declared window round-trips
+        let raw = raw.to_string() + "\ncontext_window = 1000000\n";
+        let config: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(config.models["claude"].context_window, Some(1_000_000));
+        assert!(toml::to_string_pretty(&config)
+            .unwrap()
+            .contains("context_window = 1000000"));
+
+        // zero is a configuration error at load (hand-edited TOML) and at
+        // add_model (the CLI path) — clap's range parser rejects it before
+        // that for the flag, these cover the rest.
+        let raw = r#"
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[models.broken]
+provider = "anthropic"
+model_id = "x"
+context_window = 0
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert!(config.validate_model_context_windows().is_err());
+
+        let mut config = AppConfig::starter();
+        let result = config.add_model(
+            "broken".to_string(),
+            Model {
+                provider: "anthropic".to_string(),
+                model_id: "x".to_string(),
+                context_window: Some(0),
+                routing: ModelRouting::default(),
+                pricing: None,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn starter_declares_glms_real_window() {
+        // The flagship third-party sample ships the documented 1M window;
+        // claude-* ids stay undeclared (recognized natively by Claude Code).
+        let config = AppConfig::starter();
+        assert_eq!(config.models["glm"].context_window, Some(1_000_000));
+        assert_eq!(config.models["claude"].context_window, None);
+    }
+
+    #[test]
     fn resolves_model_alias() {
         let config = AppConfig::starter();
         assert_eq!(config.resolve_target("glm").unwrap(), "glm");
@@ -702,6 +794,7 @@ pricing = { input = 3.0, output = 15.0 }
             Model {
                 provider: "missing".to_string(),
                 model_id: "x".to_string(),
+                context_window: None,
                 routing: ModelRouting::default(),
                 pricing: None,
             },
@@ -717,6 +810,7 @@ pricing = { input = 3.0, output = 15.0 }
             Model {
                 provider: "anthropic".to_string(),
                 model_id: "x".to_string(),
+                context_window: None,
                 routing: ModelRouting {
                     cost_weight: -1.0,
                     quality_weight: 1.0,
@@ -744,6 +838,7 @@ pricing = { input = 3.0, output = 15.0 }
                 Model {
                     provider: "deepseek".to_string(),
                     model_id: "deepseek-chat".to_string(),
+                    context_window: None,
                     routing: ModelRouting::default(),
                     pricing: None,
                 },

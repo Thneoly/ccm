@@ -45,6 +45,7 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
             model_id,
             cost_weight,
             quality_weight,
+            context_window,
         } => {
             let provider = required(provider, "Provider")?;
             let model_id = required(model_id, "Model ID")?;
@@ -53,6 +54,7 @@ pub fn handle(config: &mut AppConfig, command: AddCommand) -> Result<()> {
                 Model {
                     provider,
                     model_id,
+                    context_window,
                     routing: ModelRouting {
                         cost_weight,
                         quality_weight,

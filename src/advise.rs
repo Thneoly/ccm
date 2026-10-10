@@ -723,6 +723,7 @@ mod tests {
             crate::model::Model {
                 provider: "zai".to_string(),
                 model_id: "MiniMax-M3".to_string(),
+                context_window: None,
                 routing: crate::model::ModelRouting::default(),
                 pricing: Some(pricing(1.0, 2.0)),
             },

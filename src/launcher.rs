@@ -29,6 +29,7 @@ pub fn run_claude(config: &AppConfig, model_name: &str) -> Result<()> {
         &token,
         &model.model_id,
         provider.resolved_auth(),
+        model.context_window,
     )
 }
 
@@ -43,8 +44,14 @@ pub fn run_claude_via_proxy(proxy_url: &str, client_id: &str) -> Result<()> {
     )
 }
 
-fn run_command(base_url: &str, token: &str, model: &str, auth: ProviderAuth) -> Result<()> {
-    run_command_inner(base_url, token, model, auth, None, None)
+fn run_command(
+    base_url: &str,
+    token: &str,
+    model: &str,
+    auth: ProviderAuth,
+    context_window: Option<u64>,
+) -> Result<()> {
+    run_command_inner(base_url, token, model, auth, None, None, context_window)
 }
 
 fn run_command_with_proxy_env(
@@ -62,6 +69,7 @@ fn run_command_with_proxy_env(
         auth,
         Some(proxy_url),
         Some(client_id),
+        None,
     )
 }
 
@@ -84,13 +92,63 @@ fn run_command_inner(
     auth: ProviderAuth,
     proxy_url: Option<&str>,
     client_id: Option<&str>,
+    context_window: Option<u64>,
 ) -> Result<()> {
+    let mut command = build_claude_command(
+        base_url,
+        token,
+        model,
+        auth,
+        proxy_url,
+        client_id,
+        context_window,
+    );
+
+    let status = command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context(
+            "failed to launch `claude`; make sure Claude Code is installed and available on PATH",
+        )?;
+
+    if !status.success() {
+        anyhow::bail!("Claude Code exited with status {status}");
+    }
+
+    Ok(())
+}
+
+/// Assemble the `claude` child-process environment without spawning it, so
+/// the injected variables are testable without touching the real process.
+/// The spawn half lives in `run_command_inner`.
+fn build_claude_command(
+    base_url: &str,
+    token: &str,
+    model: &str,
+    auth: ProviderAuth,
+    proxy_url: Option<&str>,
+    client_id: Option<&str>,
+    context_window: Option<u64>,
+) -> Command {
     let mut command = claude_command();
     command
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("ANTHROPIC_MODEL", model)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN");
+
+    // Declared context window (direct mode): Claude Code does not know
+    // third-party model ids and would assume a small default window for
+    // them, auto-compacting long sessions at a fraction of the real one.
+    // Setting the declared value also overrides any inherited variable;
+    // an undeclared model leaves the parent environment untouched. Proxy
+    // launches pass `None` (wired in `run_command_with_proxy_env`) — the
+    // launch-time target would go stale under a runtime `ccm switch`.
+    if let Some(window) = context_window {
+        command.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", window.to_string());
+    }
 
     if let Some(proxy_url) = proxy_url {
         command.env("CCM_PROXY_URL", proxy_url);
@@ -135,20 +193,7 @@ fn run_command_inner(
         }
     }
 
-    let status = command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context(
-            "failed to launch `claude`; make sure Claude Code is installed and available on PATH",
-        )?;
-
-    if !status.success() {
-        anyhow::bail!("Claude Code exited with status {status}");
-    }
-
-    Ok(())
+    command
 }
 
 /// `ANTHROPIC_CUSTOM_HEADERS` already present in ccm's own environment, if
@@ -237,6 +282,104 @@ pub(crate) fn is_openai_compatible_model(config: &AppConfig, model_name: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    /// Value `key` is set to on the child command, or `None` when it is
+    /// not set. Note the collapse: `get_envs` surfaces `env_remove`d keys
+    /// as `(key, None)` pairs (stable since 1.57), which this helper
+    /// flattens — "never set" and "explicitly removed" are
+    /// indistinguishable here. Where the distinction is the contract, use
+    /// [`env_key_untouched`] instead.
+    fn env_value<'a>(command: &'a Command, key: &'a str) -> Option<&'a OsStr> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new(key))
+            .and_then(|(_, v)| v)
+    }
+
+    /// True when `key` is entirely absent from the command's explicit-env
+    /// map — neither set nor removed, so a parent-shell value passes
+    /// through to the child untouched. This is the pin for "未声明 =
+    /// 不干预" (USAGE 4.2/5.3): an added `env_remove` would strip a
+    /// parent value while `env_value` alone reports `None` for both
+    /// cases.
+    fn env_key_untouched(command: &Command, key: &str) -> bool {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new(key))
+            .is_none()
+    }
+
+    #[test]
+    fn declared_context_window_is_injected_on_direct_launches() {
+        let command = build_claude_command(
+            "https://api.z.ai/api/anthropic",
+            "tok",
+            "glm-5.3",
+            ProviderAuth::XApiKey,
+            None,
+            None,
+            Some(1_000_000),
+        );
+        assert_eq!(
+            env_value(&command, "CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(OsStr::new("1000000"))
+        );
+    }
+
+    #[test]
+    fn undeclared_context_window_leaves_the_environment_untouched() {
+        // The variable is never set (and never removed): an undeclared
+        // model means "let Claude Code assume its default window", and a
+        // parent-shell value stays authoritative.
+        let command = build_claude_command(
+            "https://api.anthropic.com",
+            "tok",
+            "claude-sonnet-5-5",
+            ProviderAuth::XApiKey,
+            None,
+            None,
+            None,
+        );
+        assert!(env_key_untouched(
+            &command,
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        ));
+    }
+
+    #[test]
+    fn proxy_shape_sets_identity_but_not_a_context_window() {
+        // The proxy launch shape (proxy_url + client_id present) carries
+        // identity variables and never a window key: the shape itself
+        // injects none, and the production wiring `run_claude_via_proxy`
+        // → `run_command_with_proxy_env` passes `None` by construction —
+        // the accepted untested seam (V0.5_PLAN §11); this pins the
+        // builder half, not that wiring. Absence is asserted at the
+        // `get_envs` level so a future `env_remove` would also fail:
+        // proxy sessions pass a parent-shell window variable through
+        // untouched (USAGE 5.3).
+        let command = build_claude_command(
+            "http://127.0.0.1:13521",
+            "ccm-local-abc",
+            "ccm",
+            ProviderAuth::Bearer,
+            Some("http://127.0.0.1:13521"),
+            Some("abc"),
+            None,
+        );
+        assert_eq!(
+            env_value(&command, "CCM_PROXY_URL"),
+            Some(OsStr::new("http://127.0.0.1:13521"))
+        );
+        assert_eq!(
+            env_value(&command, "CCM_CLIENT_ID"),
+            Some(OsStr::new("abc"))
+        );
+        assert!(env_key_untouched(
+            &command,
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        ));
+    }
 
     #[test]
     fn custom_headers_without_parent_value_is_just_our_line() {
@@ -328,6 +471,7 @@ mod tests {
                 crate::model::Model {
                     provider: "deepseek".to_string(),
                     model_id: "deepseek-chat".to_string(),
+                    context_window: None,
                     routing: crate::model::ModelRouting::default(),
                     pricing: None,
                 },

@@ -202,6 +202,32 @@ Routing metadata is static user-provided metadata:
 
 These are not measured billing or benchmark values.
 
+A Model may also declare its real context window (v0.5 post-release):
+
+```toml
+[models.glm]
+provider = "zai"
+model_id = "glm-5.3"
+context_window = 1000000
+```
+
+Claude Code does not know third-party model ids and assumes a small
+default window for them, proactively auto-compacting long sessions at a
+fraction of the real one. A declared window makes direct-mode launches
+inject `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — for ids Claude Code cannot
+resolve the variable applies directly (v2.1.193+), so proactive
+compaction runs near the true window. `None` = undeclared: the launch
+environment is left untouched (a parent-shell value passes through).
+Official `claude-*` ids need no declaration — Claude Code knows their
+windows natively, and the variable is inert for recognized ids unless
+`DISABLE_COMPACT` is also set. Proxy launches never inject: the
+launch-time target goes stale under a runtime `ccm switch`. Zero is
+rejected at config load and at `add_model` (clap's range parser covers
+the flag path). The starter ships glm = 1,000,000 (z.ai's documented
+window — a capability fact, not a plan-dependent price); claude stays
+undeclared; discover-registered models land undeclared (`/v1/models`
+carries no window data — the same hand-entered-fact policy as pricing).
+
 ### Profile
 
 Profiles are legacy one-model aliases.
@@ -576,6 +602,10 @@ Direct mode launches `claude` with:
 - exactly one of:
   - `ANTHROPIC_API_KEY`
   - `ANTHROPIC_AUTH_TOKEN`
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — only when the model declares
+  `context_window` (v0.5 post-release; see §4). An undeclared model
+  leaves the parent value untouched. Proxy launches never set it (the
+  launch-time target goes stale under a runtime `ccm switch`).
 
 Proxy mode launches Claude against CCM with the placeholder credential
 `ANTHROPIC_AUTH_TOKEN=ccm-local-<client-id>` and also exports:

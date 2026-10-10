@@ -118,6 +118,18 @@ pub enum AddCommand {
         cost_weight: f64,
         #[arg(long, default_value_t = 1.0)]
         quality_weight: f64,
+        /// Declare the model's real context window in tokens. Direct-mode
+        /// launches inject it as CLAUDE_CODE_MAX_CONTEXT_TOKENS so Claude
+        /// Code's auto-compaction runs at the true threshold instead of its
+        /// assumed default for unknown model ids. The upper bound is TOML's
+        /// integer ceiling (i64::MAX): a value that parses but cannot
+        /// persist in config.toml must fail here at the flag, not later at
+        /// config save with a confusing write error.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..=i64::MAX as u64)
+        )]
+        context_window: Option<u64>,
     },
     Route {
         name: String,
@@ -242,5 +254,75 @@ mod tests {
             let parsed = Cli::try_parse_from(["ccm", "history", sub, "--limit", "1"]);
             assert!(parsed.is_ok(), "{sub}: --limit 1 must still parse");
         }
+    }
+
+    /// `--context-window 0` and values above TOML's integer ceiling are
+    /// rejected at parse time, same reasoning as `--limit 0`: zero tokens
+    /// is not a window, and an unpersistable value must die at the flag,
+    /// not at config save. Hand-edited TOML gets the same zero rejection
+    /// at config load with its own wording ("must be greater than 0",
+    /// where clap says "invalid value"); the hand-edited ceiling is
+    /// bounded by TOML's own parser.
+    #[test]
+    fn context_window_zero_is_rejected_at_parse_time() {
+        let error = Cli::try_parse_from([
+            "ccm",
+            "add",
+            "model",
+            "glm",
+            "--provider",
+            "zai",
+            "--model-id",
+            "glm-5.3",
+            "--context-window",
+            "0",
+        ])
+        .expect_err("--context-window 0 must not parse");
+        let message = error.to_string();
+        assert!(message.contains("invalid value"), "{message}");
+        assert!(message.contains('0'), "{message}");
+
+        // i64::MAX + 1 parses as u64 but cannot persist in TOML.
+        let error = Cli::try_parse_from([
+            "ccm",
+            "add",
+            "model",
+            "glm",
+            "--provider",
+            "zai",
+            "--model-id",
+            "glm-5.3",
+            "--context-window",
+            "9223372036854775808",
+        ])
+        .expect_err("--context-window above i64::MAX must not parse");
+        assert!(error.to_string().contains("invalid value"), "{error}");
+
+        let parsed = Cli::try_parse_from([
+            "ccm",
+            "add",
+            "model",
+            "glm",
+            "--provider",
+            "zai",
+            "--model-id",
+            "glm-5.3",
+            "--context-window",
+            "1000000",
+        ]);
+        assert!(parsed.is_ok(), "--context-window 1000000 must parse");
+        let parsed = Cli::try_parse_from([
+            "ccm",
+            "add",
+            "model",
+            "glm",
+            "--provider",
+            "zai",
+            "--model-id",
+            "glm-5.3",
+            "--context-window",
+            "9223372036854775807",
+        ]);
+        assert!(parsed.is_ok(), "--context-window i64::MAX must parse");
     }
 }

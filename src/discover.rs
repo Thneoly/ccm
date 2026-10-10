@@ -144,6 +144,12 @@ pub async fn run(config: &mut AppConfig, provider_name: Option<String>, all: boo
                     Model {
                         provider: name.clone(),
                         model_id: model.id.clone(),
+                        // /v1/models carries no window data (M0: the client
+                        // never calls it), so a discovered model lands
+                        // undeclared — same policy as pricing: the window is
+                        // a hand-entered capability fact, `ccm add model
+                        // --context-window` or config.toml.
+                        context_window: None,
                         routing: ModelRouting::default(),
                         // Prices are hand-entered TOML facts, never CLI
                         // defaults (the `ccm add model` policy).
@@ -961,6 +967,7 @@ mod tests {
                 Model {
                     provider: "mockz".to_string(),
                     model_id: "glm-5.3".to_string(),
+                    context_window: None,
                     routing: ModelRouting {
                         cost_weight: 0.25,
                         quality_weight: 0.85,
@@ -1204,6 +1211,10 @@ mod tests {
         assert!(
             config.models.values().all(|m| m.pricing.is_none()),
             "prices are hand-entered, never CLI defaults"
+        );
+        assert!(
+            config.models.values().all(|m| m.context_window.is_none()),
+            "windows are hand-entered like prices — discovery lands undeclared"
         );
 
         // The saved config on disk matches (the ccm list of a new shell).

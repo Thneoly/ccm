@@ -38,6 +38,11 @@ pub async fn run(config: &AppConfig) -> Result<()> {
     };
     println!("✓ model id: {}", model.model_id);
 
+    // The provider lookup precedes the context-window block: its line and
+    // the settings-conflict check below both promise DIRECT-LAUNCH
+    // injection, which never happens when the provider is missing (`ccm
+    // run` aborts at "unknown provider" before any injection) — the same
+    // honesty as the proxy-only suppression further down.
     let Some(provider) = config.providers.get(&model.provider) else {
         println!("✗ provider `{}` is missing from config", model.provider);
         return Ok(());
@@ -45,7 +50,17 @@ pub async fn run(config: &AppConfig) -> Result<()> {
     println!("✓ provider: {}", model.provider);
     println!("✓ base URL: {}", provider.base_url);
 
-    if launcher::is_openai_compatible_model(config, &route.primary) {
+    // Computed once: it gates the context-window line here and prints the
+    // proxy-only note further down.
+    let proxy_only = launcher::is_openai_compatible_model(config, &route.primary);
+    if let Some(line) = context_window_line(&model.model_id, model.context_window, proxy_only) {
+        println!("{line}");
+    }
+    if should_check_window_override(model.context_window, proxy_only) {
+        check_claude_window_override();
+    }
+
+    if proxy_only {
         println!("! current target: {}", launcher::PROXY_ONLY_REASON);
     }
 
@@ -131,6 +146,46 @@ fn discovery_verdict(status: u16, content_type: &str, provider: &str) -> String 
         ),
         status => format!("! discovery endpoint: /v1/models answered ({status})"),
     }
+}
+
+/// The context-window line for the current model. `Some` → the declared
+/// window and where it goes; `None` + a non-claude id → a `!` advisory,
+/// because Claude Code does not know third-party ids and assumes a default
+/// window for them — the premature auto-compaction users actually feel;
+/// `None` + a claude id → no line (Claude Code knows those windows natively,
+/// and the variable would be inert for them anyway, v2.1.193+).
+/// Proxy-only (openai-compatible) models get NO line in either arm: the
+/// line's promise is direct-launch injection, which never happens for
+/// them — the proxy-only note owns that story.
+fn context_window_line(
+    model_id: &str,
+    context_window: Option<u64>,
+    proxy_only: bool,
+) -> Option<String> {
+    if proxy_only {
+        return None;
+    }
+    match context_window {
+        Some(window) => Some(format!(
+            "✓ context window: {window} tokens (injected as CLAUDE_CODE_MAX_CONTEXT_TOKENS on direct launches)"
+        )),
+        None if !is_claude_model_id(model_id) => Some(format!(
+            "! context window: undeclared — Claude Code does not know `{model_id}` and assumes a default window for it (the frequent premature auto-compaction); set `context_window` on the model (guide 5.3)"
+        )),
+        None => None,
+    }
+}
+
+/// Best-effort "Claude Code knows this id's window natively" check: ids
+/// carrying a `claude` spelling plausibly resolve to a model Claude Code
+/// recognizes; anything else gets the undeclared advisory. The heuristic
+/// errs toward false POSITIVES: official `claude-*` ids always carry the
+/// spelling, but a third-party id that merely contains it (e.g.
+/// `glm-5.3-claude-edition`) is classified as natively known and its
+/// advisory suppressed. USAGE 3.4 documents the check as exactly this
+/// spelling rule.
+fn is_claude_model_id(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().contains("claude")
 }
 
 // v0.4 M5: an informative look at the observability history store. Non-fatal
@@ -275,6 +330,54 @@ fn anthropic_env_overrides(value: &serde_json::Value) -> Vec<&'static str> {
     .collect()
 }
 
+/// Pure decision for [`check_claude_window_override`]: does this parsed
+/// Claude Code settings file set `CLAUDE_CODE_MAX_CONTEXT_TOKENS`? The
+/// settings env block stacks AFTER ccm's per-launch injection (the same
+/// mechanism as the ANTHROPIC_* overrides), so the settings value silently
+/// wins over a declared `context_window` on direct launches.
+fn window_override_in(value: &serde_json::Value) -> bool {
+    value
+        .get("env")
+        .and_then(|env| env.as_object())
+        .is_some_and(|env| env.contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+}
+
+/// Pure decision for the settings-conflict check in [`run`]: the conflict
+/// only exists where ccm injects — a declared window on a
+/// direct-launchable model. For undeclared or proxy sessions that variable
+/// is the documented Claude-Code-side mechanism (guide 5.3), never a
+/// conflict, so the check never runs there.
+fn should_check_window_override(context_window: Option<u64>, proxy_only: bool) -> bool {
+    context_window.is_some() && !proxy_only
+}
+
+/// Warn when Claude Code's own settings env block carries a
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` that would override the declared
+/// window. Called only against a declared, direct-launchable window — for
+/// undeclared or proxy sessions that variable is the documented
+/// Claude-Code-side mechanism (guide 5.3), not a conflict, so it is never
+/// flagged there.
+fn check_claude_window_override() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    for name in ["settings.json", "settings.local.json"] {
+        let path = home.join(".claude").join(name);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let raw = raw.trim_start_matches('\u{feff}');
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if window_override_in(&value) {
+            println!(
+                "! {name}: env block sets CLAUDE_CODE_MAX_CONTEXT_TOKENS — it wins over the declared context_window on direct launches; remove it (guide 5.3)"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +407,69 @@ mod tests {
         assert!(discovery_verdict(302, "text/html", "zai").contains("302"));
         assert!(discovery_verdict(401, "", "zai").contains("needs auth"));
         assert!(discovery_verdict(404, "", "zai").contains("not exposed"));
+    }
+
+    #[test]
+    fn context_window_line_covers_declared_undeclared_and_claude_ids() {
+        // declared: the fact and where it goes
+        assert_eq!(
+            context_window_line("glm-5.3", Some(1_000_000), false).as_deref(),
+            Some(
+                "✓ context window: 1000000 tokens (injected as CLAUDE_CODE_MAX_CONTEXT_TOKENS on direct launches)"
+            )
+        );
+        // undeclared third-party id: the advisory names the model and the fix
+        let advisory = context_window_line("MiniMax-M3", None, false).unwrap();
+        assert!(advisory.starts_with('!'), "{advisory}");
+        assert!(advisory.contains("MiniMax-M3"), "{advisory}");
+        assert!(advisory.contains("context_window"), "{advisory}");
+        // claude spellings stay silent: Claude Code knows those windows
+        assert_eq!(context_window_line("claude-sonnet-5-5", None, false), None);
+        // ...including non-bare spellings it resolves and other casings
+        assert_eq!(
+            context_window_line("anthropic/claude-opus-4-8", None, false),
+            None
+        );
+        assert_eq!(context_window_line("Claude-Sonnet-5-5", None, false), None);
+        // a declared window is stated even for claude ids (the owner said so)
+        assert!(context_window_line("claude-sonnet-5-5", Some(200_000), false).is_some());
+        // proxy-only models never direct-launch, so the line's
+        // injection promise would be false in both arms — suppressed
+        // entirely (the proxy-only note owns that story).
+        assert_eq!(
+            context_window_line("deepseek-chat", Some(128_000), true),
+            None
+        );
+        assert_eq!(context_window_line("deepseek-chat", None, true), None);
+    }
+
+    #[test]
+    fn window_override_check_requires_a_declared_direct_launchable_window() {
+        // The doc-promised gate (USAGE 3.4/5.3): the settings variable is
+        // only a conflict where ccm injects the declared window. Undeclared
+        // or proxy-only models treat it as the documented Claude-Code-side
+        // mechanism — never flagged.
+        assert!(should_check_window_override(Some(1_000_000), false));
+        assert!(!should_check_window_override(None, false));
+        assert!(!should_check_window_override(Some(1_000_000), true));
+        assert!(!should_check_window_override(None, true));
+    }
+
+    #[test]
+    fn window_override_detection_and_its_precision() {
+        // The conflicting key alone is enough...
+        assert!(window_override_in(&json!({
+            "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"}
+        })));
+        // ...unrelated env keys are not it...
+        assert!(!window_override_in(&json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://example.com"}
+        })));
+        // ...and neither are other blocks or missing env.
+        assert!(!window_override_in(
+            &json!({"other": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1"}})
+        ));
+        assert!(!window_override_in(&json!({})));
     }
 
     #[test]

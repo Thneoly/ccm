@@ -12,7 +12,7 @@ CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方
 
 | 概念 | 是什么 | 定义位置 |
 |---|---|---|
-| 模型（model） | 一个具体可用的模型：所属 provider + `model_id` + 相对成本/质量权重 | config.toml |
+| 模型（model） | 一个具体可用的模型：所属 provider + `model_id` + 相对成本/质量权重（+ 可选 context window，见 5.3） | config.toml |
 | 路由（route） | 候选列表（primary + fallback 顺序）+ 选择策略 + 重试/超时/熔断参数 | config.toml |
 | 本地代理（proxy） | 运行在 `127.0.0.1:13521` 的反向代理：注入凭据、执行路由/fallback/熔断、暴露 `/_ccm/*` 观测接口 | 进程（`ccm proxy`） |
 
@@ -154,7 +154,7 @@ Initialized C:\Users\you\.ccm\state.toml
 | provider | `anthropic` | kind `anthropic`，`https://api.anthropic.com`，`x-api-key` |
 | provider | `zai` | kind `anthropic-compatible`，`https://api.z.ai/api/anthropic`，`x-api-key` |
 | model | `claude` | provider `anthropic`，model_id `claude-sonnet-5-5` |
-| model | `glm` | provider `zai`，model_id `glm-5.3`，cost_weight 0.25，quality_weight 0.85 |
+| model | `glm` | provider `zai`，model_id `glm-5.3`，cost_weight 0.25，quality_weight 0.85，context_window 1000000（见 5.3） |
 | profile | `coding` | → `claude` |
 | profile | `fast` | → `glm` |
 | route | `coding-route` | primary `claude`，fallback `[glm]`，默认策略 |
@@ -196,7 +196,7 @@ Saved model minimax
 
 ```powershell
 ccm add provider zai --base-url https://api.z.ai/api/anthropic --kind anthropic-compatible --auth x-api-key
-ccm add model glm --provider zai --model-id glm-5.3 --cost-weight 0.25 --quality-weight 0.85
+ccm add model glm --provider zai --model-id glm-5.3 --cost-weight 0.25 --quality-weight 0.85 --context-window 1000000
 ```
 
 `ccm add provider` 参数：
@@ -207,7 +207,7 @@ ccm add model glm --provider zai --model-id glm-5.3 --cost-weight 0.25 --quality
 | `--kind` | `anthropic` / `anthropic-compatible` / `compatible` / `openai-compatible` / `openai`（不分大小写） | 交互提示 `Kind (anthropic / anthropic-compatible / openai-compatible):` |
 | `--auth` | `x-api-key`（别名 `x_api_key` / `apikey` / `api-key`）或 `bearer`（别名 `authorization`） | 按 kind 决定：anthropic 类默认 `x-api-key`，openai-compatible 默认 `bearer` |
 
-`ccm add model` 参数：`--provider`（必须指向已存在的 provider）、`--model-id`（省略则交互提示）；`--cost-weight` / `--quality-weight` 默认各 `1.0`（语义见 5.3）。
+`ccm add model` 参数：`--provider`（必须指向已存在的 provider）、`--model-id`（省略则交互提示）；`--cost-weight` / `--quality-weight` 默认各 `1.0`（语义见 5.3）；`--context-window`（token 数，≥ 1，省略 = 不声明——语义与什么时候该填见 5.3）。
 
 注意：`add provider` 是 upsert，同名会**静默覆盖**。另外所有 `ccm add` 都是交互友好的，但在脚本/CI 里请把 flag 传全，避免卡在提示上。
 
@@ -239,6 +239,7 @@ CCM doctor
 ✓ model id: glm-5.3
 ✓ provider: zai
 ✓ base URL: https://api.z.ai/api/anthropic
+✓ context window: 1000000 tokens (injected as CLAUDE_CODE_MAX_CONTEXT_TOKENS on direct launches)
 ✓ credential: present
 ✓ discovery endpoint: /v1/models answered (200)
 
@@ -246,9 +247,10 @@ For a full authenticated model check, run `ccm health glm`.
 ```
 
 - `endpoint` 一行（v0.5 起改名 discovery endpoint）对 `{base_url}/v1/models` 发起**不带凭据**、**不跟随重定向**的 GET（10 秒超时）：200 且 JSON（或无 content-type）→ `✓ answered`；200 但响应不是 JSON（登录页/兜底页也答 200）→ `!` 提示并由 `ccm discover <provider>` 确证；401/403 → `✓ exists (needs auth)`，此时带凭据的 `ccm discover <provider>`（见 3.5）能拉到清单；404/405 → `! not exposed`，该网关不支持清单发现，模型得手动加；其余状态（含 SSO 的 302）→ `! answered ({status})`。
+- `context window` 一行（v0.5 后新增）：当前模型声明了窗口 → `✓ ... tokens (...)`；未声明且 model id 不是 `claude` 拼写 → `! undeclared` 提示（Claude Code 不认识第三方 id，按假定的小窗口提前压缩——正是 "频繁 Compacting conversation" 的根源，修法见 5.3）；`claude-*` 类 id 未声明时**不出现**这一行（Claude Code 原生认识它们的窗口）；当前模型属于 openai-compatible provider 时整行同样**不出现**——它不能直连，声明的窗口永远不会被注入（这个场景由下面的 openai-compatible 提示行负责说明）。
 - `Claude Code` 一行解析 `claude --version` 输出并带版本号；低于 2.1.227 时追加一行警告——该版本起才支持 `ANTHROPIC_CUSTOM_HEADERS`（ccm 注入的客户端身份头），更早的版本客户端身份只能走 `ccm-local-<id>` token 通道。
 - 当前目标属于 openai-compatible provider 时，会多一行 `! current target: openai-compatible models are proxy-only (...)`——该目标只能走代理模式（见 4.2 / 5.5）。
-- `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键（含 `ANTHROPIC_CUSTOM_HEADERS`，会顶掉 ccm 注入的客户端身份头）会覆盖 ccm 的注入（见 FAQ）。
+- `settings.json` 一行检查 Claude Code 自己的 `~/.claude/settings.json` / `settings.local.json` 的 `env` 块——那里的 `ANTHROPIC_*` 键（含 `ANTHROPIC_CUSTOM_HEADERS`，会顶掉 ccm 注入的客户端身份头）会覆盖 ccm 的注入（见 FAQ）。当前模型声明了 `context_window` 且可直连时，`env` 块里的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 也会被单独检出并提示——它会静默顶掉声明值（见 5.3）；仅在声明了窗口且可直连（非 openai-compatible）时检查，因为未声明/代理场景下该变量是 5.3 认可的 Claude Code 侧设置途径。
 - `history` 一行显示持久化历史目录状态（v0.4，见 6.3）：文件数；目录还空着或 `[observability] history_enabled = false` 时是 `!` 提示（非致命，不影响后面各项）。
 - 链路中途失败会提前结束（例如 `✗ target `...`: ...`），后面的检查不再打印。
 - 刚 `init` 完（current 还是 `claude` 且没存 anthropic key）时，凭据行会是：
@@ -301,7 +303,7 @@ Saved model glm-5-3-flash
 - **拉清单是只读的**：确认选择之前不写任何配置；注册只写 config.toml（新模型路由权重 1.0/1.0）。
 - **skip 不覆盖**：同 provider 下已注册的 `model_id` 跳过并提示——手工调过的权重和定价永不被 discover 动到（想覆盖走 `ccm add model`）。
 - **别名** = 规范化的 model_id（非 `[A-Za-z0-9_-]` 字符替换成 `-`；与现有配置里的名字冲突——**含其他 provider 的模型别名和 profile 名**——或同批内冲突时，加 `-2`/`-3` 后缀避开，绝不覆盖已有条目）。
-- **定价是手填事实，不由 CLI 代填**：新注册模型不带定价表，discover 为每个选中的未定价模型打印注释掉的 `[models.<alias>.pricing]` 骨架。填好价格，`ccm advise`（6.6）才有依据——discover → 手填价 → advise 是设计好的闭环（见 5.3）。
+- **定价是手填事实，不由 CLI 代填**：新注册模型不带定价表，discover 为每个选中的未定价模型打印注释掉的 `[models.<alias>.pricing]` 骨架。填好价格，`ccm advise`（6.6）才有依据——discover → 手填价 → advise 是设计好的闭环（见 5.3）。`context_window` 同理：`/v1/models` 清单里没有窗口数据，需要的话按 5.3 补一行。
 - **分页**：anthropic 类 `has_more` 游标分页自动跟进（上限 10 页，触顶提示清单可能不完整）；z.ai 这类不分页的网关一次拉完。清单行带 `display_name`（anthropic 类）或 `(owned by ...)`（openai 类）时一并显示。
 - **鉴权**：按 provider 的 `auth` 配置注入凭据（anthropic 类附 `anthropic-version: 2023-06-01`），单请求 10 秒超时；凭据只发给配置的网关主机——**不跟随重定向**（302 按原状态报错），错误文案里引用的网关响应体会先抹掉凭据本身（网关把 key 回显进错误体也打印不出来）。清单形状与声明的 `kind` 明显不符时（如 openai 类网关返回 anthropic 形状）会先打一行警告，请求仍按声明的 kind 走。
 
@@ -350,9 +352,10 @@ ccm 启动 claude 时设置的环境变量：
 | `ANTHROPIC_MODEL` | 模型的 `model_id` |
 | `ANTHROPIC_API_KEY` | `x-api-key` 类 provider 的 key |
 | `ANTHROPIC_AUTH_TOKEN` | `bearer` 类 provider 的 token |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 模型声明了 `context_window` 时为该值（v0.5 后；见 5.3） |
 | `CCM_PROXY_URL` | 被主动移除（防止残留的代理地址泄漏进直连会话） |
 
-外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。直连会话也不携带 ccm 客户端标识：`CCM_CLIENT_ID` 被移除，父环境 `ANTHROPIC_CUSTOM_HEADERS` 里继承的 `x-ccm-client` 行会被剥掉（其余行保留）。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
+外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 是唯一例外：模型未声明窗口时 ccm 完全不碰它（父环境已有值则原样透传），声明时用声明的值覆盖。直连会话也不携带 ccm 客户端标识：`CCM_CLIENT_ID` 被移除，父环境 `ANTHROPIC_CUSTOM_HEADERS` 里继承的 `x-ccm-client` 行会被剥掉（其余行保留）。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
 
 **openai-compatible 模型不支持直连**：直连模式没有翻译层，ccm 会在启动前直接拒绝并报错 `cannot launch ... directly: openai-compatible models are proxy-only ...`，不会把任何请求发给上游。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
 
@@ -536,7 +539,7 @@ cost        = 1 / (1 + max(cost_weight, 0))（静态，来自模型元数据）
 quality     = quality_weight，截断到 [0,1]
 ```
 
-### 5.3 模型的 cost / quality 权重与定价表
+### 5.3 模型元数据：权重、定价表与 context window
 
 `ccm add model` 的 `--cost-weight` / `--quality-weight`（默认各 `1.0`）：
 
@@ -554,6 +557,28 @@ cache_write = 3.75 # 每百万缓存写入 token
 ```
 
 费用按 `Σ tokens/1e6 × 单价` 计算，单价快照随记录落盘（改价不影响已记的账）。没填定价表的模型按"无价"记账——`cost_usd` 是 `null`，**绝不猜一个数**；聚合视图里单独计数（见 6.4）。
+
+#### context window：声明模型的真实上下文窗口
+
+```toml
+[models.glm]
+provider = "zai"
+model_id = "glm-5.3"
+context_window = 1000000   # 该模型的真实窗口（token 数，>= 1）
+```
+
+**为什么需要它**：Claude Code 不认识第三方 model id（`glm-5.3`、`MiniMax-M3` 这类），对它们按自己**假定**的窗口执行主动压缩（auto-compact）——对 glm-5.3（真实窗口 1M）实测压缩发生在约 15% 处，即按远小于真实窗口的门限在压（社区口径约 200K；官方文档只对 pinned 模型场景明文记载了 200K 默认），于是长会话还没用到真实窗口的一半就开始频繁 "Compacting conversation"。声明 `context_window` 后，**直连模式**启动时 ccm 把它注入为 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`——Claude Code（v2.1.193 起）对无法解析的 id 直接按该值执行主动压缩，压缩推迟到真实窗口附近。
+
+规则与边界：
+
+- **只影响直连模式**（`ccm run <target>`，环境变量在 claude 启动时读取一次）。代理模式**不注入**：代理下目标可以 `ccm switch` 运行时切换，启动时声明的窗口很快就会过期；代理会话如需声明窗口，在 Claude Code 侧自行设置该变量。
+- **`claude-*` id 不需要声明**：Claude Code 原生认识它们的窗口，且对已识别 id 该变量是惰性的（除非同时设 `DISABLE_COMPACT`）——声明了也不生效。
+- **声明过大的窗口有代价**：溢出错误推迟到请求时才暴露（"Prompt is too long"），且恢复性压缩依赖 Claude Code 能识别网关返回的错误文案。按真实窗口填，不要虚标。
+- **未声明 = 不干预**：ccm 既不设置也不清除该变量，父环境若已有值则原样透传。
+- **settings.json 里的同名变量会赢**：Claude Code 自己 `~/.claude/settings.json` 的 `env` 块叠加在 ccm 注入之上（与 `ANTHROPIC_*` 同机制，见 FAQ）——曾在那里手动设过 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 做临时方案的，声明 `context_window` 后记得把它删掉，否则换模型时旧值会静默顶掉新声明（声明了窗口且可直连时 `ccm doctor` 会检出这条冲突并提示）。
+- **`ccm discover` 注册的模型不带窗口**：`/v1/models` 清单不含窗口数据，与定价同策略（手填能力事实），注册后按上面格式补一行即可。
+- **0 被拒绝**：CLI 在解析时、手写 TOML 在加载时都会报错，但措辞不同——CLI 报 `invalid value '0' ... is not in 1..=...`，配置加载报 `context_window must be greater than 0`；上限只受 TOML 整数上限（i64::MAX）约束，超出的值在 flag 解析时即被拒，按模型真实能力填。
+- `ccm doctor` 会诊断当前模型（已声明 → `✓`；未声明的第三方 id → `!` 提示，见 3.4）；`GET /_ccm/models` 在声明时带出 `context_window` 字段。
 
 ### 5.4 熔断与 fallback 行为
 
@@ -647,7 +672,7 @@ fallback = ["glm"]
 | `GET /health` | 存活检查，返回字面量 `ok` |
 | `GET /metrics` | Prometheus 文本格式导出（v0.4 M7，见 6.5）：与全部 `/_ccm/*` 共用同一个仅回环的监听端口，`[observability] prometheus_enabled = false` 时该路由不存在（404） |
 | `GET /_ccm/status` | 当前目标的解析结果：primary、model_id、provider、`kind`（与 provider 平级的顶层字段）、fallback 列表、完整 policy；`?client=<id>` 查询该客户端的生效目标（未切过的客户端会标注跟随全局） |
-| `GET /_ccm/models` | 模型清单：model_id、provider、`kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`；模型引用了未配置的 provider 时为 `unknown`）、cost_weight、quality_weight |
+| `GET /_ccm/models` | 模型清单：model_id、provider、`kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`；模型引用了未配置的 provider 时为 `unknown`）、cost_weight、quality_weight、`context_window`（仅声明时出现该字段，见 5.3） |
 | `GET /_ccm/routes` | 路由清单 + `active` 标记（哪条是当前内存目标） |
 | `GET /_ccm/traces` | 最近 100 条请求尝试记录；`?client=<id>` 只看该客户端 |
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
@@ -944,6 +969,9 @@ export CCM_ZAI_API_KEY="sk-..."
 **为什么 config.toml 里找不到 API key？**
 设计如此。key 只存系统凭据管理器或环境变量，永不入文件（`ccm auth set`）。这不是丢失，是隔离。
 
+**`ccm run glm` 启动的 claude 经常 "Compacting conversation…"，正常吗？**
+这是 Claude Code 在压缩，不是 ccm 或网关——Claude Code 不认识 `glm-5.3` 这类第三方 model id，按自己假定的小窗口（远小于真实 1M）执行主动压缩，长会话自然频繁触发。根治：给模型声明真实窗口（`ccm add model glm ... --context-window 1000000`，或直接在 config.toml 的 `[models.glm]` 下加 `context_window = 1000000`），直连模式启动时 ccm 注入 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，压缩推迟到真实窗口附近。机制、边界（代理模式不注入、claude-* id 不需要、别虚标）见 5.3。样例配置的 glm 已带 1M 声明。
+
 **装完后 `ccm` 提示找不到命令？**
 `install.ps1` 修改的是用户 PATH，**需要新开一个终端**。仍不行就检查 `%LOCALAPPDATA%\Programs\ccm` 是否在 PATH 里；手动安装的话把 `target\release\ccm.exe` 所在目录加进 PATH。
 
@@ -1000,7 +1028,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 |---|---|---|
 | `ccm init` | 初始化 config.toml + state.toml | `--force` |
 | `ccm add provider <name>` | 添加/覆盖 provider | `--base-url`、`--kind`（`anthropic` / `anthropic-compatible` / `openai-compatible`）、`--auth`（按 kind 默认：anthropic 类 `x-api-key`，openai 类 `bearer`） |
-| `ccm add model <name>` | 添加模型 | `--provider`、`--model-id`、`--cost-weight`（1.0）、`--quality-weight`（1.0） |
+| `ccm add model <name>` | 添加模型 | `--provider`、`--model-id`、`--cost-weight`（1.0）、`--quality-weight`（1.0）、`--context-window`（缺省不声明，token 数 >= 1，见 5.3） |
 | `ccm add route <name>` | 添加路由 | `--primary`、`--fallback`、`--selection`（`ordered`）、四个权重（0.4/0.2/0.2/0.2）、`--header-timeout-ms`（30000）、`--fallback-on`（429,502,503,504）、`--max-attempts`（3）、`--backoff-ms`（200）、`--circuit-enabled`（true，需显式传值）、`--failure-threshold`（3）、`--circuit-open-ms`（30000） |
 | `ccm auth set <provider>` | 交互式存 key 进 keyring | — |
 | `ccm auth delete <provider>` | 删除 keyring 条目 | — |

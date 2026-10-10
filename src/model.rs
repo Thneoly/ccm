@@ -29,6 +29,16 @@ impl Default for ModelRouting {
 pub struct Model {
     pub provider: String,
     pub model_id: String,
+    /// The model's real context window in tokens, when declared. Claude
+    /// Code does not know third-party model ids and assumes a small default
+    /// window for them, auto-compacting long sessions at a fraction of the
+    /// real one; a declared window makes direct-mode launches inject
+    /// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` so compaction runs at the true
+    /// threshold. Official `claude-*` ids need no declaration — Claude Code
+    /// knows their windows natively. `None` = undeclared: the launch
+    /// environment is left untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     #[serde(default)]
     pub routing: ModelRouting,
     /// Hand-entered per-MTok prices (v0.4 M6). `None` = unpriced: usage

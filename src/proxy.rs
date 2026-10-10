@@ -3149,6 +3149,63 @@ model_id = "upstream-y"
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(y_mock.requests.lock().unwrap().len(), y_before + 1);
 
+        // /_ccm/models (v0.5 post-release): a declared context_window
+        // appears in the wire JSON; an undeclared model keeps the
+        // pre-feature shape — the key is absent, not null. The config is
+        // rewritten first (each control request reloads it) so modelx
+        // carries a declaration; the mock URLs stay the real ones so this
+        // is pure observation with no routing side effects.
+        std::fs::write(
+            root.join("config.toml"),
+            format!(
+                r#"
+[providers.px]
+kind = "anthropic-compatible"
+base_url = "http://{x_addr}"
+auth = "x-api-key"
+
+[providers.py]
+kind = "anthropic-compatible"
+base_url = "http://{y_addr}"
+auth = "bearer"
+
+[models.modelx]
+provider = "px"
+model_id = "upstream-x"
+context_window = 1000000
+
+[models.modely]
+provider = "py"
+model_id = "upstream-y"
+"#
+            ),
+        )
+        .unwrap();
+        let response = http
+            .get(format!("{base}/_ccm/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let models: Value = response.json().await.unwrap();
+        let modelx = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "modelx")
+            .expect("modelx in /_ccm/models");
+        assert_eq!(modelx["context_window"], 1_000_000u64);
+        let modely = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "modely")
+            .expect("modely in /_ccm/models");
+        assert!(
+            modely.get("context_window").is_none(),
+            "undeclared models keep the pre-feature shape: {modely}"
+        );
+
         router_task.abort();
         x_task.abort();
         y_task.abort();

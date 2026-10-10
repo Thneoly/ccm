@@ -173,6 +173,12 @@ struct ModelView {
     kind: String,
     cost_weight: f64,
     quality_weight: f64,
+    // Declared context window in tokens, when set (v0.5 post-release:
+    // direct-mode launches inject it as CLAUDE_CODE_MAX_CONTEXT_TOKENS).
+    // Absent for undeclared models, so the pre-feature JSON shape is
+    // unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -287,6 +293,7 @@ async fn control_models() -> impl IntoResponse {
                     kind: provider_kind_name(&config, &model.provider),
                     cost_weight: model.routing.cost_weight,
                     quality_weight: model.routing.quality_weight,
+                    context_window: model.context_window,
                 })
                 .collect::<Vec<_>>();
             Json(models).into_response()

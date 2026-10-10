@@ -160,6 +160,7 @@ quality_weight = 1.0
 [models.glm]
 provider = "zai"
 model_id = "glm-5.3"
+context_window = 1000000
 
 [models.glm.routing]
 cost_weight = 0.25
@@ -168,6 +169,8 @@ quality_weight = 0.85
 
 `cost_weight` is a relative cost factor where lower is cheaper. `quality_weight` is a user-supplied relative quality signal; weighted routing clamps it to the 0..1 range. These are routing hints, not measured billing or benchmark data.
 
+Models can also declare their real context window: Claude Code does not know third-party model ids and proactively auto-compacts sessions at a small assumed window — a declared window is injected as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` on direct-mode launches so compaction runs near the true window. `claude-*` ids need no declaration (Claude Code knows their windows natively), and proxy launches never inject it (the launch-time target goes stale under a runtime switch). See the user guide §5.3.
+
 Create models from CLI with:
 
 ```bash
@@ -175,7 +178,8 @@ ccm add model glm \
   --provider zai \
   --model-id glm-5.3 \
   --cost-weight 0.25 \
-  --quality-weight 0.85
+  --quality-weight 0.85 \
+  --context-window 1000000
 ```
 
 Existing model configs that omit `[models.<name>.routing]` remain valid and default both values to `1.0`.
@@ -468,7 +472,7 @@ GET  /_ccm/clients
 POST /_ccm/switch/{model-or-profile-or-route}
 ```
 
-`/_ccm/models` exposes model cost/quality metadata. `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — oldest-first (chronological) and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed). `/metrics` (v0.4 M7) is the Prometheus text exposition — same listener, so the loopback-only bind guard covers it; `prometheus_enabled = false` unregisters the route.
+`/_ccm/models` exposes model cost/quality metadata plus the declared `context_window` (the key is absent for undeclared models, v0.5 post-release). `/_ccm/status` and `/_ccm/routes` expose selection strategy, scoring weights, fallback policy, and circuit-breaker policy. `/_ccm/scores` explains the active route's current candidate scores. `/_ccm/decisions` returns the most recent complete per-request routing decisions. `/_ccm/clients` lists per-client runtime targets; `/_ccm/status`, `/_ccm/traces`, and `/_ccm/decisions` accept a `?client=<id>` filter. `/_ccm/decisions?since=&until=&model=` (unix-ms, inclusive) reads the persisted history from disk instead of the in-memory ring — oldest-first (chronological) and bounded to the most recent 1000 records by default, `?limit=` adjusts (v0.4 M5; a 400 names the cause when no history store is running). `/_ccm/usage` (v0.4 M6) lists captured usage records with the same parameter contract, and `/_ccm/cost?day=YYYY-MM-DD` aggregates one UTC day's tokens and USD cost by model (always disk-backed). `/metrics` (v0.4 M7) is the Prometheus text exposition — same listener, so the loopback-only bind guard covers it; `prometheus_enabled = false` unregisters the route.
 
 The proxy binds to loopback addresses only: `ccm proxy --bind` rejects non-loopback addresses because the control API is unauthenticated.
 
@@ -629,6 +633,7 @@ ccm add provider <name> [--base-url URL]
 ccm add model <name> [--provider PROVIDER] [--model-id MODEL]
   [--cost-weight N]
   [--quality-weight N]
+  [--context-window N]
 ccm add route <name> [--primary MODEL] [--fallback MODEL1,MODEL2]
   [--selection ordered|healthiest|lowest-latency|lowest-cost|weighted]
   [--reliability-weight N]
@@ -755,6 +760,10 @@ GitHub Actions CI runs the release gate ([.github/workflows/ci.yml](.github/work
 - model-level circuit breaker
 - runtime reliability and latency metrics
 - model cost/quality routing metadata
+- per-model declared context windows (v0.5 post-release): direct-mode
+  launches inject `CLAUDE_CODE_MAX_CONTEXT_TOKENS` so Claude Code's
+  proactive auto-compaction runs at the true window for third-party ids
+  (proxy launches never inject; `claude-*` ids need no declaration)
 - `ordered`, `healthiest`, `lowest-latency`, `lowest-cost`, and `weighted` selection
 - transparent weighted scoring
 - explainable candidate score control API
