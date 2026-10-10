@@ -56,6 +56,12 @@ pub enum Command {
         /// short random id). In proxy mode the pre-switch stays scoped to it.
         #[arg(long)]
         client: Option<String>,
+        /// Everything after `--`, passed through to the `claude` process
+        /// verbatim (e.g. `ccm run glm -- --resume <session-id>`). ccm's own
+        /// flags keep parsing normally; claude-style flags land here only,
+        /// so the separator is what disambiguates the two namespaces.
+        #[arg(last = true)]
+        extra: Vec<String>,
     },
     Auth {
         #[command(subcommand)]
@@ -324,5 +330,128 @@ mod tests {
             "9223372036854775807",
         ]);
         assert!(parsed.is_ok(), "--context-window i64::MAX must parse");
+    }
+
+    /// `ccm run` passthrough: everything after `--` reaches `extra`
+    /// verbatim, while ccm's own flags keep parsing normally — including
+    /// after the target. That ordering pin matters: if `--proxy` after the
+    /// target ever fell into passthrough, `ccm run glm --proxy` would
+    /// silently launch DIRECT mode instead of proxy mode. Claude-style
+    /// flags before `--` must be a parse error (clap's tip names the
+    /// separator form), never a silent misroute.
+    #[test]
+    fn run_passthrough_args_parse_after_the_separator() {
+        use super::Command;
+        let parsed = Cli::try_parse_from([
+            "ccm",
+            "run",
+            "glm",
+            "--",
+            "--resume",
+            "656df134-af19-4e23-9736-59563c697c3f",
+        ])
+        .expect("-- passthrough must parse");
+        match parsed.command {
+            Command::Run {
+                target,
+                proxy,
+                extra,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("glm"));
+                assert!(!proxy);
+                assert_eq!(
+                    extra,
+                    vec![
+                        "--resume".to_string(),
+                        "656df134-af19-4e23-9736-59563c697c3f".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected Run"),
+        }
+
+        // ccm flags after the target still parse as ccm flags (regression
+        // pin — see the test doc comment).
+        let parsed = Cli::try_parse_from(["ccm", "run", "glm", "--proxy"])
+            .expect("--proxy stays a ccm flag");
+        match parsed.command {
+            Command::Run {
+                target,
+                proxy,
+                extra,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("glm"));
+                assert!(proxy);
+                assert!(extra.is_empty());
+            }
+            _ => panic!("expected Run"),
+        }
+
+        // Proxy mode composes: ccm flags + target before --, passthrough after.
+        let parsed = Cli::try_parse_from([
+            "ccm",
+            "run",
+            "--proxy",
+            "coding-route",
+            "--client",
+            "term1",
+            "--",
+            "--resume",
+            "abc",
+        ])
+        .expect("proxy + passthrough must parse");
+        match parsed.command {
+            Command::Run {
+                target,
+                proxy,
+                client,
+                extra,
+                ..
+            } => {
+                assert!(proxy);
+                assert_eq!(target.as_deref(), Some("coding-route"));
+                assert_eq!(client.as_deref(), Some("term1"));
+                assert_eq!(extra, vec!["--resume".to_string(), "abc".to_string()]);
+            }
+            _ => panic!("expected Run"),
+        }
+
+        // A claude-style flag before -- is a parse error naming the flag
+        // AND tipping the separator form — the second half is a documented
+        // UX promise (USAGE 4.2: 会在解析时报错并提示加 `--`), so pin the
+        // tip itself, not just the flag name.
+        let error = Cli::try_parse_from(["ccm", "run", "glm", "--resume", "abc"])
+            .expect_err("claude flags must not parse before --");
+        let message = error.to_string();
+        assert!(message.contains("--resume"), "{message}");
+        assert!(message.contains("-- --resume"), "{message}");
+
+        // No-target form: post--- values NEVER fill the target positional
+        // (clap jumps to the last positional once -- is seen), so
+        // `ccm run -- --resume abc` launches the persisted default with
+        // the passthrough intact — the silent-misroute hazard the test
+        // name promises to catch.
+        let parsed = Cli::try_parse_from(["ccm", "run", "--", "--resume", "abc"])
+            .expect("no-target passthrough must parse");
+        match parsed.command {
+            Command::Run { target, extra, .. } => {
+                assert_eq!(target, None);
+                assert_eq!(extra, vec!["--resume".to_string(), "abc".to_string()]);
+            }
+            _ => panic!("expected Run"),
+        }
+
+        // A bare trailing -- parses with empty passthrough.
+        let parsed =
+            Cli::try_parse_from(["ccm", "run", "glm", "--"]).expect("bare trailing -- must parse");
+        match parsed.command {
+            Command::Run { target, extra, .. } => {
+                assert_eq!(target.as_deref(), Some("glm"));
+                assert!(extra.is_empty());
+            }
+            _ => panic!("expected Run"),
+        }
     }
 }

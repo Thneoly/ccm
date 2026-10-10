@@ -662,8 +662,10 @@ ccm history circuit [--model M] [--limit N]
 ccm history cost [--day YYYY-MM-DD] [--client ID]
 ccm advise [--window DAYS] [--min-samples N] [--model M]   (v0.5)
 ccm discover [provider] [--all]                              (v0.5)
-ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
-  (with --proxy a route name also works; direct mode resolves models/profiles only)
+ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>] [-- <claude args>]
+  (with --proxy a route name also works; direct mode resolves models/profiles only;
+   everything after -- passes through to claude, e.g. -- --resume <session-id> — on
+   Windows a small cmd-metacharacter guard applies, docs/USAGE.md §4.2)
 ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>

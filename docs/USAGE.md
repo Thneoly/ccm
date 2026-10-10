@@ -357,6 +357,15 @@ ccm 启动 claude 时设置的环境变量：
 
 外部已存在的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 会先被清除、再注入 ccm 解析的凭据——claude 子进程只会用到 ccm 认可的那一个。`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 是唯一例外：模型未声明窗口时 ccm 完全不碰它（父环境已有值则原样透传），声明时用声明的值覆盖。直连会话也不携带 ccm 客户端标识：`CCM_CLIENT_ID` 被移除，父环境 `ANTHROPIC_CUSTOM_HEADERS` 里继承的 `x-ccm-client` 行会被剥掉（其余行保留）。stdio 直接继承，claude 的输出原样透传。Windows 上 claude 通过 `cmd /c claude` 启动，npm 的 `claude.cmd` shim 和原生 `claude.exe` 都兼容。
 
+**透传 claude 参数**（v0.5 后追加）：`ccm run [ccm 参数] [target] -- <claude 参数>`——`--` 之后的参数原样传给 claude 子进程，例如恢复某个历史会话：
+
+```powershell
+ccm run glm -- --resume 656df134-af19-4e23-9736-59563c697c3f
+ccm run --proxy coding-route -- --resume 656df134-af19-4e23-9736-59563c697c3f   # 代理模式同样支持
+```
+
+`--` 是两个参数命名空间的分界：ccm 自己的 flag（`--proxy` / `--proxy-url` / `--client`）放在 `--` **之前**照常解析（`ccm run glm --proxy` 仍是代理模式，不会被当成 claude 参数），claude 的参数放 `--` **之后**；写在 `--` 之前的 claude 风格参数（如 `ccm run glm --resume <id>`）会在解析时报错并提示加 `--`（`ccm run -- <claude 参数>` 这种不带 target 的形式也合法，`--` 之后的值永远不会被误当成 target）。不带 `--` 时行为与之前完全一致。Windows 边界：ccm 经 `cmd /c claude` 启动，含 `& | < > ^ "` 或换行符的透传参数会被**直接拒绝**并指名是哪个参数（ccm 不做转义、不猜测——要传这类值就自己开 shell 启动 claude）；`%` 不在拒绝列表（cmd 的变量展开需要成对 `%`，正常的 id / flag / 数值不受影响）。
+
 **openai-compatible 模型不支持直连**：直连模式没有翻译层，ccm 会在启动前直接拒绝并报错 `cannot launch ... directly: openai-compatible models are proxy-only ...`，不会把任何请求发给上游。openai 类模型请走代理模式（`ccm proxy` + `ccm run --proxy`）。
 
 没选过默认目标时：`no current model selected; run `ccm use <name>` first`。直连模式下路由名不可用——解析口径只有模型/profile，传路由名会报 `unknown model/profile `...``。
@@ -385,6 +394,7 @@ Runtime switch: `ccm switch <model-or-profile-or-route>`.
 ccm run --proxy                # 用代理当前的目标（自动生成随机 client id，见 4.6）
 ccm run --proxy coding-route   # 把本会话切到 coding-route 再启动（只作用于本会话，见 4.6）
 ccm run --proxy --client dev1  # 显式指定 client id
+ccm run --proxy -- --resume 656df134-af19-4e23-9736-59563c697c3f   # -- 之后的参数透传给 claude（见 4.2）
 ```
 
 claude 拿到的是占位配置：`ANTHROPIC_BASE_URL=<代理地址>`、`ANTHROPIC_MODEL=ccm`、`ANTHROPIC_AUTH_TOKEN=ccm-local-<client-id>`、`CCM_PROXY_URL=<代理地址>`，外加客户端标识 `CCM_CLIENT_ID=<client-id>` 和 `ANTHROPIC_CUSTOM_HEADERS`（内容为一行 `x-ccm-client: <client-id>`；父环境已有该变量时，ccm 保留其余行、只把 `x-ccm-client` 行替换成自己的）——真实路由与鉴权全部由运行中的代理完成。
@@ -1041,7 +1051,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `ccm history cost` | 离线查看按 UTC 日聚合的使用量与成本表（见 6.4） | `--day`（`YYYY-MM-DD`，缺省今天）、`--client` |
 | `ccm advise` | 从真实使用量建议 `cost_weight`（只打印不写配置，见 6.6） | `--window`（7 天）、`--min-samples`（20）、`--model` |
 | `ccm proxy` | 启动本地代理 | `--bind`（`127.0.0.1:13521`，仅回环） |
-| `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话） |
+| `ccm run [target]` | 启动 claude（直连或代理） | `--proxy`、`--proxy-url`（`http://127.0.0.1:13521`）、`--client <id>`（代理模式 client id，默认 `CCM_CLIENT_ID` > 随机短 id；带 target 时预切换只作用于本会话）、`-- <claude 参数>`（`--` 之后的参数原样透传给 claude，如 `--resume <id>`；见 4.2） |
 | `ccm list` | 列出模型与路由（`*` = 当前） | — |
 | `ccm current` | 显示持久默认目标 | — |
 | `ccm doctor` | 本地体检 | — |

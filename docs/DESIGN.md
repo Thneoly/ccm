@@ -607,6 +607,17 @@ Direct mode launches `claude` with:
   leaves the parent value untouched. Proxy launches never set it (the
   launch-time target goes stale under a runtime `ccm switch`).
 
+Both launch modes also pass command-line arguments through verbatim
+(v0.5 post-release): everything after `--` on the `ccm run` command line
+(`ccm run glm -- --resume <session-id>`) is appended after the `claude`
+token. ccm's own flags keep parsing before the separator — `ccm run glm
+--proxy` remains proxy mode. On Windows the spawn goes through `cmd /c`,
+so passthrough args containing cmd metacharacters (`& | < > ^ "`,
+line breaks) are rejected with a naming error rather than escaped, and
+`%PAIR%` expansion is a documented residual caveat (USAGE 4.2) rather
+than a blocked one; other platforms exec `claude` directly with no shell
+in between.
+
 Proxy mode launches Claude against CCM with the placeholder credential
 `ANTHROPIC_AUTH_TOKEN=ccm-local-<client-id>` and also exports:
 

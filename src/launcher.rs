@@ -1,6 +1,6 @@
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
     config::AppConfig,
@@ -13,7 +13,8 @@ use crate::{
 /// `ccm doctor` note for an openai-kind current target.
 pub(crate) const PROXY_ONLY_REASON: &str = "openai-compatible models are proxy-only (protocol translation exists only inside the ccm proxy; a direct launch would send the Anthropic protocol to an OpenAI endpoint) — start `ccm proxy` and use `ccm run --proxy`";
 
-pub fn run_claude(config: &AppConfig, model_name: &str) -> Result<()> {
+pub fn run_claude(config: &AppConfig, model_name: &str, extra: &[String]) -> Result<()> {
+    validate_passthrough_args(extra)?;
     let model = config
         .models
         .get(model_name)
@@ -30,10 +31,12 @@ pub fn run_claude(config: &AppConfig, model_name: &str) -> Result<()> {
         &model.model_id,
         provider.resolved_auth(),
         model.context_window,
+        extra,
     )
 }
 
-pub fn run_claude_via_proxy(proxy_url: &str, client_id: &str) -> Result<()> {
+pub fn run_claude_via_proxy(proxy_url: &str, client_id: &str, extra: &[String]) -> Result<()> {
+    validate_passthrough_args(extra)?;
     run_command_with_proxy_env(
         proxy_url.trim_end_matches('/'),
         &format!("ccm-local-{client_id}"),
@@ -41,6 +44,7 @@ pub fn run_claude_via_proxy(proxy_url: &str, client_id: &str) -> Result<()> {
         ProviderAuth::Bearer,
         proxy_url,
         client_id,
+        extra,
     )
 }
 
@@ -50,8 +54,9 @@ fn run_command(
     model: &str,
     auth: ProviderAuth,
     context_window: Option<u64>,
+    extra: &[String],
 ) -> Result<()> {
-    run_command_inner(base_url, token, model, auth, None, None, context_window)
+    run_command_inner(base_url, token, model, auth, None, context_window, extra)
 }
 
 fn run_command_with_proxy_env(
@@ -61,15 +66,16 @@ fn run_command_with_proxy_env(
     auth: ProviderAuth,
     proxy_url: &str,
     client_id: &str,
+    extra: &[String],
 ) -> Result<()> {
     run_command_inner(
         base_url,
         token,
         model,
         auth,
-        Some(proxy_url),
-        Some(client_id),
+        Some((proxy_url, client_id)),
         None,
+        extra,
     )
 }
 
@@ -85,24 +91,57 @@ pub fn claude_command() -> Command {
     }
 }
 
+/// The cmd.exe metacharacters ccm refuses to pass through on Windows.
+/// std's Windows quoting wraps args containing spaces/tabs, but `&`, `|`,
+/// `<`, `>`, `^`, and `"` inside an otherwise-unquoted token are
+/// re-interpreted by `cmd /c` as command syntax — and ccm launches claude
+/// through cmd (the `.cmd` shim rule above). `\n`/`\r` join them: std does
+/// not quote them, and cmd treats a bare line break as a command separator
+/// (verify-pass fix). A loud parse-time rejection beats guessing an
+/// escaping strategy cmd may or may not honor. `%` is deliberately not
+/// listed: variable expansion needs a matching `%pair%`, and rejecting
+/// every percent would bar legitimate values; USAGE 4.2 states the caveat.
+const CMD_METACHARACTERS: [char; 8] = ['&', '|', '<', '>', '^', '"', '\n', '\r'];
+
+/// Pure core of [`validate_passthrough_args`]: the first cmd metacharacter
+/// in `arg`, if any.
+fn disallowed_cmd_metacharacter(arg: &str) -> Option<char> {
+    arg.chars().find(|ch| CMD_METACHARACTERS.contains(ch))
+}
+
+/// Reject passthrough args ccm cannot carry safely through `cmd /c` on
+/// Windows (see [`CMD_METACHARACTERS`]). Other platforms pass through
+/// untouched: their spawn path execs `claude` directly, no shell in
+/// between. Called BEFORE any side effect by the `ccm run` dispatch (ahead
+/// of the proxy pre-switch) and re-called by both entry points (`run_claude`,
+/// `run_claude_via_proxy`) ahead of any config lookup or credential
+/// resolution.
+pub(crate) fn validate_passthrough_args(extra: &[String]) -> Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    for arg in extra {
+        if let Some(found) = disallowed_cmd_metacharacter(arg) {
+            bail!(
+                "passthrough argument `{arg}` contains `{found}`, which ccm does not escape through `cmd /c` on Windows; \
+                 rewrite the argument or launch claude from your own shell"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_command_inner(
     base_url: &str,
     token: &str,
     model: &str,
     auth: ProviderAuth,
-    proxy_url: Option<&str>,
-    client_id: Option<&str>,
+    proxy: Option<(&str, &str)>,
     context_window: Option<u64>,
+    extra: &[String],
 ) -> Result<()> {
-    let mut command = build_claude_command(
-        base_url,
-        token,
-        model,
-        auth,
-        proxy_url,
-        client_id,
-        context_window,
-    );
+    let mut command =
+        build_claude_command(base_url, token, model, auth, proxy, context_window, extra);
 
     let status = command
         .stdin(Stdio::inherit())
@@ -122,17 +161,24 @@ fn run_command_inner(
 
 /// Assemble the `claude` child-process environment without spawning it, so
 /// the injected variables are testable without touching the real process.
-/// The spawn half lives in `run_command_inner`.
+/// The spawn half lives in `run_command_inner`. `proxy` is the session
+/// shape — `(proxy_url, client_id)`, both present together or neither —
+/// which two independent Options could only promise by convention.
 fn build_claude_command(
     base_url: &str,
     token: &str,
     model: &str,
     auth: ProviderAuth,
-    proxy_url: Option<&str>,
-    client_id: Option<&str>,
+    proxy: Option<(&str, &str)>,
     context_window: Option<u64>,
+    extra: &[String],
 ) -> Command {
     let mut command = claude_command();
+    // Passthrough args ride AFTER the `claude` token (`cmd /c claude
+    // --resume <id>` / `claude --resume <id>`). Windows metacharacters were
+    // rejected at the entry points (validate_passthrough_args); std's arg
+    // quoting handles everything else.
+    command.args(extra);
     command
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("ANTHROPIC_MODEL", model)
@@ -150,14 +196,14 @@ fn build_claude_command(
         command.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", window.to_string());
     }
 
-    if let Some(proxy_url) = proxy_url {
+    if let Some((proxy_url, _)) = proxy {
         command.env("CCM_PROXY_URL", proxy_url);
     } else {
         command.env_remove("CCM_PROXY_URL");
     }
 
-    match client_id {
-        Some(client_id) => {
+    match proxy {
+        Some((_, client_id)) => {
             command.env("CCM_CLIENT_ID", client_id).env(
                 "ANTHROPIC_CUSTOM_HEADERS",
                 merge_custom_headers(parent_custom_headers().as_deref(), client_id),
@@ -318,8 +364,8 @@ mod tests {
             "glm-5.3",
             ProviderAuth::XApiKey,
             None,
-            None,
             Some(1_000_000),
+            &[],
         );
         assert_eq!(
             env_value(&command, "CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
@@ -339,7 +385,7 @@ mod tests {
             ProviderAuth::XApiKey,
             None,
             None,
-            None,
+            &[],
         );
         assert!(env_key_untouched(
             &command,
@@ -363,9 +409,9 @@ mod tests {
             "ccm-local-abc",
             "ccm",
             ProviderAuth::Bearer,
-            Some("http://127.0.0.1:13521"),
-            Some("abc"),
+            Some(("http://127.0.0.1:13521", "abc")),
             None,
+            &[],
         );
         assert_eq!(
             env_value(&command, "CCM_PROXY_URL"),
@@ -379,6 +425,129 @@ mod tests {
             &command,
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
         ));
+    }
+
+    #[test]
+    fn passthrough_args_ride_after_the_claude_token() {
+        // The passthrough contract (USAGE 4.2): extra args appear as
+        // command-line arguments after the `claude` token, while the env
+        // injection (here: the declared window) happens alongside — the two
+        // mechanisms compose, neither replaces the other. The argv is
+        // asserted EXACTLY, per platform, so both membership and order are
+        // pinned (`get_args()` excludes the program token — on Unix the
+        // program IS `claude`, so the args are only the passthrough).
+        let extra = [
+            "--resume".to_string(),
+            "656df134-af19-4e23-9736-59563c697c3f".to_string(),
+        ];
+        let command = build_claude_command(
+            "https://api.z.ai/api/anthropic",
+            "tok",
+            "glm-5.3",
+            ProviderAuth::XApiKey,
+            None,
+            Some(1_000_000),
+            &extra,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(
+                args,
+                [
+                    "/c",
+                    "claude",
+                    "--resume",
+                    "656df134-af19-4e23-9736-59563c697c3f"
+                ]
+            );
+        } else {
+            assert_eq!(command.get_program(), "claude");
+            assert_eq!(args, ["--resume", "656df134-af19-4e23-9736-59563c697c3f"]);
+        }
+        assert_eq!(
+            env_value(&command, "CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(OsStr::new("1000000"))
+        );
+    }
+
+    #[test]
+    fn empty_passthrough_leaves_the_command_shape_untouched() {
+        // No `--` on the command line → empty extra → the built command is
+        // byte-identical to the pre-passthrough shape (the exact argv,
+        // per platform: Windows routes through cmd, Unix execs claude
+        // directly — and get_args() never includes the program token).
+        let command = build_claude_command(
+            "https://api.anthropic.com",
+            "tok",
+            "claude-sonnet-5-5",
+            ProviderAuth::XApiKey,
+            None,
+            None,
+            &[],
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(args, ["/c", "claude"]);
+        } else {
+            assert_eq!(command.get_program(), "claude");
+            assert!(args.is_empty());
+        }
+    }
+
+    #[test]
+    fn cmd_metacharacter_rule_covers_the_rejected_set() {
+        // Each metacharacter is caught wherever it appears in the token —
+        // including line breaks, which std leaves unquoted and cmd treats
+        // as a command separator (verify-pass fix)...
+        for bad in [
+            "a&b",
+            "x|y",
+            "a>b",
+            "a<b",
+            "a^b",
+            "say \"hi\"",
+            "first\nsecond&calc",
+            "cr\rjunk",
+        ] {
+            assert!(disallowed_cmd_metacharacter(bad).is_some(), "{bad:?}");
+        }
+        // ...while realistic claude flags, session ids, and plain values
+        // (spaces included — std quotes those) pass the rule.
+        for fine in [
+            "--resume",
+            "656df134-af19-4e23-9736-59563c697c3f",
+            "--verbose",
+            "-p",
+            "--model",
+            "plain value with spaces",
+            "100%",
+        ] {
+            assert_eq!(disallowed_cmd_metacharacter(fine), None, "{fine}");
+        }
+    }
+
+    #[test]
+    fn passthrough_validation_is_windows_only_and_names_the_offender() {
+        if cfg!(windows) {
+            let error = validate_passthrough_args(&["--prompt".to_string(), "a&b".to_string()])
+                .expect_err("metacharacter must be rejected on Windows");
+            let message = error.to_string();
+            assert!(message.contains("a&b"), "{message}");
+            assert!(message.contains('&'), "{message}");
+            assert!(validate_passthrough_args(&[]).is_ok());
+            assert!(
+                validate_passthrough_args(&["--resume".to_string(), "abc".to_string()]).is_ok()
+            );
+        } else {
+            // No cmd in the spawn path on this platform: anything passes.
+            assert!(validate_passthrough_args(&["a&b".to_string()]).is_ok());
+        }
     }
 
     #[test]

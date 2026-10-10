@@ -140,7 +140,15 @@ async fn main() -> Result<()> {
             proxy,
             proxy_url,
             client,
+            extra,
         } => {
+            // Reject unusable passthrough args BEFORE any side effect: the
+            // proxy pre-switch below durably moves a client's routing
+            // target (clients.toml), and a metacharacter rejection landing
+            // after it would leave the switch standing on a launch that
+            // never happened (verify-pass fix; the launcher entries
+            // re-validate — defense in depth for future callers).
+            launcher::validate_passthrough_args(&extra)?;
             let config = load_config()?;
             let state = load_state(&config)?;
             if proxy {
@@ -154,7 +162,7 @@ async fn main() -> Result<()> {
                     // global runtime target.
                     control::switch(&proxy_url, &target, Some(&client_id)).await?;
                 }
-                launcher::run_claude_via_proxy(&proxy_url, &client_id)?;
+                launcher::run_claude_via_proxy(&proxy_url, &client_id, &extra)?;
             } else {
                 let name = match target {
                     Some(target) => config.resolve_target(&target)?,
@@ -172,7 +180,7 @@ async fn main() -> Result<()> {
                         launcher::PROXY_ONLY_REASON
                     );
                 }
-                launcher::run_claude(&config, &name)?;
+                launcher::run_claude(&config, &name, &extra)?;
             }
         }
         Command::Health { target } => {
