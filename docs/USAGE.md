@@ -1,6 +1,6 @@
 # CCM 使用指南
 
-CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换。
+CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方模型网关（zai、minimax 这类 anthropic / anthropic-compatible 端点，以及 DeepSeek 等 OpenAI 兼容端点——ccm 在代理内做双向协议翻译），并在中间加一层路由：fallback、重试、熔断、指标与运行时切换；每个被接受的响应还会落一条用量记录（v0.4），由此支撑按天成本核算与 `ccm advise` 的 cost_weight 建议（v0.5）。
 
 本文是操作手册。架构背景见 [docs/DESIGN.md](DESIGN.md)，v0.5 的规划与逐里程碑落地记录见 [docs/V0.5_PLAN.md](V0.5_PLAN.md)（v0.4/v0.3 的发布与验证记录见 [docs/V0.4_PLAN.md](V0.4_PLAN.md)、[docs/V0.3_PLAN.md](V0.3_PLAN.md)）。
 
@@ -37,7 +37,7 @@ CCM（Claude Code Model Manager）让你把 Claude Code 指向本地或第三方
 
 ## 2. 安装
 
-两种方式：**预编译二进制**（v0.4.0 起随发布提供，无需 Rust 工具链，推荐）或**源码构建**（需要 Rust 工具链 + 仓库）。两种方式都要求 Claude Code 已安装（终端里 `claude --version` 可用）。
+两种方式：**预编译二进制**（随每次发布提供，无需 Rust 工具链，推荐）或**源码构建**（需要 Rust 工具链 + 仓库）。两种方式都要求 Claude Code 已安装（终端里 `claude --version` 可用）。
 
 ### 2.1 预编译二进制
 
@@ -134,7 +134,7 @@ ccm --version
 
 ## 3. 首次配置
 
-完整流程：`init` → `auth set` →（按需）`add provider` / `add model` → `use` → `doctor` / `health` 验证。
+完整流程：`init` → `auth set` →（按需）`add provider`，模型逐个 `add model` 或 `discover` 从网关清单勾选（3.5）→ `use` → `doctor` / `health` 验证。
 
 ### 3.1 初始化
 
@@ -261,7 +261,7 @@ healthy: zai / glm-5.3
 healthy: minimax / MiniMax-M3
 ```
 
-注意 `health` 只接受**模型名或 profile 名，不接受路由名**（`use` / `switch` / `proxy` 三者才接受路由名）。常见报错：401/403 → `provider reachable but authentication failed (401)`；名字拼错 → `unknown model/profile `...``（解析发生在发请求之前）。
+注意 `health` 只接受**模型名或 profile 名，不接受路由名**（`use` / `switch` / `run --proxy` 三者才接受路由名）。常见报错：401/403 → `provider reachable but authentication failed (401)`；名字拼错 → `unknown model/profile `...``（解析发生在发请求之前）。
 
 ### 3.5 从网关发现模型清单：`ccm discover`（v0.5）
 
@@ -397,7 +397,7 @@ ccm route=coding-route attempt=2 model=minimax result=HTTP 200
 
 `--bind` 可改监听地址，但**只允许回环地址**（默认 `127.0.0.1:13521`，`[::1]` 也可以；`0.0.0.0`、局域网 IP、`[::]` 一律拒绝），原因见 FAQ。
 
-代理转发 `/v1/messages` 和 `/v1/messages/count_tokens`（v0.5 起转发后者）。v0.5 之前该端点返回 404——实测接近上下文窗口时（约 190k 估算 token）Claude Code 会重试 count_tokens 多达 17 次，这正是转发它的动机。count 请求按当前目标解析（含 scoped 客户端条目，读取无副作用——不刷新计数器与 `last_seen`），只发往**主模型**、单次尝试、不进 fallback，整个上游调用（响应头 + 响应体）受 10 秒超时约束；计数流量对决策、指标、用量统计完全不可见。openai-compatible 主模型没有计数端点，返回 404 Anthropic 错误信封（实测 Claude Code 容忍 404；不做本地估算）。部分网关的 count_tokens 是存根——实测 z.ai 对任意输入返回 `input_tokens:0`，代理原样透传，仅在大请求（>8KiB）收到 0 计数时向 stderr 打一次进程级警告。**近窗口边界（v0.5 发布前 E2E 实测）**：Claude Code 的 "Prompt is too long" 预检门由它自己的本地估算驱动，不咨询服务端计数——同一个超限 body 在 z.ai 存根 0 计数与 minimax 真实计数（约 151k，低于有效窗口）下同样被 1 秒内本地拒绝、从未发送。转发修复的是上下文计量表与 404 重试风暴，**不会**放行被本地估算拒绝的近窗口发送；真被放行的发送若超模型实际上限，溢出仍在发送时由网关报错。其余端点（`/v1/models` 等）仍不转发——实测 Claude Code 从不调用 `/v1/models`。
+代理转发 `/v1/messages` 和 `/v1/messages/count_tokens`（v0.5 起转发后者）。v0.5 之前该端点返回 404——实测接近上下文窗口时（约 190k 估算 token）Claude Code 会重试 count_tokens 多达 17 次，这正是转发它的动机。count 请求按当前目标解析（含 scoped 客户端条目，读取无副作用——不刷新计数器与 `last_seen`），只发往**主模型**、单次尝试、不进 fallback，整个上游调用（响应头 + 响应体）受 10 秒超时约束；计数流量对决策、指标、用量统计完全不可见。openai-compatible 主模型没有计数端点，返回 404 Anthropic 错误信封（实测 Claude Code 容忍 404；不做本地估算）。部分网关的 count_tokens 是存根——实测 z.ai 对任意输入返回 `input_tokens:0`，代理原样透传，仅在大请求（>8KiB）收到 0 计数时向 stderr 打一次进程级警告。**近窗口边界（v0.5 发布前 E2E 实测）**：Claude Code 的 "Prompt is too long" 预检门由它自己的本地估算驱动，不咨询服务端计数——同一个超限 body 在 z.ai 存根 0 计数与 minimax 真实计数（约 151k，低于有效窗口）下同样被 1 秒内本地拒绝、从未发送。转发修复的是上下文计量表与 404 重试风暴，**不会**放行被本地估算拒绝的近窗口发送；真被放行的发送若超模型实际上限，溢出仍在发送时由网关报错。其余端点（`/v1/models` 等）仍不转发——实测 Claude Code 从不调用 `/v1/models`。会话启动时它还会探测 `HEAD /api/hello`：代理不实现该路径、返回 404，实测被容忍，每个会话照常进行。
 
 ### 4.4 `use` vs `switch`（持久默认 vs 运行时切换）
 
@@ -638,6 +638,7 @@ fallback = ["glm"]
 | `ccm history decisions\|metrics\|circuit\|cost` | 离线查看持久化的决策 / 指标快照 / 熔断转换 / 按天成本（见 6.3、6.4，代理停着也能查） |
 | `ccm advise` | 从已落盘的使用量重算 `cost_weight` 建议并打印（只读不写配置，见 6.6） |
 | `/_ccm/*` 控制接口 | 代理运行时的实时观测与切换（本节） |
+| `/metrics` + OTLP 推送 | 指标导出双出口：Prometheus 抓取（见 6.5，默认开）/ OTLP 主动推送（见 6.7，`[observability.otlp]` 缺省关） |
 
 ### 6.1 控制接口一览（默认 `http://127.0.0.1:13521`）
 
@@ -651,7 +652,7 @@ fallback = ["glm"]
 | `GET /_ccm/traces` | 最近 100 条请求尝试记录；`?client=<id>` 只看该客户端 |
 | `GET /_ccm/circuits` | 各模型熔断状态（CLOSED / OPEN / HALF_OPEN / HALF_OPEN_READY） |
 | `GET /_ccm/metrics` | 各模型指标：attempts、successes、success_rate、health_score、http_errors、fallback_failures、timeouts、request_errors、rate_limited、latency_ewma_ms、last_success_ms、last_failure_ms |
-| `GET /_ccm/scores` | 当前路由候选的打分明细（reliability/latency/cost/quality/weighted，按加权分降序） |
+| `GET /_ccm/scores` | 当前路由候选的打分明细（`reliability_score` / `latency_score` / `cost_score` / `quality_score` / `weighted_score`，另有 `attempts` 与 `latency_ewma_ms`，按加权分降序） |
 | `GET /_ccm/decisions` | 最近 100 条路由决策（见下）；`?client=<id>` 只看该客户端；`?since=&until=&model=`（unix-ms，含边界）转为读取磁盘上的持久化历史（见 6.3）；`?limit=` 限制返回条数、保留最新 N（内存/磁盘两条路径都生效，磁盘查询缺省 1000），无运行中的 history 存储时该组合返回 400 |
 | `GET /_ccm/usage` | 最近 100 条使用量记录（见 6.4）；过滤参数与 `/_ccm/decisions` 完全一致（`?client=` / `?since=&until=&model=` / `?limit=`，无 history 存储时过滤查询同样 400） |
 | `GET /_ccm/cost` | 按 UTC 日聚合的使用量与成本（见 6.4）：`?day=YYYY-MM-DD`（缺省今天），`?client=<id>` 缩小到该客户端；始终读磁盘历史，无 history 存储时 400 |
@@ -681,7 +682,7 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
 3. `selected`：最终承接下来的模型；全部候选失败且无可透传响应时，代理返回 502。**例外**（见 5.4）：最后一次可用尝试遇到 `fallback_on` 状态码时，上游的错误响应会原样透传给客户端（openai 类经翻译），此时 `selected` 已设置、`outcome` 形如 `HTTP 429`——看起来像成功，实为透传的失败；
 4. `outcome`：结果概述——成功是 `HTTP {status}`；请求前解析失败是 `resolve error: ...`（该请求整体 502）；全部候选失败是 `failed: {候选: 原因; ...}`，或没有候选被放行 / 预算耗尽时是 `no candidate admitted or attempt budget exhausted`；上述第 3 条的透传例外下同样是 `HTTP {status}`。
 
-一个"熔断跳过 + fallback 成功"的决策示例（结构示意，个别字段名以实际响应为准）：
+一个"熔断跳过 + fallback 成功"的决策示例（字段名与实际响应一致）：
 
 ```json
 {
@@ -692,22 +693,21 @@ traces 是进程内环形缓冲，保留**最近 100 条**，重启代理即清�
   "configured_candidates": ["glm", "minimax"],
   "ranked_candidates": [
     {
+      "rank": 1,
       "model": "glm",
-      "reliability": 1.0,
-      "latency": 0.83,
-      "cost": 0.8,
-      "quality": 0.85,
-      "weighted": 0.896,
-      "attempts": 8,
-      "latency_ewma_ms": 204
+      "reliability_score": 1.0,
+      "latency_score": 0.83,
+      "cost_score": 0.8,
+      "quality_score": 0.85,
+      "weighted_score": 0.896
     }
   ],
   "attempts": [
-    { "model": "glm", "circuit": "OPEN", "result": "skipped: circuit OPEN until 1790985630000", "fallback": true },
-    { "model": "minimax", "circuit": "CLOSED", "result": "HTTP 200", "fallback": false }
+    { "attempt": 1, "model": "glm", "circuit": "OPEN", "result": "skipped: circuit OPEN until 1790985630000", "fallback": true },
+    { "attempt": 2, "model": "minimax", "circuit": "CLOSED", "result": "HTTP 200", "fallback": false }
   ],
   "selected": "minimax",
-  "outcome": "..."
+  "outcome": "HTTP 200"
 }
 ```
 
@@ -920,7 +920,7 @@ keyring 条目：service 名固定为 `ccm`，条目名 = provider 名。Windows
 
 | 变量 | 作用 |
 |---|---|
-| `CCM_HOME` | 重定位 `config.toml` 和 `state.toml`（默认 `~/.ccm`） |
+| `CCM_HOME` | 重定位整个 CCM 根目录（默认 `~/.ccm`）：`config.toml`、`state.toml`、`clients.toml`、`history/` 都在它下面 |
 | `CCM_PROXY_URL` | `ccm switch` / `ccm clients` 的默认代理地址（`--proxy-url` flag 可覆盖；最终默认 `http://127.0.0.1:13521`。注意 `ccm run --proxy` 不读它，只认 `--proxy-url` flag）；代理模式下会传给 claude 子进程 |
 | `CCM_CLIENT_ID` | `ccm switch` / `ccm run --proxy` 的默认 client id（`--client` flag 可覆盖；`switch` 里 `--global` 优先于它）；代理模式下会传给 claude 子进程，会话内 `/switch` 靠它保持本会话作用域（见 4.6） |
 | `OTEL_EXPORTER_OTLP_HEADERS` | OTLP 推送的收集器认证头（`k1=v1,k2=v2`，仅 `[observability.otlp]` 开启时读取；见 6.7。只认环境变量——凭据永不入 config.toml） |
@@ -1023,7 +1023,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 
 | 环境变量 | 作用 |
 |---|---|
-| `CCM_HOME` | 重定位 config.toml / state.toml |
+| `CCM_HOME` | 重定位整个 CCM 根目录（全部状态文件，见 7.3） |
 | `CCM_PROXY_URL` | switch / clients 的默认代理地址（run --proxy 只认 `--proxy-url` flag）；代理模式下传给 claude |
 | `CCM_CLIENT_ID` | switch / run --proxy 的默认 client id；代理模式下传给 claude（`/switch` 靠它保持会话作用域） |
 | `OTEL_EXPORTER_OTLP_HEADERS` | OTLP 推送收集器认证头（仅环境变量，见 6.7） |
@@ -1035,6 +1035,7 @@ health 只接受模型名 / profile 名，不接受路由名。传 `coding-route
 | `~/.ccm/clients.toml` | 客户端会话持久化：scoped 条目的 id / target / last_seen_ms，只由代理写入（见 4.6；`[clients] persist = false` 关闭） |
 | `~/.ccm/history/` | 观测历史 JSONL：decisions / metrics / circuit / usage（见 6.3、6.4；`CCM_HOME` 同样生效） |
 | `~/.claude/skills/switch/SKILL.md` | `/switch` skill 安装位置 |
-| `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,clients}` | 观测接口（GET；status/traces/decisions 支持 `?client=` 过滤） |
+| `http://127.0.0.1:13521/_ccm/{status,models,routes,traces,circuits,metrics,scores,decisions,usage,cost,clients}` | 观测接口（GET；status/traces/decisions/usage/cost 支持 `?client=` 过滤） |
 | `http://127.0.0.1:13521/_ccm/switch/{target}` | 运行时切换（POST；`?client=<id>` 只切该客户端） |
 | `http://127.0.0.1:13521/v1/messages` | 反向代理入口（与 `/v1/messages/count_tokens` 一并转发——v0.5 起含后者；其余端点不转发） |
+| `http://127.0.0.1:13521/metrics` | Prometheus 文本导出（默认开；`[observability] prometheus_enabled = false` 时该路由不存在；OTLP 推送见 6.7） |

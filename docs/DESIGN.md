@@ -509,7 +509,10 @@ Purpose:
 
 > A user or Agent must be able to explain why CCM selected, skipped, retried, or fell back for a specific request.
 
-Persistence/replay storage is deferred to post-v0.3.
+Persistence shipped in v0.4 M5: every routing decision appends to
+`decisions.jsonl` with disk-backed filtered queries (see §13/§18.4); the
+in-memory ring (last 100) stays the default view, and full replay tooling
+remains unscoped (§17).
 
 ## 10. Configuration and State
 
@@ -683,7 +686,7 @@ Binding Proxy to a non-loopback address would expose:
 - upstream proxy capability
 - access to credentials resolved by CCM
 
-v0.3 enforces loopback-only binding: `ccm proxy` refuses non-loopback bind addresses before loading configuration or opening the listener. Remote/LAN binding requires an authentication design first and remains deferred (open backlog, unchanged through v0.4).
+v0.3 enforces loopback-only binding: `ccm proxy` refuses non-loopback bind addresses before loading configuration or opening the listener. Remote/LAN binding requires an authentication design first and remains deferred (open backlog).
 
 ## 14. Main Source Modules
 

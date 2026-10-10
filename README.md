@@ -24,7 +24,7 @@ Post-v0.5 work follows the backlog in `docs/V0.5_PLAN.md` §11; keep the CI rele
 
 ## Install
 
-Download a prebuilt binary from the [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) page (v0.4.0 and later): Windows x64 `ccm-v<ver>-x86_64-pc-windows-msvc.exe` and Linux x64 `ccm-v<ver>-x86_64-unknown-linux-gnu` (built on Ubuntu 24.04, needs glibc ≥ 2.39), with SHA-256 hashes in `checksums.txt`. Drop the binary into a directory on your PATH.
+Download a prebuilt binary from the [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) page: Windows x64 `ccm-v<ver>-x86_64-pc-windows-msvc.exe` and Linux x64 `ccm-v<ver>-x86_64-unknown-linux-gnu` (built on Ubuntu 24.04, needs glibc ≥ 2.39), with SHA-256 hashes in `checksums.txt`. Drop the binary into a directory on your PATH.
 
 Or build the release binary from source and install it onto your PATH:
 
@@ -55,13 +55,16 @@ macOS is unverified for v0.5 — there is no macOS host to run the release gate 
 ```bash
 git clone https://github.com/Thneoly/ccm.git
 cd ccm
-cargo build --release
+./scripts/install.sh   # builds + installs onto PATH (Windows PowerShell: .\scripts\install.ps1)
 ccm init
 ccm auth set anthropic
 ccm auth set zai
+ccm discover zai       # optional (v0.5): register models from the gateway's /v1/models list (Enter skips)
 ccm proxy
 ccm run --proxy
 ```
+
+Open a new terminal after the install step so the PATH change takes effect — in the current shell the next command would report `command not found`.
 
 ## Configuration and state
 
@@ -85,7 +88,7 @@ A fresh `ccm init` creates both files. Example state:
 current = "claude"
 ```
 
-`ccm use <target>` writes only `state.toml`. Runtime `ccm switch <target>` remains in-memory and does not modify either file.
+`ccm use <target>` writes only `state.toml`. Runtime `ccm switch <target>` never writes `config.toml` or `state.toml`: the global target stays in-memory, while scoped client targets (`--client <id>`, or a bare switch inside a `ccm run --proxy` session) persist best-effort to `$CCM_HOME/clients.toml` (v0.5).
 
 Older CCM configurations that stored:
 
@@ -94,6 +97,8 @@ current = "glm"
 ```
 
 inside `config.toml` are migrated automatically the first time CCM loads persisted state. CCM writes that value to `state.toml` and rewrites `config.toml` without the legacy `current` field.
+
+At runtime the proxy additionally writes best-effort state under the same root: `$CCM_HOME/clients.toml` (scoped per-client targets, v0.5) and `$CCM_HOME/history/*.jsonl` (observability history, v0.4).
 
 ## Provider authentication
 
@@ -335,6 +340,13 @@ a fixed-bucket header-latency histogram alongside the EWMA gauge,
 decision duration, circuit state, tokens, and cost in integer micro-USD.
 `[observability] prometheus_enabled = false` removes the route entirely.
 
+The same 12 metric families can also be PUSHED to an OTLP/HTTP JSON
+collector (`[observability.otlp]`, v0.5) instead of or alongside scraping:
+the section is entirely off when absent and independent of
+`prometheus_enabled` — push-on keeps the `/metrics` route off, scrape-on
+adds no push. Collector auth headers come from the
+`OTEL_EXPORTER_OTLP_HEADERS` env var only. See the user guide §6.7.
+
 ```bash
 curl -s http://127.0.0.1:13521/metrics | grep ccm_
 ```
@@ -563,6 +575,11 @@ cargo test multi_client_integration_covers_scoped_switching_contract -- --nocapt
 cargo test control_router_serves_client_contract_over_http -- --nocapture
 ```
 
+The remaining env-lock integration tests — history persistence, usage
+capture, Prometheus exposition, `count_tokens` forwarding, `clients.toml`
+persistence/restart, and the two `ccm discover` live-listener tests — run
+as part of the plain `cargo test` suite.
+
 ## v0.3 stabilization boundary
 
 v0.3.0 shipped on 2026-10-03. The stabilization release work is complete:
@@ -577,6 +594,12 @@ v0.4.0 shipped on 2026-10-03 with the same packaging and gate. The v0.4
 scope (multi-client routing, openai-compatible translation, observability
 persistence) and its milestone-by-milestone landing records live in
 `docs/V0.4_PLAN.md`.
+
+v0.5.0 shipped on 2026-10-10 with the same packaging and gate. The v0.5
+scope (spend-based `ccm advise`, persistent client sessions,
+`count_tokens` forwarding, OTLP metrics export, provider discovery) and
+its milestone-by-milestone landing records live in
+`docs/V0.5_PLAN.md`.
 
 ## In-session switching from Claude Code
 
@@ -635,6 +658,7 @@ ccm history cost [--day YYYY-MM-DD] [--client ID]
 ccm advise [--window DAYS] [--min-samples N] [--model M]   (v0.5)
 ccm discover [provider] [--all]                              (v0.5)
 ccm run [model-or-profile] [--proxy] [--proxy-url URL] [--client <id>]
+  (with --proxy a route name also works; direct mode resolves models/profiles only)
 ccm auth set <provider>
 ccm auth delete <provider>
 ccm health <model-or-profile>
