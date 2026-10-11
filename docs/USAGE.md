@@ -53,8 +53,8 @@ macOS 没有预编译产物（macOS 本就不在支持声明内，见 2.2 末尾
 **完整性校验**（建议）：下载同一发布的 `checksums.txt` 后对照 SHA-256——
 
 ```powershell
-# Windows PowerShell（以 v0.5.0 为例）
-Get-FileHash .\ccm-v0.5.0-x86_64-pc-windows-msvc.exe -Algorithm SHA256
+# Windows PowerShell（以 v0.5.1 为例）
+Get-FileHash .\ccm-v0.5.1-x86_64-pc-windows-msvc.exe -Algorithm SHA256
 ```
 
 ```sh
@@ -70,7 +70,7 @@ grep x86_64-unknown-linux-gnu checksums.txt | sha256sum -c
 # Windows：装进用户程序目录（install.ps1 默认也装这里；确认该目录在用户
 # PATH 里，不在就手动加入——加完需要新开终端）
 mkdir $env:LOCALAPPDATA\Programs\ccm -Force
-Copy-Item .\ccm-v0.5.0-x86_64-pc-windows-msvc.exe $env:LOCALAPPDATA\Programs\ccm\ccm.exe
+Copy-Item .\ccm-v0.5.1-x86_64-pc-windows-msvc.exe $env:LOCALAPPDATA\Programs\ccm\ccm.exe
 ```
 
 ```sh
@@ -128,7 +128,7 @@ cp target/release/ccm ~/.local/bin/
 ccm --version
 ```
 
-输出 `ccm 0.5.0`。
+输出 `ccm 0.5.1`。
 
 ---
 
