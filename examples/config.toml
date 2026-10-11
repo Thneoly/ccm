@@ -26,7 +26,7 @@ quality_weight = 1.0
 [models.glm]
 provider = "zai"
 model_id = "glm-5.3"
-# Declared context window (v0.5): Claude Code does not know `glm-5.3` and
+# Declared context window (v0.5.1): Claude Code does not know `glm-5.3` and
 # assumes a small default window for it, auto-compacting long sessions at
 # a fraction of the real 1M window. Direct-mode launches inject this as
 # CLAUDE_CODE_MAX_CONTEXT_TOKENS. claude-* ids need no declaration —

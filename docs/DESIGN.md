@@ -742,7 +742,7 @@ src/model.rs       model/profile definitions
 src/route.rs       route + policy definitions
 src/manage.rs      add/config commands
 src/credential.rs  env/keyring credential resolution
-src/launcher.rs    Claude Code process environment
+src/launcher.rs    Claude Code process environment, claude argv passthrough + Windows cmd-metachar guard (v0.5.1)
 src/integrate.rs   Claude Skill installation
 src/health.rs      authenticated provider check
 src/discover.rs    /v1/models listing + selective registration (v0.5 M5)
@@ -805,8 +805,8 @@ failover), and HALF_OPEN probe release on translate failure.
 Target platforms and v0.5 claim status:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-10
-Linux    x86_64-unknown-linux-gnu   verified 2026-10-10 (WSL2 Ubuntu 24.04)
+Windows  x86_64-pc-windows-msvc     verified 2026-10-11
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-11 (WSL2 Ubuntu 24.04)
 macOS    aarch64-apple-darwin       not claimed for v0.5 (no host to verify)
 macOS    x86_64-apple-darwin        not claimed for v0.5 (no host to verify)
 ```

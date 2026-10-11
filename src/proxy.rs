@@ -1426,11 +1426,12 @@ pub(crate) mod tests {
     use axum::{routing::post, Router};
     use serde_json::json;
 
-    /// All five integration tests mutate process env (`CCM_HOME`,
-    /// `CCM_<PROVIDER>_API_KEY`); each holds this lock for its whole duration
-    /// so they never race (V0.3_PLAN §11.2 discipline). Shared
-    /// crate-wide: the discover integration tests mutate the same env
-    /// vars and must serialize against these, not just each other.
+    /// All ten integration tests in this module mutate process env
+    /// (`CCM_HOME`, `CCM_<PROVIDER>_API_KEY`); each holds this lock for
+    /// its whole duration so they never race (V0.3_PLAN §11.2
+    /// discipline). Shared crate-wide: the two discover integration
+    /// tests mutate the same env vars and must serialize against these,
+    /// not just each other.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {

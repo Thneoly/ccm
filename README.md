@@ -24,7 +24,7 @@ Post-v0.5 work follows the backlog in `docs/V0.5_PLAN.md` §11; keep the CI rele
 
 ## Install
 
-Download a prebuilt binary from the [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) page: Windows x64 `ccm-v<ver>-x86_64-pc-windows-msvc.exe` and Linux x64 `ccm-v<ver>-x86_64-unknown-linux-gnu` (built on Ubuntu 24.04, needs glibc ≥ 2.39), with SHA-256 hashes in `checksums.txt`. Drop the binary into a directory on your PATH.
+Download a prebuilt binary from the [GitHub Releases](https://github.com/Thneoly/ccm/releases/latest) page: Windows x64 `ccm-v<ver>-x86_64-pc-windows-msvc.exe` and Linux x64 `ccm-v<ver>-x86_64-unknown-linux-gnu` (built on Ubuntu 24.04, needs glibc ≥ 2.39), with SHA-256 hashes in `checksums.txt`. Rename it to `ccm.exe` on Windows / `ccm` on Linux (plus `chmod +x`) and put it in a directory on your PATH — step-by-step in [docs/USAGE.md](docs/USAGE.md) §2.1.
 
 Or build the release binary from source and install it onto your PATH:
 
@@ -714,8 +714,8 @@ The repository pins the stable Rust channel and installs `rustfmt` and `clippy` 
 The v0.5 release target is:
 
 ```text
-Windows  x86_64-pc-windows-msvc     verified 2026-10-10
-Linux    x86_64-unknown-linux-gnu   verified 2026-10-10 (WSL2 Ubuntu 24.04)
+Windows  x86_64-pc-windows-msvc     verified 2026-10-11
+Linux    x86_64-unknown-linux-gnu   verified 2026-10-11 (WSL2 Ubuntu 24.04)
 ```
 
 macOS is not claimed as supported for v0.5: there is no macOS host to run the release gate on. `install.sh` is expected to work on macOS, but that expectation is unverified, and the macOS keyring backend has never been compiled. macOS support can be re-claimed only after the gate passes on real macOS hardware or a GitHub Actions macOS runner, and must then be labeled CI-verified rather than manually verified.
@@ -766,6 +766,10 @@ GitHub Actions CI runs the release gate ([.github/workflows/ci.yml](.github/work
   launches inject `CLAUDE_CODE_MAX_CONTEXT_TOKENS` so Claude Code's
   proactive auto-compaction runs at the true window for third-party ids
   (proxy launches never inject; `claude-*` ids need no declaration)
+- claude argument passthrough on `ccm run [flags] [target] -- <args>`
+  (v0.5 post-release): everything after `--` rides to the claude
+  process verbatim; on Windows, args carrying cmd metacharacters are
+  rejected with a naming error rather than escaped through `cmd /c`
 - `ordered`, `healthiest`, `lowest-latency`, `lowest-cost`, and `weighted` selection
 - transparent weighted scoring
 - explainable candidate score control API
